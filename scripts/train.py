@@ -38,6 +38,12 @@ import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 from lightning.pytorch.loggers import CSVLogger
 
+try:
+    from lightning.pytorch.loggers import WandbLogger
+    HAVE_WANDB = True
+except Exception:
+    HAVE_WANDB = False
+
 # Lazy import to avoid torchrl DLL on some setups
 try:
     from rl4co.envs import CVRPEnv
@@ -189,6 +195,8 @@ def train(
     max_instances: int | None = None,
     backbone: str = "pomo",
     baseline: str | None = None,
+    logger: str = "csv",
+    resume: str | None = None,
 ):
     assert FULL_RL4CO, (
         "Full rl4co import failed. Ensure torchrl DLL is installed correctly "
@@ -279,7 +287,19 @@ def train(
         patience=20,
         mode="max",
     )
-    logger = CSVLogger(save_dir=str(log_path), name="metrics")
+    if logger == "wandb":
+        if not HAVE_WANDB:
+            raise RuntimeError(
+                "wandb requested but WandbLogger is not installed. "
+                "Run `pip install wandb lightning` and login with `wandb login`."
+            )
+        logger_obj = WandbLogger(
+            project="MeTRA_Slot_NCO",
+            name=run_name,
+            log_model="all",
+        )
+    else:
+        logger_obj = CSVLogger(save_dir=str(log_path), name="metrics")
 
     # ── Trainer ─────────────────────────────────────────────────────────
     trainer_kwargs = dict(
@@ -309,7 +329,7 @@ def train(
     print(f"{'='*60}\n")
 
     t0 = time.time()
-    trainer.fit(model, train_loader, val_loader)
+    trainer.fit(model, train_loader, val_loader, ckpt_path=resume)
     elapsed = time.time() - t0
 
     best_reward = checkpoint_cb.best_model_score.item() if checkpoint_cb.best_model_score else None
@@ -325,11 +345,14 @@ def train(
         "checkpoint": str(checkpoint_cb.best_model_path),
     }
 
-    # Save result summary
+    # Save result summary (deduplicate identical configs — rerun replaces,
+    # never appends a duplicate row).
     result_dir = Path("results")
     result_dir.mkdir(exist_ok=True)
     result_file = result_dir / f"ablation_N{num_loc}.json"
     results = json.loads(result_file.read_text()) if result_file.exists() else []
+    dedup_key = {k: result[k] for k in ("backbone", "variant", "num_slots", "num_loc", "dist", "seed")}
+    results = [r for r in results if not all(r.get(k) == v for k, v in dedup_key.items())]
     results.append(result)
     result_file.write_text(json.dumps(results, indent=2))
 
@@ -366,6 +389,10 @@ def main():
                         help="Backbone: 'pomo' (multi-start, shared baseline) or 'am' (single-start, rollout baseline)")
     parser.add_argument("--baseline",      type=str,   default=None,
                         help="REINFORCE baseline for the AM backbone (e.g. rollout, shared). Ignored for pomo.")
+    parser.add_argument("--logger",        type=str,   default="csv", choices=["csv", "wandb"],
+                        help="Logger: 'csv' (default, lightweight) or 'wandb' (requires wandb login).")
+    parser.add_argument("--resume",        type=str,   default=None,
+                        help="Path to a .ckpt to resume training from its last epoch (Lightning checkpoint).")
     args = parser.parse_args()
 
     train(
@@ -387,6 +414,8 @@ def main():
         max_instances=args.max_instances,
         backbone=args.backbone,
         baseline=args.baseline,
+        logger=args.logger,
+        resume=args.resume,
     )
 
 
