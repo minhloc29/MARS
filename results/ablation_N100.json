@@ -1,0 +1,11 @@
+[
+  {
+    "variant": "D",
+    "num_loc": 100,
+    "dist": "uniform",
+    "seed": 42,
+    "best_val_reward": -25.14698028564453,
+    "elapsed_min": 0.7,
+    "checkpoint": "C:\\Users\\BKAI\\locodo\\MeTRA_Slot_NCO\\logs\\am_slot_D_N100_uniform_seed42\\checkpoints\\best-epoch=000-val/reward=-25.1470.ckpt"
+  }
+]
