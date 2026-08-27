@@ -7,5 +7,27 @@
     "best_val_reward": -25.14698028564453,
     "elapsed_min": 0.7,
     "checkpoint": "C:\\Users\\BKAI\\locodo\\MeTRA_Slot_NCO\\logs\\am_slot_D_N100_uniform_seed42\\checkpoints\\best-epoch=000-val/reward=-25.1470.ckpt"
+  },
+  {
+    "backbone": "am",
+    "variant": "D",
+    "num_slots": 8,
+    "num_loc": 100,
+    "dist": "uniform",
+    "seed": 42,
+    "best_val_reward": -17.99163246154785,
+    "elapsed_min": 358.3,
+    "checkpoint": "C:\\Users\\BKAI\\locodo\\MeTRA_Slot_NCO\\logs\\am_slot_D_K8_N100_uniform_seed42\\checkpoints\\best-epoch=094-val/reward=-17.9916.ckpt"
+  },
+  {
+    "backbone": "am",
+    "variant": "B",
+    "num_slots": 8,
+    "num_loc": 100,
+    "dist": "uniform",
+    "seed": 42,
+    "best_val_reward": -18.002635955810547,
+    "elapsed_min": 394.0,
+    "checkpoint": "C:\\Users\\BKAI\\locodo\\MeTRA_Slot_NCO\\logs\\am_slot_B_K8_N100_uniform_seed42\\checkpoints\\best-epoch=092-val/reward=-18.0026.ckpt"
   }
 ]

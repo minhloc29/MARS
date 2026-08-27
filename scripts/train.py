@@ -1,30 +1,3 @@
-"""
-Full-Scale Training Script for Metric-Aware Slot Abstraction NCO.
-
-Trains POMOSlot (Variants A-E) on CVRP using rl4co's Lightning trainer.
-Uses pre-cached slot datasets (with d_ins matrices) from generate_slot_dataset.py.
-
-Usage:
-    # Single variant:
-    conda run -n ec_nco python scripts/train.py variant=D num_loc=100
-
-    # Run full ablation ladder A→E sequentially:
-    for variant in A B C D E:
-        conda run -n ec_nco python scripts/train.py variant=$variant
-
-    # Multi-GPU with DDP:
-    conda run -n ec_nco python scripts/train.py variant=D trainer.devices=4
-
-Outputs:
-    logs/pomo_slot_{variant}_N{num_loc}/   — Lightning logs & checkpoints
-    results/ablation_{num_loc}.json        — Summary metrics for all variants
-
-Requirements (ec_nco env):
-    pip install rl4co einops wandb
-
-Note: Run scripts/generate_slot_datasets.py first to precompute datasets.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -53,17 +26,13 @@ except Exception as e:
     print(f"[WARN] Full rl4co import failed: {e}")
     FULL_RL4CO = False
 
-# Model registry: choose POMO (multi-start, shared baseline) or
-# AM (single-start, rollout baseline) backbone.
+
 MODEL_CLASSES = {
     "pomo": POMOSlot,
     "am": AMSlot,
 }
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Dataset with d_ins support
-# ════════════════════════════════════════════════════════════════════════════
 
 class SlotDataset(torch.utils.data.Dataset):
     """
@@ -307,7 +276,7 @@ def train(
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=devices,
         callbacks=[checkpoint_cb, early_stop_cb],
-        logger=logger,
+        logger=logger_obj,
         gradient_clip_val=1.0,
         enable_progress_bar=True,
         log_every_n_steps=10,
@@ -373,14 +342,14 @@ def main():
     parser.add_argument("--data_dir",      type=str,   default="./data/slot_datasets_v2")
     parser.add_argument("--log_dir",       type=str,   default="./logs")
     parser.add_argument("--seed",          type=int,   default=42)
-    parser.add_argument("--devices",       type=int,   default=0,
-                        help="Number of GPUs to use (0 = all available; default). Use 1 for a single GPU.")
+    parser.add_argument("--devices",       type=int,   default=1,
+                        help="Number of GPUs to use (default 1). Pass >1 for DDP.")
     parser.add_argument("--embed_dim",     type=int,   default=128)
     parser.add_argument("--num_slots",     type=int,   default=8)
     parser.add_argument("--proj_dim",      type=int,   default=64)
     parser.add_argument("--slot_iters",    type=int,   default=3)
     parser.add_argument("--lambda_init",   type=float, default=1.0)
-    parser.add_argument("--lr_dual",       type=float, default=1e-3)
+    parser.add_argument("--lr_dual",       type=float, default=1e-4)
     parser.add_argument("--epochs",        type=int,   default=None)
     parser.add_argument("--batch_size",    type=int,   default=None)
     parser.add_argument("--max_instances", type=int,   default=None,

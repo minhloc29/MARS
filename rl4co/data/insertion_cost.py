@@ -161,7 +161,7 @@ def compute_sparse_insertion_cost(
     locs: torch.Tensor,
     k_neighbors: int = 15,
     depot_loc: Optional[torch.Tensor] = None,
-    method: str = "savings",
+    method: str = "construction",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute sparse (B, N, k) insertion cost for efficient storage and aggregation.
@@ -300,15 +300,7 @@ def _compute_dense_construction_d_ins(
     locs: torch.Tensor,          # (B, N, 2)
     depot_loc: torch.Tensor,     # (B, 1, 2)
 ) -> torch.Tensor:
-    """
-    Compute dense (B, N, N) construction-aware insertion distance.
-
-    For every customer pair (i, j):
-        d_ins(i, j) = min over the two directions of the along-tour arc
-                      separating i and j on the constructed NN tour.
-
-    Symmetric by construction and ~0 on self-pairs.
-    """
+  
     B, N, _ = locs.shape
     device = locs.device
 

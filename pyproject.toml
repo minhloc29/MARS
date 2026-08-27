@@ -56,6 +56,7 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
 dependencies = [
     "einops",
     "hydra-core",
@@ -68,9 +69,10 @@ dependencies = [
     "robust-downloader",
     "scipy",
     "tensordict>=0.6.0",
+    "torch>=2.11.0",
     "torchrl>=0.6.0",
     "wandb",
-    "hydra",
+    "pandas>=2.3.3",
 ]
 
 [project.optional-dependencies]
@@ -159,3 +161,11 @@ exclude_lines = [
     "pragma: no cover",
     "if __name__ == .__main__.:",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
