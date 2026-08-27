@@ -11,20 +11,10 @@ import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 from lightning.pytorch.loggers import CSVLogger
 
-try:
-    from lightning.pytorch.loggers import WandbLogger
-    HAVE_WANDB = True
-except Exception:
-    HAVE_WANDB = False
+from lightning.pytorch.loggers import WandbLogger
 
-# Lazy import to avoid torchrl DLL on some setups
-try:
-    from rl4co.envs import CVRPEnv
-    from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
-    FULL_RL4CO = True
-except Exception as e:
-    print(f"[WARN] Full rl4co import failed: {e}")
-    FULL_RL4CO = False
+from rl4co.envs import CVRPEnv
+from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
 
 
 MODEL_CLASSES = {
@@ -121,10 +111,6 @@ def make_dataloader(filepath: str, variant: str, batch_size: int, shuffle: bool,
     )
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Training config
-# ════════════════════════════════════════════════════════════════════════════
-
 VARIANT_DEFAULTS = {
     "A": dict(metric_variant="A", alpha_metric=0.1,  beta_entropy=0.01),
     "B": dict(metric_variant="B", alpha_metric=0.0,  beta_entropy=0.00),
@@ -140,10 +126,6 @@ TRAIN_DEFAULTS = {
     500: dict(epochs=200, batch=32,  lr=5e-5, n_train=50_000,  n_val=500),
 }
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Main training function
-# ════════════════════════════════════════════════════════════════════════════
 
 def train(
     variant: str = "D",
@@ -164,13 +146,11 @@ def train(
     max_instances: int | None = None,
     backbone: str = "pomo",
     baseline: str | None = None,
+    disable_slots: bool = False,
     logger: str = "csv",
     resume: str | None = None,
 ):
-    assert FULL_RL4CO, (
-        "Full rl4co import failed. Ensure torchrl DLL is installed correctly "
-        "or run on a compatible machine."
-    )
+  
 
     pl.seed_everything(seed)
     t_cfg = TRAIN_DEFAULTS[num_loc].copy()
@@ -204,26 +184,24 @@ def train(
             f"--num_locs {num_loc} --dist {dist} --out_dir {data_dir}"
         )
 
-    # ── Data ────────────────────────────────────────────────────────────
+    # Data
     train_loader = make_dataloader(train_path, variant, t_cfg["batch"], shuffle=True, max_instances=t_cfg["n_train"])
     val_loader   = make_dataloader(val_path,   variant, t_cfg["batch"], shuffle=False, max_instances=t_cfg["n_val"])
 
-    # ── Environment ─────────────────────────────────────────────────────
+    # Environment
     env = CVRPEnv(generator_kwargs=dict(num_loc=num_loc))
 
-    # ── Model ───────────────────────────────────────────────────────────
-    model_cls = MODEL_CLASSES[backbone]   # "pomo" -> POMOSlot, "am" -> AMSlot
+    # Model
+    model_cls = MODEL_CLASSES[backbone]
     model_kwargs = dict(
         env=env,
         embed_dim=embed_dim,
         num_slots=num_slots,
-        # Slot/metric config
         **v_cfg,
         proj_dim=proj_dim,
         slot_iters=slot_iters,
         lambda_init=lambda_init,
         lr_dual=lr_dual,
-        # Optimizer
         optimizer_kwargs={"lr": t_cfg["lr"]},
     )
     # AM defaults to "rollout" baseline, but rollout requires the dataloader to
@@ -233,15 +211,22 @@ def train(
     # if a different baseline is wired up.
     if backbone == "am":
         model_kwargs["baseline"] = baseline if baseline is not None else "shared"
+    # disable_slots: run the backbone as a true no-slot baseline (skips
+    # SlotAttention, slot injection, and all aux losses).
+    if disable_slots:
+        model_kwargs["disable_slots"] = True
     model = model_cls(**model_kwargs)
 
-    # ── Callbacks ───────────────────────────────────────────────────────
+    # Callbacks
     # run_name must uniquely identify the run so concurrent/serial configs
     # (K sweep, D-vs-B ablation) never share a log dir. Include backbone,
     # variant, K (num_slots), N, dist, seed. baseline only for am (pomo is
     # hard-wired to "shared").
     base_suffix = f"_bl{baseline}" if backbone == "am" and baseline else ""
-    run_name = f"{backbone}_slot_{variant}_K{num_slots}_N{num_loc}_{dist}_seed{seed}{base_suffix}"
+    if disable_slots:
+        run_name = f"{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
+    else:
+        run_name = f"{backbone}_slot_{variant}_K{num_slots}_N{num_loc}_{dist}_seed{seed}{base_suffix}"
     log_path = Path(log_dir) / run_name
 
     checkpoint_cb = ModelCheckpoint(
@@ -270,7 +255,7 @@ def train(
     else:
         logger_obj = CSVLogger(save_dir=str(log_path), name="metrics")
 
-    # ── Trainer ─────────────────────────────────────────────────────────
+    # Trainer
     trainer_kwargs = dict(
         max_epochs=t_cfg["epochs"],
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
@@ -329,10 +314,6 @@ def train(
     return result
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# CLI
-# ════════════════════════════════════════════════════════════════════════════
-
 def main():
     parser = argparse.ArgumentParser(description="Train POMOSlot -- Metric-Aware NCO")
     parser.add_argument("--variant",       type=str,   default="D",       choices=list("ABCD"),
@@ -358,6 +339,8 @@ def main():
                         help="Backbone: 'pomo' (multi-start, shared baseline) or 'am' (single-start, rollout baseline)")
     parser.add_argument("--baseline",      type=str,   default=None,
                         help="REINFORCE baseline for the AM backbone (e.g. rollout, shared). Ignored for pomo.")
+    parser.add_argument("--disable_slots", action="store_true",
+                        help="Run the backbone as a true no-slot baseline (skips SlotAttention + aux losses).")
     parser.add_argument("--logger",        type=str,   default="csv", choices=["csv", "wandb"],
                         help="Logger: 'csv' (default, lightweight) or 'wandb' (requires wandb login).")
     parser.add_argument("--resume",        type=str,   default=None,
@@ -383,6 +366,7 @@ def main():
         max_instances=args.max_instances,
         backbone=args.backbone,
         baseline=args.baseline,
+        disable_slots=args.disable_slots,
         logger=args.logger,
         resume=args.resume,
     )

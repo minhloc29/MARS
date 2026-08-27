@@ -1,33 +1,5 @@
-"""
-Insertion cost utilities for Metric-Aware Slot NCO.
-
-NOTE on d_ins formula:
-    The formula used here is:
-        d_ins(i, j) = dist(D, i) + dist(i, j) - dist(D, j)
-
-    This is the "Clarke-Wright savings"-style marginal cost of visiting node i
-    on a sub-tour (D -> j -> D), not a true cheapest-insertion into a built
-    route. It ignores demand/capacity context and full route structure.
-    It may correlate with Euclidean distance for some instances.
-
-    TODO: If ablation results show D vs C are not clearly separated, replace
-    with a proper nearest-neighbor route construction + marginal insertion cost
-    computation that accounts for route structure.
-
-Format:
-    Dense (B, N, N): compute_marginal_insertion_cost() — used internally only
-    Sparse (B, N, k): compute_sparse_insertion_cost() — used for dataset storage
-
-Sparsification is done AFTER symmetrization to ensure d_ins(i,j) == d_ins(j,i)
-before selecting top-k neighbors. This avoids the correctness issue that would
-arise from trying to symmetrize an already-sparse tensor where j in kNN(i)
-does not imply i in kNN(j).
-"""
-
 from __future__ import annotations
-
 from typing import Optional, Tuple
-
 import torch
 
 
@@ -142,7 +114,7 @@ def compute_marginal_insertion_cost(
     else:
         depot_loc_3d = depot_loc
 
-    d_ins = _compute_dense_d_ins(locs, depot_loc_3d)  # (B, N, N) symmetric
+    d_ins = _compute_dense_d_ins(locs, depot_loc_3d)
 
     if k_neighbors is not None and k_neighbors < N:
         dist_customers = compute_pairwise_distance_matrix(locs)
@@ -177,12 +149,17 @@ def compute_sparse_insertion_cost(
         locs:        (B, N, 2) customer coordinates. Must be 3D.
         k_neighbors: Number of nearest neighbors per node.
         depot_loc:   (B, 1, 2) depot coordinates. Defaults to (0.5, 0.5).
-        method:      Which insertion-cost definition to use.
-                     - "savings" (default): Clarke-Wright-style marginal
+        method:      Insertion-cost definition to use.
+                     - "savings": Clarke-Wright-style marginal proxy
                        d_ins(i,j) = dist(D,i) + dist(i,j) - dist(D,j).
-                     - "construction": route-construction-aware arc distance from
-                       a greedy nearest-neighbour tour (see
+                     - "construction": along-tour arc distance from a greedy
+                       nearest-neighbour tour (see
                        compute_construction_aware_insertion_cost).
+                     - "insertion": Route-Conditioned Insertion Cost (RCIC) —
+                       a genuine marginal cost of inserting i into a route edge
+                       adjacent to j, symmetrized (see
+                       _compute_route_adjacent_insertion_cost). Recommended
+                       target for Variant D.
 
     Returns:
         (idx, val):
@@ -198,7 +175,9 @@ def compute_sparse_insertion_cost(
         depot_loc = depot_loc.unsqueeze(1)
 
     # Compute dense symmetric d_ins: (B, N, N)
-    if method == "construction":
+    if method == "insertion":
+        d_ins = _compute_route_adjacent_insertion_cost(locs, depot_loc)
+    elif method == "construction":
         d_ins = _compute_dense_construction_d_ins(locs, depot_loc)
     else:
         d_ins = _compute_dense_d_ins(locs, depot_loc)
@@ -211,9 +190,7 @@ def compute_sparse_insertion_cost(
 
     k_actual = min(k_neighbors, N - 1)
     _, knn_idx = torch.topk(dist_customers, k=k_actual, dim=-1, largest=False)
-    # knn_idx: (B, N, k_actual)
 
-    # Gather the d_ins values at kNN positions
     knn_val = torch.gather(d_ins, dim=2, index=knn_idx)  # (B, N, k_actual)
 
     # Store indices as int16 to save disk space (supports N up to 32767)
@@ -224,27 +201,43 @@ def compute_sparse_insertion_cost(
     return knn_idx_i16, knn_val
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Construction-aware insertion cost (method="construction")
-#
-# Replaces the Clarke-Wright savings proxy with a target derived from an actual
-# route construction, so that d_ins reflects *routing structural* separation
-# between customers rather than raw coordinate proximity.
-#
-#   d_ins(i, j) = shortest along-tour arc distance between i and j on a greedy
-#                 nearest-neighbour tour (depot -> ... -> depot).
-#
-# This is the "cheapest-insertion-flavoured" marginal used in the Metric-Aware
-# Slot NCO proposal: customers that sit far apart in a good route have very
-# different marginal routing consequences, even if they are spatially close —
-# exactly the mechanism the metric-conflict benchmark (EXPERIMENT_PLAN.md §3-§4)
-# is designed to test. The route construction is sequential and per-instance.
-#
-# NOTE on capacity: the current construction is a single nearest-neighbour
-# Hamiltonian cycle (capacity ignored), consistent with the original CW proxy.
-# A capacity-aware multi-route construction (demand-normalised, capacity=1.0 per
-# generate_slot_dataset.py) is a planned refinement.
-# ────────────────────────────────────────────────────────────────────────────────
+
+def _build_nn_customer_order(
+    locs: torch.Tensor,          # (B, N, 2) customers
+    depot_loc: torch.Tensor,     # (B, 1, 2) depot
+) -> torch.Tensor:
+    """
+    Build a deterministic nearest-neighbour tour from the depot.
+
+    At each step move to the nearest unvisited customer. Returns the occupancy
+    order alone (the RCIC method only needs the visit sequence, not the tour
+    geometry). Shareable with the construction method.
+
+    Returns:
+        order: (B, N) — customer indices (0..N-1) in visit order.
+    """
+    B, N, _ = locs.shape
+    device = locs.device
+
+    nodes = torch.cat([depot_loc, locs], dim=1)  # (B, N+1, 2); index 0 = depot
+    dist = torch.cdist(nodes, nodes)             # (B, N+1, N+1)
+
+    visited = torch.zeros(B, N, dtype=torch.bool, device=device)
+    order = torch.empty(B, N, dtype=torch.long, device=device)
+    current = torch.zeros(B, dtype=torch.long, device=device)   # node index; 0 = depot
+    batch_idx = torch.arange(B, device=device)
+
+    for step in range(N):
+        # Distances from the current node to each customer (nodes 1..N)
+        candidate_dist = dist[batch_idx, current, 1:]           # (B, N)
+        candidate_dist = candidate_dist.masked_fill(visited, float("inf"))
+        next_customer = candidate_dist.argmin(dim=1)            # (B,) in 0..N-1
+        order[:, step] = next_customer
+        visited[batch_idx, next_customer] = True
+        current = next_customer + 1                             # +1: node index 0 is depot
+
+    return order
+
 
 def _build_nn_route_order(
     locs: torch.Tensor,          # (B, N, 2) customers
@@ -253,8 +246,8 @@ def _build_nn_route_order(
     """
     Greedy nearest-neighbour tour from the depot.
 
-    At each step move to the nearest unvisited customer. Returns the route
-    geometry needed to compute along-tour arc distances.
+    Delegates the visit order to :func:`_build_nn_customer_order`, then returns
+    the route geometry needed to compute along-tour arc distances.
 
     Returns:
         cust_ord: (B, N, 2) customer coordinates in visit order.
@@ -263,23 +256,8 @@ def _build_nn_route_order(
     """
     B, N, _ = locs.shape
     device = locs.device
-    INF = torch.tensor(float("inf"), device=device)
 
-    node_seq_all = torch.cat([depot_loc, locs], dim=1)      # (B, N+1, 2); idx 0 = depot
-    dist = torch.cdist(node_seq_all, node_seq_all)          # (B, N+1, N+1)
-
-    visited = torch.zeros(B, N, dtype=torch.bool, device=device)
-    order = torch.zeros(B, N, dtype=torch.long, device=device)
-    cur = torch.zeros(B, dtype=torch.long, device=device)   # node index; 0 = depot
-
-    for step in range(N):
-        # Distances from current node to each customer (node indices 1..N)
-        d_cur = dist[torch.arange(B), cur][:, 1:]           # (B, N)
-        d_cur = d_cur.masked_fill(visited, INF)
-        best = d_cur.argmin(dim=1)                          # (B,) customer idx 0..N-1
-        order[:, step] = best
-        visited[torch.arange(B), best] = True
-        cur = best + 1                                      # advance to that customer node
+    order = _build_nn_customer_order(locs, depot_loc)           # (B, N)
 
     # Ordered customer coordinates: (B, N, 2)
     cust_ord = torch.gather(locs, 1, order.unsqueeze(-1).expand(B, N, 2))
@@ -346,7 +324,150 @@ def compute_construction_aware_insertion_cost(
     elif depot_loc.dim() == 2:
         depot_loc = depot_loc.unsqueeze(1)
 
-    d_ins = _compute_dense_construction_d_ins(locs, depot_loc)  # (B, N, N) symmetric
+    d_ins = _compute_dense_construction_d_ins(locs, depot_loc)
+
+    # Euclidean kNN for neighbor selection (consistent with training convention)
+    dist_customers = compute_pairwise_distance_matrix(locs)
+    dist_customers = dist_customers + torch.eye(N, device=device).unsqueeze(0) * 1e9
+    k_actual = min(k_neighbors, N - 1)
+    _, knn_idx = torch.topk(dist_customers, k=k_actual, dim=-1, largest=False)
+
+    knn_val = torch.gather(d_ins, dim=2, index=knn_idx)  # (B, N, k_actual)
+
+    assert N <= 32767, f"N={N} exceeds int16 range; use int32 for larger instances"
+    return knn_idx.to(torch.int16), knn_val
+
+
+
+def _compute_route_adjacent_insertion_cost(
+    locs: torch.Tensor,          # (B, N, 2) customers
+    depot_loc: torch.Tensor,     # (B, 1, 2) depot
+) -> torch.Tensor:
+    """
+    Compute a symmetric, route-conditioned insertion-cost matrix (RCIC).
+
+    Builds a deterministic nearest-neighbour reference route, then for every
+    pair (i, j) evaluates the cheapest genuine marginal cost of inserting i
+    into an edge adjacent to j (and vice versa), symmetrized:
+
+        D_RCIC(i, j) = 0.5 * [ Δ(i|j) + Δ(j|i) ]
+
+    Args:
+        locs:      (B, N, 2) customer coordinates (batch must already be 3D).
+        depot_loc: (B, 1, 2) depot coordinates.
+
+    Returns:
+        D_ins: (B, N, N) float32 — symmetric route-conditioned insertion cost.
+    """
+    B, N, _ = locs.shape
+    device = locs.device
+
+    if N < 3:
+        return torch.cdist(locs, locs)
+
+    order = _build_nn_customer_order(locs, depot_loc)   # (B, N)
+
+    pred = torch.empty_like(order)
+    succ = torch.empty_like(order)
+    pred[:, 0] = -1
+    succ[:, -1] = -1
+    if N > 1:
+        pred[:, 1:] = order[:, :-1]
+        succ[:, :-1] = order[:, 1:]
+    depot_idx = torch.full((B,), N, dtype=torch.long, device=device)
+    pred[:, 0] = depot_idx
+    succ[:, -1] = depot_idx
+
+    # 3. Route nodes: customers (0..N-1) then depot (N)
+    route_nodes = torch.cat([locs, depot_loc], dim=1)   # (B, N+1, 2)
+    D = torch.cdist(route_nodes, route_nodes)           # (B, N+1, N+1)
+
+    # 4. directed[i, j] = cheapest insertion cost of i into an edge adjacent to j
+    directed = torch.full((B, N, N), float("inf"), dtype=locs.dtype, device=device)
+    batch_idx = torch.arange(B, device=device)
+
+    for j_pos in range(N):
+        j = order[:, j_pos]     # reference customer
+
+        # We want, for every batch b and candidate i in [0, N):
+        #   cost_before[i] = D[b, u[b], i] + D[b, i, j[b]] - D[b, u[b], j[b]]
+        # All three dims are indexed with aligned advanced indices so each
+        # term stays (B, N) — a trailing advanced index on a slice would push
+        # the advanced dim to the front and give (B, B, N).
+        i_range = torch.arange(N, device=device)
+
+        # Edge 1: pred(j) -> j.
+        u = pred[:, j_pos]
+        v = j
+        cost_before = (
+            D[batch_idx, u, :N]
+            + D[batch_idx[:, None], i_range[None, :], v[:, None]]
+            - D[batch_idx, u, v].unsqueeze(-1)
+        )
+
+        # Edge 2: j -> succ(j).
+        u2 = j
+        v2 = succ[:, j_pos]
+        cost_after = (
+            D[batch_idx, u2, :N]
+            + D[batch_idx[:, None], i_range[None, :], v2[:, None]]
+            - D[batch_idx, u2, v2].unsqueeze(-1)
+        )
+
+        # Do NOT allow inserting i into an edge that already contains i —
+        # otherwise d(j,i) + d(i,i) - d(j,i) = 0 creates an artificial zero target.
+        i_indices = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)
+        invalid_before = (i_indices == u.unsqueeze(-1)) | (i_indices == v.unsqueeze(-1))
+        invalid_after = (i_indices == u2.unsqueeze(-1)) | (i_indices == v2.unsqueeze(-1))
+        cost_before = cost_before.masked_fill(invalid_before, float("inf"))
+        cost_after = cost_after.masked_fill(invalid_after, float("inf"))
+
+        # Cheapest insertion around j.
+        best = torch.minimum(cost_before, cost_after)
+        directed[batch_idx, :, j] = best
+
+    # 5. Symmetrize: directed[i,j] = Δ(i|j), directed[j,i] = Δ(j|i)
+    D_ins = 0.5 * (directed + directed.transpose(-1, -2))
+
+    # Numerical cleanup.
+    D_ins = torch.nan_to_num(D_ins, nan=0.0, posinf=0.0, neginf=0.0)
+    D_ins = torch.clamp(D_ins, min=0.0)
+
+    # Self distance = 0.
+    eye = torch.eye(N, dtype=torch.bool, device=device).unsqueeze(0)
+    D_ins = D_ins.masked_fill(eye, 0.0)
+
+    return D_ins
+
+
+def compute_route_conditioned_insertion_cost(
+    locs: torch.Tensor,
+    k_neighbors: int = 15,
+    depot_loc: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sparse (B, N, k) Route-Conditioned Insertion Cost (RCIC), same storage
+    format as compute_sparse_insertion_cost(method="insertion").
+
+    Args:
+        locs:        (B, N, 2) customer coordinates. Must be 3D.
+        k_neighbors: Number of nearest neighbors per node.
+        depot_loc:   (B, 1, 2) depot coordinates. Defaults to (0.5, 0.5).
+
+    Returns:
+        (idx, val):
+            idx: (B, N, k) int16 — k-NN neighbor indices (Euclidean kNN).
+            val: (B, N, k) float32 — RCIC values to those neighbors.
+    """
+    B, N, _ = locs.shape
+    device = locs.device
+
+    if depot_loc is None:
+        depot_loc = torch.full((B, 1, 2), 0.5, device=device, dtype=locs.dtype)
+    elif depot_loc.dim() == 2:
+        depot_loc = depot_loc.unsqueeze(1)
+
+    d_ins = _compute_route_adjacent_insertion_cost(locs, depot_loc)
 
     # Euclidean kNN for neighbor selection (consistent with training convention)
     dist_customers = compute_pairwise_distance_matrix(locs)

@@ -298,9 +298,7 @@ class MetricPreservationLoss(nn.Module):
         return loss + dual_loss, info
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Slot Entropy Regulariser
-# ────────────────────────────────────────────────────────────────────────────────
+
 
 class SlotEntropyLoss(nn.Module):
     """

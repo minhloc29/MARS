@@ -1,25 +1,3 @@
-"""
-Evaluate a trained AMSlot/POMOSlot checkpoint on CVRP at a SPECIFIED instance
-size (defaults to the training size, but can override to test generalization on
-larger N like 200/500/1000 immediately).
-
-Loads the best checkpoint from a run, generates a fresh random CVRP dataset at
-the target num_loc, runs greedy decoding, and reports:
-    - mean tour length (= -mean reward, since CVRP reward = -tour length)
-    - mean reward
-    - (optional) gap vs an oracle if --gap_ref is provided
-
-Usage:
-    # eval at the same size as training
-    python scripts/eval_test.py --ckpt logs/am_slot_D_K8_N100_.../checkpoints/best-*.ckpt
-
-    # eval at a LARGER size immediately (generalization test) on 2000 instances
-    python scripts/eval_test.py --ckpt .../best-*.ckpt --num_loc 200 --n_inst 2000 --out results/eval_D_K8_N200.json
-
-Note: greedy single-start (AM-style) eval; for POMO checkpoints pass --num_starts to
-use multi-start greedy (requires a matching num_starts at eval).
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -28,6 +6,7 @@ from pathlib import Path
 
 import torch
 import lightning.pytorch as pl
+from tensordict import TensorDict
 
 from rl4co.envs import CVRPEnv
 from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
@@ -56,7 +35,20 @@ def main() -> None:
     # Build env at the target size and the matching model class.
     env = CVRPEnv(generator_kwargs=dict(num_loc=num_loc))
     model_cls = POMOSlot if backbone == "pomo" else AMSlot
-    model = model_cls.load_from_checkpoint(args.ckpt, env=env, map_location="cpu")
+    model = model_cls.load_from_checkpoint(args.ckpt, env=env, map_location="cpu", weights_only = False)
+    
+    print("=" * 60)
+    print("Requested num_loc:", num_loc)
+
+    env = CVRPEnv(generator_kwargs=dict(num_loc=num_loc))
+
+    print("ENV:", env)
+    print("GENERATOR:", env.generator)
+
+    if hasattr(env.generator, "__dict__"):
+        print("GENERATOR DICT:", env.generator.__dict__)
+
+    print("=" * 60)
 
     # ── Eval dataloader (fresh instances at target size) ─────────────────
     ds = env.dataset(batch_size=[args.n_inst])
@@ -74,11 +66,29 @@ def main() -> None:
     rewards = []
     with torch.no_grad():
         for batch in loader:
-            batch = batch.to(next(model.parameters()).device)
+            device = next(model.parameters()).device    
+            batch = TensorDict(
+                batch,
+                batch_size=[batch["locs"].shape[0]],
+                device=device,
+            )
             td = env.reset(batch)
             # num_starts: default to policy default (1 for AM / policy default for POMO).
             ns = args.num_starts
             out = model.policy(td, env, phase="test", num_starts=ns)
+            
+            r = out["reward"]
+
+            print(
+                f"N={num_loc} | "
+                f"locs={tuple(td['locs'].shape)} | "
+                f"coord_range=({td['locs'].min().item():.3f}, "
+                f"{td['locs'].max().item():.3f}) | "
+                f"reward_mean={r.mean().item():.4f} | "
+                f"reward_min={r.min().item():.4f} | "
+                f"reward_max={r.max().item():.4f}"
+            )
+
             rewards.append(out["reward"].cpu())
 
     reward = torch.cat(rewards)

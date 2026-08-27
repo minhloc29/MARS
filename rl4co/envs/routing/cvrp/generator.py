@@ -54,7 +54,7 @@ class CVRPGenerator(Generator):
 
     def __init__(
         self,
-        num_loc: int = 20,
+        num_loc: int = 200,
         min_loc: float = 0.0,
         max_loc: float = 1.0,
         loc_distribution: int | float | str | type | Callable = Uniform,

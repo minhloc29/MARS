@@ -30,6 +30,11 @@ Usage:
     python -m rl4co.data.generate_slot_dataset \\
         --num_locs 100 --dist uniform --n_train 100000 --n_val 1000 \\
         --out_dir ./data/slot_datasets_v2 --k_neighbors 15 --seed 42
+
+The insertion-cost target is selected via --method (savings / construction /
+insertion). Datasets are written to a method-scoped subdirectory of --out_dir
+(e.g. .../insertion/cvrp100_uniform_train.pt) so different d_ins targets never
+collide; pass the matching directory as train.py's --data_dir.
 """
 
 from __future__ import annotations
@@ -66,27 +71,25 @@ def _gen_clustered(
     Returns (batch, n, 2).
     """
     lo, hi = n_clusters_range
-    max_k = hi  # maximum possible number of clusters
+    max_k = hi
 
-    # Per-instance cluster counts: (batch,)
-    n_clust = torch.randint(lo, hi + 1, (batch,))  # (batch,)
+    # Per-instance cluster counts
+    n_clust = torch.randint(lo, hi + 1, (batch,))
 
-    # Sample cluster centers for all instances: (batch, max_k, 2)
+    # Sample cluster centers for all instances
     centers = torch.rand(batch, max_k, 2)
 
     # Assign nodes: random float in [0, n_clust[b]) per node, clamped to valid index
-    # rand: (batch, n), scale by n_clust per instance
-    rand_float = torch.rand(batch, n) * n_clust.float().unsqueeze(1)  # (batch, n)
-    assign_idx = rand_float.long().clamp(max=(n_clust - 1).unsqueeze(1))  # (batch, n)
+    rand_float = torch.rand(batch, n) * n_clust.float().unsqueeze(1)
+    assign_idx = rand_float.long().clamp(max=(n_clust - 1).unsqueeze(1))
 
-    # Gather cluster centers for each node: centers[b, assign_idx[b, i], :]
-    # assign_idx: (batch, n) -> expand to (batch, n, 2) for gather
+    # Gather cluster centers for each node
     assign_expanded = assign_idx.unsqueeze(-1).expand(batch, n, 2)
     node_centers = torch.gather(
         centers.unsqueeze(2).expand(batch, max_k, n, 2).permute(0, 2, 1, 3),
         dim=2,
         index=assign_idx.unsqueeze(-1).unsqueeze(-1).expand(batch, n, 1, 2),
-    ).squeeze(2)  # (batch, n, 2)
+    ).squeeze(2)
 
     # Add Gaussian noise and clamp to [0, 1]^2
     locs = (node_centers + cluster_std * torch.randn(batch, n, 2)).clamp(0.0, 1.0)
@@ -109,10 +112,12 @@ def _compute_sparse_d_ins(
     locs: torch.Tensor,
     depot: torch.Tensor,
     k_neighbors: int,
+    method: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute sparse (B, N, k) insertion cost. Returns (idx int16, val float32).
     depot: (B, 2) or (B, 1, 2) — both accepted.
+    method: "savings" | "construction" | "insertion" — d_ins target definition.
     """
     from rl4co.data.insertion_cost import compute_sparse_insertion_cost
 
@@ -121,7 +126,9 @@ def _compute_sparse_d_ins(
     else:
         depot_3d = depot
 
-    return compute_sparse_insertion_cost(locs, k_neighbors=k_neighbors, depot_loc=depot_3d)
+    return compute_sparse_insertion_cost(
+        locs, k_neighbors=k_neighbors, depot_loc=depot_3d, method=method
+    )
 
 
 def generate_split(
@@ -129,6 +136,7 @@ def generate_split(
     n: int,
     dist: str,
     k_neighbors: int,
+    method: str,
     chunk_size: int = 512,
 ) -> dict[str, torch.Tensor | str]:
     """
@@ -139,6 +147,7 @@ def generate_split(
         n:           Number of customer nodes per instance.
         dist:        "uniform" or "clustered".
         k_neighbors: k for kNN sparsification of d_ins.
+        method:      "savings" | "construction" | "insertion" — d_ins target.
         chunk_size:  Instances per processing chunk (avoid OOM for large N).
 
     Returns:
@@ -158,7 +167,7 @@ def generate_split(
         depot  = torch.rand(bs, 2)          # (bs, 2) — CVRPEnv expects (B, 2) not (B,1,2)
         demand = _gen_demands(bs, n)        # (bs, N) already normalized
 
-        d_idx, d_val = _compute_sparse_d_ins(locs, depot, k_neighbors)  # (bs,N,k) each
+        d_idx, d_val = _compute_sparse_d_ins(locs, depot, k_neighbors, method)  # (bs,N,k) each
 
         all_locs.append(locs)
         all_depots.append(depot)
@@ -192,17 +201,19 @@ def generate_and_save(
     n_val: int,
     n_test: int,
     k_neighbors: int,
+    method: str,
     chunk_size: int = 512,
 ) -> None:
     """
     Generate and save train/val/test splits to out_dir.
 
-    File naming convention:
-        {out_dir}/cvrp{n}_{dist}_train.pt
-        {out_dir}/cvrp{n}_{dist}_val.pt
-        {out_dir}/cvrp{n}_{dist}_test.pt
+    Datasets are written to a method-scoped subdirectory so different d_ins
+    targets (savings/construction/insertion) never collide:
+        {out_dir}/{method}/cvrp{n}_{dist}_train.pt
+        {out_dir}/{method}/cvrp{n}_{dist}_val.pt
+        {out_dir}/{method}/cvrp{n}_{dist}_test.pt
     """
-    out_dir = Path(out_dir)
+    out_dir = Path(out_dir) / method
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for split, n_instances in [("train", n_train), ("val", n_val), ("test", n_test)]:
@@ -213,7 +224,7 @@ def generate_and_save(
             print(f"  Skipping {fpath} (already exists).")
             continue
         print(f"\nGenerating {split} split: {n_instances} instances, N={n}, dist={dist}")
-        data = generate_split(n_instances, n, dist, k_neighbors, chunk_size)
+        data = generate_split(n_instances, n, dist, k_neighbors, method, chunk_size)
         torch.save(data, fpath)
         d_idx_shape = data["d_ins_idx"].shape
         print(f"  Saved -> {fpath}  (d_ins_idx shape: {d_idx_shape}, format: sparse_v2)")
@@ -231,6 +242,11 @@ def main() -> None:
     parser.add_argument("--n_val",       type=int,   default=1_000)
     parser.add_argument("--n_test",      type=int,   default=1_000)
     parser.add_argument("--out_dir",     type=str,   default="./data/slot_datasets_v2")
+    parser.add_argument("--method",      type=str,   default="construction",
+                        choices=["savings", "construction", "insertion"],
+                        help="d_ins target definition. 'insertion' = Route-Conditioned "
+                             "Insertion Cost (RCIC), the recommended Variant D target. "
+                             "Default 'construction' matches current cached datasets.")
     parser.add_argument("--k_neighbors", type=int,   default=15)
     parser.add_argument("--chunk_size",  type=int,   default=512)
     parser.add_argument("--seed",        type=int,   default=None,
@@ -251,6 +267,7 @@ def main() -> None:
             n_val=args.n_val,
             n_test=args.n_test,
             k_neighbors=args.k_neighbors,
+            method=args.method,
             chunk_size=args.chunk_size,
         )
 
