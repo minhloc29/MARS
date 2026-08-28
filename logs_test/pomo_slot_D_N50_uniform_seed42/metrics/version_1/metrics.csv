@@ -1,4 +1,0 @@
-epoch,step,train/aux_loss_epoch,train/aux_loss_step,train/loss,train/metric_lambda_epoch,train/metric_lambda_step,train/metric_penalty_epoch,train/metric_penalty_step,train/metric_spread_epoch,train/metric_spread_step,train/metric_violation_mean_epoch,train/metric_violation_mean_step,train/policy_loss_epoch,train/policy_loss_step,train/reward,train/slot_entropy_loss_epoch,train/slot_entropy_loss_step,val/reward
-0,9,,-0.1051710993051529,-1.6045910120010376,,1.0,,0.0,,-0.8438219428062439,,0.0,,-1.6045910120010376,-17.79741096496582,,-2.078890323638916,
-0,15,,,,,,,,,,,,,,,,,-13.825942039489746
-0,15,-0.10316658765077591,,,1.0,,0.0,,-0.8237754106521606,,0.0,,-2.8017995357513428,,,-2.078904628753662,,

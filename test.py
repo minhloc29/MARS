@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 import lightning.pytorch as pl
-
+from tensordict import TensorDict
 from rl4co.envs import CVRPEnv
 from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
 from rl4co.models.zoo.pomo_slot.model_am import SingleSharedBaseline
@@ -46,13 +46,20 @@ def main() -> None:
 
     # Load model
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    env = CVRPEnv(generator_kwargs=dict(num_loc=num_loc))
+    env = CVRPEnv(generator_params=dict(num_loc=num_loc))
     model_cls = POMOSlot if args.model == "pomo" else AMSlot
     model = model_cls.load_from_checkpoint(args.ckpt, env=env, map_location="cpu")
 
     # Eval dataloader — fresh instances at target size
     ds = env.dataset(batch_size=[args.n_inst])
-    loader = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+    collate_fn = getattr(ds, "collate_fn", None)
+    if collate_fn is None:
+        collate_fn = torch.stack  # TensorDict supports stacking a list of TensorDicts
+
+    loader = torch.utils.data.DataLoader(
+        ds, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn
+    )
 
     model.eval()
 

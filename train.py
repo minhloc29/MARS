@@ -166,8 +166,8 @@ def train(
     v_cfg = VARIANT_DEFAULTS[variant]
 
     data_dir = Path(data_dir)
-    train_path = data_dir / f"cvrp{num_loc}_{dist}_train.pt"
-    val_path   = data_dir / f"cvrp{num_loc}_{dist}_val.pt"
+    train_path = data_dir / ins_method / f"cvrp{num_loc}_{dist}_train.pt"
+    val_path   = data_dir / ins_method / f"cvrp{num_loc}_{dist}_val.pt"
 
     if not train_path.exists():
         raise FileNotFoundError(
@@ -215,11 +215,7 @@ def train(
         ins_method=ins_method,
         optimizer_kwargs={"lr": t_cfg["lr"]},
     )
-    # AM defaults to "rollout" baseline, but rollout requires the dataloader to
-    # attach baseline values via wrap_dataset — which this custom script does NOT
-    # do. So default the AM backbone to the "shared" baseline (batch-intrinsic,
-    # works with a plain DataLoader, exactly like POMO). Override with --baseline
-    # if a different baseline is wired up.
+
     if backbone == "am":
         model_kwargs["baseline"] = baseline if baseline is not None else "shared"
     # disable_slots: run backbone as a true no-slot baseline (no slot/aux).
