@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import time
 from pathlib import Path
 
@@ -35,26 +34,13 @@ MODEL_CLASSES = {
 
 
 class SlotDataset(torch.utils.data.Dataset):
-    """
-    Wraps cached .pt files from generate_slot_dataset.py (sparse_v2 format).
-    Returns dict items compatible with POMOSlot.shared_step.
-
-    Expected file format (sparse_v2):
-        locs:      (N_inst, N, 2)    float32
-        depot:     (N_inst, 2)       float32
-        demand:    (N_inst, N)       float32
-        capacity:  (N_inst, 1)       float32
-        d_ins_idx: (N_inst, N, k)    int16   -- k-NN indices
-        d_ins_val: (N_inst, N, k)    float32 -- insertion costs
-        format_version: "sparse_v2"
-    """
+    """Wraps cached .pt files from generate_slot_dataset.py (sparse_v2)."""
     def __init__(self, filepath: str | Path, variant: str = "D", max_instances: int | None = None):
         data = torch.load(filepath, map_location="cpu", weights_only=False)
 
-        # Check format version
+        # Format version sanity check (reject old dense d_ins)
         fmt = data.get("format_version", None)
         if fmt is None:
-            # Old dense format — detected by presence of "d_ins" key
             if "d_ins" in data:
                 raise RuntimeError(
                     f"Old dense d_ins format detected in {filepath}.\n"
@@ -69,6 +55,8 @@ class SlotDataset(torch.utils.data.Dataset):
         self.depot    = data["depot"]    # (N_inst, 2)
         self.demand   = data["demand"]   # (N_inst, N)
         self.capacity = data.get("capacity", None)
+        # d_ins cost-method tag stamped by the generator; None for legacy datasets.
+        self.method: str | None = data.get("method", None)
 
         # Sparse d_ins only needed for Variant D
         needs_dins = variant == "D"
@@ -103,8 +91,7 @@ class SlotDataset(torch.utils.data.Dataset):
 
 
 def _collate_fn(batch: list[dict]) -> dict:
-    """Collate list of dicts into a batched dict (stays as plain dict;
-    POMOSlot.shared_step converts it to TensorDict internally)."""
+    """Collate dicts -> batched dict; shared_step converts to TensorDict internally."""
     keys = batch[0].keys()
     return {k: torch.stack([b[k] for b in batch], dim=0) for k in keys}
 
@@ -121,16 +108,12 @@ def make_dataloader(filepath: str, variant: str, batch_size: int, shuffle: bool,
     )
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Training config
-# ════════════════════════════════════════════════════════════════════════════
-
 VARIANT_DEFAULTS = {
     "A": dict(metric_variant="A", alpha_metric=0.1,  beta_entropy=0.01),
     "B": dict(metric_variant="B", alpha_metric=0.0,  beta_entropy=0.00),
     "C": dict(metric_variant="C", alpha_metric=0.1,  beta_entropy=0.01),
     "D": dict(metric_variant="D", alpha_metric=0.1,  beta_entropy=0.01),
-    # E: future-regret target -- RESERVED, not yet implemented
+    # "E": future-regret target -- reserved, not implemented
 }
 
 TRAIN_DEFAULTS = {
@@ -141,18 +124,14 @@ TRAIN_DEFAULTS = {
 }
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Main training function
-# ════════════════════════════════════════════════════════════════════════════
-
 def train(
     variant: str = "D",
     num_loc: int = 100,
     dist: str = "uniform",
     data_dir: str = "./data/slot_datasets",
-    log_dir: str = "./logs",
+    output: str = "./output",
     seed: int = 42,
-    devices: int = 1,
+    device: int = 0,
     embed_dim: int = 128,
     num_slots: int = 8,
     proj_dim: int = 64,
@@ -164,6 +143,8 @@ def train(
     max_instances: int | None = None,
     backbone: str = "pomo",
     baseline: str | None = None,
+    disable_slots: bool = False,
+    ins_method: str = "construction",
     logger: str = "csv",
     resume: str | None = None,
 ):
@@ -174,15 +155,6 @@ def train(
 
     pl.seed_everything(seed)
     t_cfg = TRAIN_DEFAULTS[num_loc].copy()
-
-    # Resolve devices. Default is SINGLE GPU (devices=1): the custom dataloader
-    # below has no DistributedSampler, so multi-GPU DDP here would silently
-    # duplicate data across ranks instead of sharding it — and on Windows this
-    # torch build has no NCCL. Only if the user explicitly passes devices>1 do
-    # we attempt DDP, and then we force the gloo backend on Windows. 0/None
-    # simply means "single device" (CPU if no GPU).
-    if not devices or devices <= 0:
-        devices = 1
 
     if epochs is not None:
         t_cfg["epochs"] = epochs
@@ -204,26 +176,43 @@ def train(
             f"--num_locs {num_loc} --dist {dist} --out_dir {data_dir}"
         )
 
-    # ── Data ────────────────────────────────────────────────────────────
+    # Data
     train_loader = make_dataloader(train_path, variant, t_cfg["batch"], shuffle=True, max_instances=t_cfg["n_train"])
     val_loader   = make_dataloader(val_path,   variant, t_cfg["batch"], shuffle=False, max_instances=t_cfg["n_val"])
 
-    # ── Environment ─────────────────────────────────────────────────────
+    # Validate d_ins cost method (Variant D consumes d_ins). The data was baked
+    # with a specific method; refuse a mismatch so we never train on the wrong cost.
+    if variant == "D":
+        data_method = train_loader.dataset.method
+        if data_method is not None and data_method != ins_method:
+            raise RuntimeError(
+                f"ins_method mismatch: --ins_method={ins_method!r} but cached dataset "
+                f"{train_path} was generated with method={data_method!r} (see the "
+                f"'method' tag in the .pt, and the {data_dir.name}/ subfolder). "
+                f"Regenerate with --method {ins_method} or pass --ins_method {data_method}."
+            )
+        elif data_method is None:
+            print(f"[WARN] {train_path} has no 'method' tag (legacy dataset) — "
+                  f"cannot verify it matches --ins_method={ins_method!r}. "
+                  f"Regenerate datasets with the current generator to stamp the method.")
+        else:
+            print(f"Dataset method '{data_method}' matches --ins_method. OK.")
+
+    # Environment
     env = CVRPEnv(generator_kwargs=dict(num_loc=num_loc))
 
-    # ── Model ───────────────────────────────────────────────────────────
-    model_cls = MODEL_CLASSES[backbone]   # "pomo" -> POMOSlot, "am" -> AMSlot
+    # Model
+    model_cls = MODEL_CLASSES[backbone]
     model_kwargs = dict(
         env=env,
         embed_dim=embed_dim,
         num_slots=num_slots,
-        # Slot/metric config
         **v_cfg,
         proj_dim=proj_dim,
         slot_iters=slot_iters,
         lambda_init=lambda_init,
         lr_dual=lr_dual,
-        # Optimizer
+        ins_method=ins_method,
         optimizer_kwargs={"lr": t_cfg["lr"]},
     )
     # AM defaults to "rollout" baseline, but rollout requires the dataloader to
@@ -233,16 +222,18 @@ def train(
     # if a different baseline is wired up.
     if backbone == "am":
         model_kwargs["baseline"] = baseline if baseline is not None else "shared"
+    # disable_slots: run backbone as a true no-slot baseline (no slot/aux).
+    if disable_slots:
+        model_kwargs["disable_slots"] = True
     model = model_cls(**model_kwargs)
 
-    # ── Callbacks ───────────────────────────────────────────────────────
-    # run_name must uniquely identify the run so concurrent/serial configs
-    # (K sweep, D-vs-B ablation) never share a log dir. Include backbone,
-    # variant, K (num_slots), N, dist, seed. baseline only for am (pomo is
-    # hard-wired to "shared").
+    # run_name uniquely IDs the run (backbone, variant, K, N, dist, seed, ins_method).
     base_suffix = f"_bl{baseline}" if backbone == "am" and baseline else ""
-    run_name = f"{backbone}_slot_{variant}_K{num_slots}_N{num_loc}_{dist}_seed{seed}{base_suffix}"
-    log_path = Path(log_dir) / run_name
+    if disable_slots:
+        run_name = f"{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
+    else:
+        run_name = f"{backbone}_slot_{variant}_K{num_slots}_N{num_loc}_{dist}_{ins_method}_seed{seed}{base_suffix}"
+    log_path = Path(output) / run_name
 
     checkpoint_cb = ModelCheckpoint(
         dirpath=log_path / "checkpoints",
@@ -270,30 +261,26 @@ def train(
     else:
         logger_obj = CSVLogger(save_dir=str(log_path), name="metrics")
 
-    # ── Trainer ─────────────────────────────────────────────────────────
+    # Trainer (single GPU; --device picks the index)
+    use_cuda = torch.cuda.is_available()
     trainer_kwargs = dict(
         max_epochs=t_cfg["epochs"],
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=devices,
+        accelerator="gpu" if use_cuda else "cpu",
+        devices=[device] if use_cuda else 1,
+        strategy="auto",
         callbacks=[checkpoint_cb, early_stop_cb],
         logger=logger_obj,
         gradient_clip_val=1.0,
         enable_progress_bar=True,
         log_every_n_steps=10,
     )
-    if devices > 1:
-        # Multi-GPU DDP. Windows torch builds ship without NCCL; use gloo.
-        trainer_kwargs["strategy"] = "ddp"
-        if os.name == "nt":
-            trainer_kwargs["process_group_backend"] = "gloo"
-    else:
-        trainer_kwargs["strategy"] = "auto"
     trainer = pl.Trainer(**trainer_kwargs)
 
     print(f"\n{'='*60}")
     print(f"Training POMOSlot — Variant {variant} | N={num_loc} | {dist}")
     print(f"  Epochs: {t_cfg['epochs']}  Batch: {t_cfg['batch']}  LR: {t_cfg['lr']}")
     print(f"  Slots: K={num_slots}  proj_dim={proj_dim}  iters={slot_iters}")
+    print(f"  ins_method: {ins_method}")
     print(f"  Output: {log_path}")
     print(f"{'='*60}\n")
 
@@ -309,18 +296,18 @@ def train(
         "num_loc": num_loc,
         "dist": dist,
         "seed": seed,
+        "ins_method": ins_method,
         "best_val_reward": best_reward,
         "elapsed_min": round(elapsed / 60, 1),
         "checkpoint": str(checkpoint_cb.best_model_path),
     }
 
-    # Save result summary (deduplicate identical configs — rerun replaces,
-    # never appends a duplicate row).
-    result_dir = Path("results")
-    result_dir.mkdir(exist_ok=True)
+    # Dedup identical configs: rerun replaces, never appends a duplicate row.
+    result_dir = Path(output)
+    result_dir.mkdir(parents=True, exist_ok=True)
     result_file = result_dir / f"ablation_N{num_loc}.json"
     results = json.loads(result_file.read_text()) if result_file.exists() else []
-    dedup_key = {k: result[k] for k in ("backbone", "variant", "num_slots", "num_loc", "dist", "seed")}
+    dedup_key = {k: result[k] for k in ("backbone", "variant", "num_slots", "num_loc", "dist", "seed", "ins_method")}
     results = [r for r in results if not all(r.get(k) == v for k, v in dedup_key.items())]
     results.append(result)
     result_file.write_text(json.dumps(results, indent=2))
@@ -329,10 +316,6 @@ def train(
     return result
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# CLI
-# ════════════════════════════════════════════════════════════════════════════
-
 def main():
     parser = argparse.ArgumentParser(description="Train POMOSlot -- Metric-Aware NCO")
     parser.add_argument("--variant",       type=str,   default="D",       choices=list("ABCD"),
@@ -340,16 +323,21 @@ def main():
     parser.add_argument("--num_loc",       type=int,   default=100,       choices=[50, 100, 200, 500])
     parser.add_argument("--dist",          type=str,   default="uniform", choices=["uniform", "clustered"])
     parser.add_argument("--data_dir",      type=str,   default="./data/slot_datasets_v2")
-    parser.add_argument("--log_dir",       type=str,   default="./logs")
+    parser.add_argument("--output",        type=str,   default="./output",
+                        help="Root dir for logs + results/ablation_N{num_loc}.json")
     parser.add_argument("--seed",          type=int,   default=42)
-    parser.add_argument("--devices",       type=int,   default=1,
-                        help="Number of GPUs to use (default 1). Pass >1 for DDP.")
+    parser.add_argument("--device",        type=int,   default=0,
+                        help="GPU index (0 or 1) to use; single GPU only.")
     parser.add_argument("--embed_dim",     type=int,   default=128)
     parser.add_argument("--num_slots",     type=int,   default=8)
     parser.add_argument("--proj_dim",      type=int,   default=64)
     parser.add_argument("--slot_iters",    type=int,   default=3)
     parser.add_argument("--lambda_init",   type=float, default=1.0)
     parser.add_argument("--lr_dual",       type=float, default=1e-4)
+    parser.add_argument("--ins_method",    type=str,   default="construction",
+                        choices=["savings", "construction", "insertion"],
+                        help="d_ins insertion-cost method. Must match the cached dataset's "
+                             "'method' tag (the generator stamps it into the .pt).")
     parser.add_argument("--epochs",        type=int,   default=None)
     parser.add_argument("--batch_size",    type=int,   default=None)
     parser.add_argument("--max_instances", type=int,   default=None,
@@ -358,6 +346,8 @@ def main():
                         help="Backbone: 'pomo' (multi-start, shared baseline) or 'am' (single-start, rollout baseline)")
     parser.add_argument("--baseline",      type=str,   default=None,
                         help="REINFORCE baseline for the AM backbone (e.g. rollout, shared). Ignored for pomo.")
+    parser.add_argument("--disable_slots", action="store_true",
+                        help="Run the backbone as a true no-slot baseline (skips SlotAttention + aux losses).")
     parser.add_argument("--logger",        type=str,   default="csv", choices=["csv", "wandb"],
                         help="Logger: 'csv' (default, lightweight) or 'wandb' (requires wandb login).")
     parser.add_argument("--resume",        type=str,   default=None,
@@ -369,9 +359,9 @@ def main():
         num_loc=args.num_loc,
         dist=args.dist,
         data_dir=args.data_dir,
-        log_dir=args.log_dir,
+        output=args.output,
         seed=args.seed,
-        devices=args.devices,
+        device=args.device,
         embed_dim=args.embed_dim,
         num_slots=args.num_slots,
         proj_dim=args.proj_dim,
@@ -383,6 +373,8 @@ def main():
         max_instances=args.max_instances,
         backbone=args.backbone,
         baseline=args.baseline,
+        disable_slots=args.disable_slots,
+        ins_method=args.ins_method,
         logger=args.logger,
         resume=args.resume,
     )

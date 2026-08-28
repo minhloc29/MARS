@@ -1,39 +1,3 @@
-"""
-M5 — POMOSlot: POMO + Slot Attention + Metric-Aware Loss
-
-A drop-in extension of rl4co's POMO model that:
-  1. Wraps the POMO encoder with SlotInjectingEncoder so that slot context
-     is fed into the decoder on every forward pass (not just in a side branch).
-  2. Reads slot embeddings from the encoder side-channel after each policy
-     forward to compute auxiliary losses (Variants A, C, D).
-  3. Adds a slot entropy regulariser to prevent slot collapse.
-
-Ablation Variants (controlled via `metric_variant` arg):
-  "none" / "B" : No metric loss — slot learns purely from task (REINFORCE) loss
-  "A"           : Reconstruction loss (MSE on slot centroids vs node coords)
-  "C"           : Metric loss with Euclidean centroid distance as target
-  "D"           : Metric loss with insertion-cost distance (proposed method)
-  # "E"         : Future-regret target — reserved, not implemented yet
-
-Augmentation note:
-  POMO disables augmentation during training (n_aug=0). Aux losses are only
-  computed during training. Therefore slots and d_ins always share batch size B.
-  If aux losses are ever extended to val/test, d_ins must be repeated by
-  num_augment before passing to metric_loss_fn.
-
-Usage example (Variant D):
-    from rl4co.models.zoo.pomo_slot import POMOSlot
-
-    model = POMOSlot(
-        env,
-        embed_dim=128,
-        num_slots=8,
-        metric_variant="D",
-        alpha_metric=0.1,
-        beta_entropy=0.01,
-    )
-"""
-
 from __future__ import annotations
 
 import math
@@ -81,6 +45,8 @@ class POMOSlot(POMO):
         proj_dim (int): Projection dimension for phi(z_k) in metric loss.
         lambda_init (float): Initial Lagrange multiplier for MetricPreservationLoss.
         lr_dual (float): Learning rate for dual ascent on lambda (log_lambda param group).
+        ins_method (str): d_ins insertion-cost definition for the on-the-fly
+            Variant D fallback: "savings" | "construction" | "insertion".
         **pomo_kwargs: All remaining kwargs forwarded to POMO base class.
     """
 
@@ -100,20 +66,21 @@ class POMOSlot(POMO):
         lambda_init: float = 1.0,
         lr_dual: float = 1e-3,
         k_neighbors: int = 15,
+        ins_method: str = "construction",
         **pomo_kwargs,
     ) -> None:
         assert metric_variant in self.METRIC_VARIANTS, (
             f"metric_variant must be one of {self.METRIC_VARIANTS}, got '{metric_variant}'"
         )
 
-        # ── Build SlotAttention ───────────────────────────────────────────
+        # Build SlotAttention
         slot_attn = SlotAttention(
             num_slots=num_slots,
             dim=embed_dim,
             iters=slot_iters,
         )
 
-        # ── Build base encoder, wrap it with slot injection ───────────────
+        # Build base encoder, wrap it with slot injection
         base_encoder = AttentionModelEncoder(
             embed_dim=embed_dim,
             num_heads=pomo_kwargs.pop("num_heads", 8),
@@ -124,7 +91,7 @@ class POMOSlot(POMO):
         )
         slot_encoder = SlotInjectingEncoder(base_encoder, slot_attn)
 
-        # ── Build AttentionModelPolicy with our slot-injecting encoder ────
+        # Build AttentionModelPolicy with our slot-injecting encoder
         policy = AttentionModelPolicy(
             encoder=slot_encoder,
             embed_dim=embed_dim,
@@ -132,7 +99,7 @@ class POMOSlot(POMO):
             use_graph_context=pomo_kwargs.pop("use_graph_context", False),
         )
 
-        # ── Init POMO (which sets up REINFORCE, shared baseline, etc.) ────
+        # Init POMO (which sets up REINFORCE, shared baseline, etc.)
         super().__init__(env, policy=policy, **pomo_kwargs)
         self.save_hyperparameters(logger=False, ignore=["env", "policy"])
 
@@ -142,12 +109,13 @@ class POMOSlot(POMO):
         self.alpha_metric = alpha_metric
         self.beta_entropy = beta_entropy
         self.k_neighbors = k_neighbors
+        self.ins_method = ins_method
 
         # Keep a reference to slot_attn for display in the model summary
         # (it's actually inside policy.encoder, but named here for clarity)
         self.slot_attn = slot_attn
 
-        # ── Auxiliary losses ──────────────────────────────────────────────
+        # Auxiliary losses
         self.slot_entropy_loss = SlotEntropyLoss()
 
         self.metric_loss_fn: MetricPreservationLoss | None = None
@@ -168,11 +136,8 @@ class POMOSlot(POMO):
             f"variant={metric_variant}, alpha={alpha_metric}, beta={beta_entropy}"
         )
 
-    # ────────────────────────────────────────────────────────────────────────
-    # configure_optimizers: add separate param group for log_lambda (dual ascent)
-    # Delegates back to base class to preserve the POMO LR scheduler.
-    # ────────────────────────────────────────────────────────────────────────
-
+    # configure_optimizers: separate dual param group for log_lambda (dual ascent),
+    # delegating to base to keep the POMO LR scheduler.
     def configure_optimizers(self):
         if self.metric_loss_fn is None:
             # No dual parameter — use base class as-is
@@ -188,25 +153,12 @@ class POMOSlot(POMO):
             {"params": main_params},                      # uses base lr + scheduler
             {"params": dual_params, "lr": lr_dual},       # dual ascent, no scheduler
         ]
-        # super().configure_optimizers(parameters) builds optimizer+scheduler using
-        # RL4COLitModule machinery, so we preserve scheduler type and kwargs exactly.
+        # super(parameters=) builds optimizer+scheduler via RL4COLitModule machinery.
         return super().configure_optimizers(parameters=param_groups)
 
-    # ────────────────────────────────────────────────────────────────────────
-    # on_after_optimizer_step: bound log_lambda (dual ascent) growth
-    # ────────────────────────────────────────────────────────────────────────
-    # The dual-ascent update on log_lambda is self-reinforcing: its gradient is
-    # proportional to lambda itself (d/dlog_lambda of -lambda * penalty =
-    # -penalty * lambda). If a batch produces a sudden penalty spike this can
-    # push lambda up hyper-exponentially with no natural bound, which then
-    # dominates `loss = spread + lambda.detach() * penalty` and corrupts the
-    # shared encoder -> policy gradient (entropy spike / reward crash).
-    #
-    # Clamp log_lambda after every optimiser step so lambda = exp(log_lambda)
-    # never exceeds LAMBDA_MAX. This is a cheap safety net that bounds the
-    # runaway regardless of its root cause. LAMBDA_MAX is a hyperparameter that
-    # can be tuned (via self.lambda_max, default 50.0).
-
+    # on_after_optimizer_step: clamp log_lambda (dual ascent) so lambda never
+    # exceeds LAMBDA_MAX — runaway lambda would dominate loss and corrupt the
+    # policy gradient. Safety net; lambda_max tunable (default 50.0).
     def on_after_optimizer_step(self, optimizer):
         if self.metric_loss_fn is None:
             return
@@ -214,15 +166,11 @@ class POMOSlot(POMO):
         with torch.no_grad():
             self.metric_loss_fn.log_lambda.data.clamp_(max=math.log(lambda_max))
 
-    # ────────────────────────────────────────────────────────────────────────
     # shared_step: extract d_ins, run POMO, read slot side-channel, add aux loss
-    # ────────────────────────────────────────────────────────────────────────
-
     def shared_step(
         self, batch: Any, batch_idx: int, phase: str, dataloader_idx: int = None
     ):
-        # ── Extract sparse d_ins keys from batch BEFORE passing to POMO ──
-        # d_ins_idx / d_ins_val are slot-only keys not understood by CVRPEnv.
+        # Extract sparse d_ins keys BEFORE passing to POMO (slot-only, not env keys).
         d_ins_idx = None
         d_ins_val = None
 
@@ -246,28 +194,15 @@ class POMOSlot(POMO):
             d_ins_idx = d_ins_idx.to(device)  # keep as int16 for transfer, cast in loss fn
         if d_ins_val is not None:
             d_ins_val = d_ins_val.to(device)
-        # ── Read locs BEFORE super().shared_step() mutates the batch ──────
-        # After super() calls env.reset(batch), batch gains 'visited' (shape B,N+1).
-        # We cannot call env.reset(batch) again without a shape mismatch.
-        # Instead, extract customer locs (excluding depot) directly from batch here.
-        # CVRPEnv stores customers at locs[:, 0:N, :] and depot separately.
-        # Our dataset stores them as locs (B,N,2) without depot prepended.
-        # The encoder sees locs with depot prepended by the env's init_embedding.
+        # Read locs BEFORE super() mutates the batch (it adds 'visited' etc.).
         locs_customers: torch.Tensor | None = None
         if self.metric_variant not in ("none", "B"):
             raw_locs = batch.get("locs") if hasattr(batch, "get") else batch["locs"]
             locs_customers = raw_locs.to(device)  # (B, N, 2) — customers only, no depot
 
-        # ── Fallback: compute d_ins on-the-fly if Variant D needs it, but the
-        # dataset didn't cache it (e.g. the standard `run.py` TSP/CVRP pipeline).
-        # This mirrors generate_slot_dataset.build_sparse_d_ins so batched training
-        # works without precomputed d_ins matrices.
-        #
-        # NOTE on node indexing: A_ik is built over hidden[:, 1:, :], i.e. node
-        # index 0 is treated as a pseudo-depot (see SlotInjectingEncoder). So the
-        # on-the-fly d_ins must cover the SAME customer nodes as A_ik (N-1), with
-        # node 0 used as the depot origin — otherwise the aggregation in
-        # _aggregate_d_ins_sparse sees an N mismatch with A_ik.
+        # On-the-fly d_ins fallback for Variant D when the dataset didn't cache it.
+        # Node indexing: A_ik covers hidden[:, 1:, :] so node 0 is a pseudo-depot;
+        # d_ins must cover the same N-1 customer nodes (see SlotInjectingEncoder).
         if (
             self.metric_variant == "D"
             and d_ins_idx is None
@@ -278,20 +213,18 @@ class POMOSlot(POMO):
             customers = locs_customers[:, 1:, :]   # (B, N_cust, 2) — matches A_ik
             depot = locs_customers[:, :1, :]        # (B, 1, 2) — node 0 as pseudo-depot
             d_ins_idx, d_ins_val = compute_sparse_insertion_cost(
-                customers, k_neighbors=self.k_neighbors, depot_loc=depot
+                customers, k_neighbors=self.k_neighbors, depot_loc=depot,
+                method=self.ins_method,
             )  # (B, N_cust, k) int16, (B, N_cust, k) float32
 
-        # ── Run standard POMO step ────────────────────────────────────────
-        # SlotInjectingEncoder runs inside policy.forward() here.
-        # After this call, slots and A_ik are available via side-channel.
+        # Run standard POMO step (slot encoder runs inside policy.forward()).
         out = super().shared_step(batch, batch_idx, phase, dataloader_idx)
 
-        # ── Skip aux losses during val/test ──────────────────────────────
+        # Skip aux losses during val/test
         if phase != "train" or self.metric_variant in ("none", "B"):
             return out
 
-        # ── Read slot side-channel ────────────────────────────────────────
-        # policy.encoder is our SlotInjectingEncoder
+        # Read slot side-channel (policy.encoder is SlotInjectingEncoder)
         slots = self.policy.encoder.last_slots  # (B, K, d)
         A_ik  = self.policy.encoder.last_A_ik   # (B, N, K)
 
@@ -299,7 +232,7 @@ class POMOSlot(POMO):
             log.warning("SlotInjectingEncoder side-channel is None — skipping aux loss.")
             return out
 
-        # ── Compute auxiliary losses ──────────────────────────────────────
+        # Compute auxiliary losses
         aux_loss = torch.tensor(0.0, device=device)
         log_dict: dict = {}
 
@@ -331,7 +264,7 @@ class POMOSlot(POMO):
             aux_loss = aux_loss + self.alpha_metric * metric_loss
             log_dict.update(metric_info)
 
-        # ── Merge auxiliary loss into policy loss ─────────────────────────
+        # Merge auxiliary loss into policy loss
         policy_loss = out.get("loss", None)
         if policy_loss is not None and aux_loss.requires_grad:
             out["loss"] = policy_loss + aux_loss

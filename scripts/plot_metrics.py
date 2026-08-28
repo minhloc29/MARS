@@ -1,29 +1,3 @@
-"""
-Plot & compare training curves from multiple Lightning CSVLogger metrics.csv.
-
-Reads several metrics.csv files (one per run) and overlays them — one line per
-run — split across two panels: (left) val/reward, (right) train loss components.
-This is the tool for the D-vs-B / K-sweep comparison: drop one CSV per run and
-read which val/reward curve wins.
-
-Usage:
-    # single run
-    python scripts/plot_metrics.py logs/am_slot_D_K8_.../metrics/metrics.csv
-
-    # compare many runs (pass each run's dir or its metrics.csv)
-    python scripts/plot_metrics.py \
-        logs/am_slot_D_K8_N100_uniform_seed42 \
-        logs/am_slot_B_K8_N100_uniform_seed42 \
-        --out compare_D_vs_B.png
-
-Metrics of interest:
-    val/reward          - greedy validation reward (higher = better tour)
-    train/reward        - training reward
-    train/loss          - total loss (policy + aux)
-    train/policy_loss   - REINFORCE loss component
-    train/aux_loss      - metric/entropy aux loss component
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -33,7 +7,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
-# Panels on the right: which loss components to plot per run
+# Loss components to plot in the right panel
 LOSS_COLS = ["train/loss", "train/policy_loss", "train/aux_loss"]
 
 
@@ -82,7 +56,7 @@ def main() -> None:
                         help="If set, log the figure to a wandb run (pass the run_id / project:run or 'new'). Requires wandb login.")
     args = parser.parse_args()
 
-    # ── Load all runs ────────────────────────────────────────────────────
+    # Load all runs
     runs = []
     for raw in args.csvs:
         csv_path = resolve_csv(Path(raw))
@@ -101,7 +75,7 @@ def main() -> None:
         print("Nothing to plot.")
         return
 
-    # ── Figure: left = val/reward, right = loss components ───────────────
+    # Figure: left = val/reward, right = loss components
     fig, (ax_val, ax_loss) = plt.subplots(1, 2, figsize=(14, 5))
     cmap = plt.get_cmap("tab10")
 
@@ -139,7 +113,7 @@ def main() -> None:
     else:
         plt.show()
 
-    # ── Optional: push the figure to a wandb run ────────────────────────
+    # Optional: push the figure to a wandb run
     if args.log_wandb:
         import wandb
         wandb.init(project="MeTRA_Slot_NCO", id=args.log_wandb if args.log_wandb != "new" else None,

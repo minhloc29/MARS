@@ -1,30 +1,3 @@
-"""
-AMSlot — Attention Model + Slot Attention + Metric-Aware Loss
-
-Lightweight single-start counterpart to :class:`POMOSlot`. Uses the exact same
-slot module (SlotInjectingEncoder) and metric-loss machinery, but bases the
-training loop on the Attention Model (AM) instead of POMO:
-
-    AM  : single-start decode, rollout baseline, 3 encoder layers
-    POMO: multi-start decode, shared baseline,    6 encoder layers
-
-Because :class:`rl4co.models.rl.REINFORCE`'s `shared_step` is already
-single-start and backbone-agnostic, this class only needs to (1) build the
-slot-injecting policy exactly like POMOSlot and (2) call the base AM
-`shared_step` (REINFORCE's) before adding the auxiliary losses.
-
-Ablation Variants (controlled via `metric_variant`):
-  "none" / "B" : No metric loss — slot learns purely from task (REINFORCE) loss
-  "A"           : Reconstruction loss (MSE on slot centroids vs node coords)
-  "C"           : Metric loss with Euclidean centroid distance as target
-  "D"           : Metric loss with insertion-cost distance (proposed method)
-  # "E"         : Future-regret target — reserved, not implemented yet
-
-Usage:
-    from rl4co.models.zoo.pomo_slot import AMSlot
-    model = AMSlot(env, embed_dim=128, num_slots=8, metric_variant="D")
-"""
-
 from __future__ import annotations
 
 import math
@@ -86,6 +59,8 @@ class AMSlot(AttentionModel):
         lambda_init (float): Initial Lagrange multiplier for MetricPreservationLoss.
         lr_dual (float): Learning rate for dual ascent on lambda (log_lambda param group).
         k_neighbors (int): kNN sparsification for on-the-fly d_ins computation (Variant D).
+        ins_method (str): d_ins insertion-cost definition for the on-the-fly
+            Variant D fallback: "savings" | "construction" | "insertion".
         baseline (str): REINFORCE baseline — "rollout" (default, true AM) or "shared".
         **am_kwargs: Remaining kwargs forwarded to AttentionModel base class.
     """
@@ -106,21 +81,16 @@ class AMSlot(AttentionModel):
         lambda_init: float = 1.0,
         lr_dual: float = 1e-3,
         k_neighbors: int = 15,
+        ins_method: str = "construction",
         baseline: str = "rollout",
+        disable_slots: bool = False,
         **am_kwargs,
     ) -> None:
         assert metric_variant in self.METRIC_VARIANTS, (
             f"metric_variant must be one of {self.METRIC_VARIANTS}, got '{metric_variant}'"
         )
 
-        # ── Build SlotAttention ───────────────────────────────────────────
-        slot_attn = SlotAttention(
-            num_slots=num_slots,
-            dim=embed_dim,
-            iters=slot_iters,
-        )
-
-        # ── Build base encoder, wrap it with slot injection ───────────────
+        # Base encoder used directly when disable_slots (plain AM — no slots).
         # AM default is 3 encoder layers (lighter than POMO's 6). Overridable.
         base_encoder = AttentionModelEncoder(
             embed_dim=embed_dim,
@@ -130,17 +100,32 @@ class AMSlot(AttentionModel):
             normalization=am_kwargs.pop("normalization", "instance"),
             feedforward_hidden=am_kwargs.pop("feedforward_hidden", 512),
         )
-        slot_encoder = SlotInjectingEncoder(base_encoder, slot_attn)
 
-        # ── Build AttentionModelPolicy with our slot-injecting encoder ────
-        policy = AttentionModelPolicy(
-            encoder=slot_encoder,
-            embed_dim=embed_dim,
-            env_name=env.name,
-            use_graph_context=am_kwargs.pop("use_graph_context", False),
-        )
+        if disable_slots:
+            # Plain AM — no slot attention or injection.
+            policy = AttentionModelPolicy(
+                encoder=base_encoder,
+                embed_dim=embed_dim,
+                env_name=env.name,
+                use_graph_context=am_kwargs.pop("use_graph_context", False),
+            )
+            slot_attn = None
+        else:
+            # Wrap the base encoder with slot injection.
+            slot_attn = SlotAttention(
+                num_slots=num_slots,
+                dim=embed_dim,
+                iters=slot_iters,
+            )
+            slot_encoder = SlotInjectingEncoder(base_encoder, slot_attn)
+            policy = AttentionModelPolicy(
+                encoder=slot_encoder,
+                embed_dim=embed_dim,
+                env_name=env.name,
+                use_graph_context=am_kwargs.pop("use_graph_context", False),
+            )
 
-        # ── Init AM (REINFORCE single-start) ─────────────────────────────
+        # Init AM (REINFORCE single-start)
         # The stock "shared" baseline reduces over dim=1 (POMO multi-start
         # layout) and breaks on single-start rewards [B]. Route it through
         # the single-start-safe subclass. Other strings (e.g. "rollout") are
@@ -156,26 +141,17 @@ class AMSlot(AttentionModel):
         self.alpha_metric = alpha_metric
         self.beta_entropy = beta_entropy
         self.k_neighbors = k_neighbors
+        self.ins_method = ins_method
+        self.disable_slots = disable_slots
 
-        # Keep a reference to slot_attn for display in the model summary
-        # (it's actually inside policy.encoder, but named here for clarity)
+        # Reference for display (lives inside policy.encoder)
         self.slot_attn = slot_attn
 
-        # ── Auxiliary losses ──────────────────────────────────────────────
-        self.slot_entropy_loss = SlotEntropyLoss()
-
-        self.metric_loss_fn: MetricPreservationLoss | None = None
-        if metric_variant not in ("none", "B", "A"):
-            proj_head = ProjectionHead(
-                input_dim=embed_dim,
-                proj_dim=proj_dim,
-            )
-            self.metric_loss_fn = MetricPreservationLoss(
-                proj_head=proj_head,
-                variant=metric_variant,
-                lambda_init=lambda_init,
-                lr_dual=lr_dual,
-            )
+        # Auxiliary losses (skipped when slots are disabled)
+        self.slot_entropy_loss = None if disable_slots else SlotEntropyLoss()
+        self.metric_loss_fn = (
+            None if disable_slots else self._build_metric_loss(metric_variant, embed_dim, proj_dim, lambda_init, lr_dual)
+        )
 
         log.info(
             f"AMSlot: embed_dim={embed_dim}, K={num_slots}, "
@@ -183,11 +159,20 @@ class AMSlot(AttentionModel):
             f"baseline={baseline}"
         )
 
-    # ────────────────────────────────────────────────────────────────────────
-    # configure_optimizers: add separate param group for log_lambda (dual ascent)
-    # Delegates back to base class to preserve the AM LR scheduler.
-    # ────────────────────────────────────────────────────────────────────────
+    def _build_metric_loss(self, variant, embed_dim, proj_dim, lambda_init, lr_dual):
+        """Construct the metric-preservation loss for metric variants (C/D)."""
+        if variant in ("none", "B", "A"):
+            return None
+        proj_head = ProjectionHead(input_dim=embed_dim, proj_dim=proj_dim)
+        return MetricPreservationLoss(
+            proj_head=proj_head,
+            variant=variant,
+            lambda_init=lambda_init,
+            lr_dual=lr_dual,
+        )
 
+    # configure_optimizers: separate dual param group for log_lambda (dual ascent),
+    # delegating to base to keep the AM LR scheduler.
     def configure_optimizers(self):
         if self.metric_loss_fn is None:
             # No dual parameter — use base class as-is
@@ -205,11 +190,8 @@ class AMSlot(AttentionModel):
         ]
         return super().configure_optimizers(parameters=param_groups)
 
-    # ────────────────────────────────────────────────────────────────────────
-    # on_after_optimizer_step: bound log_lambda (dual ascent) growth
-    # (Same safety net as POMOSlot — see model.py for rationale.)
-    # ────────────────────────────────────────────────────────────────────────
-
+    # on_after_optimizer_step: clamp log_lambda (dual ascent). Same safety net
+    # as POMOSlot (see model.py for rationale).
     def on_after_optimizer_step(self, optimizer):
         if self.metric_loss_fn is None:
             return
@@ -217,16 +199,13 @@ class AMSlot(AttentionModel):
         with torch.no_grad():
             self.metric_loss_fn.log_lambda.data.clamp_(max=math.log(lambda_max))
 
-    # ────────────────────────────────────────────────────────────────────────
     # shared_step: extract d_ins, run AM (single-start), read slot side-channel,
     # add aux loss. Mirrors POMOSlot.shared_step except it calls the base AM
     # (REINFORCE) step — already single-start, so no multistart reshape needed.
-    # ────────────────────────────────────────────────────────────────────────
-
     def shared_step(
         self, batch: Any, batch_idx: int, phase: str, dataloader_idx: int = None
     ):
-        # ── Extract sparse d_ins keys from batch BEFORE passing to base ──
+        # Extract sparse d_ins keys from batch BEFORE passing to base
         d_ins_idx = None
         d_ins_val = None
 
@@ -250,13 +229,13 @@ class AMSlot(AttentionModel):
             d_ins_idx = d_ins_idx.to(device)  # keep as int16 for transfer, cast in loss fn
         if d_ins_val is not None:
             d_ins_val = d_ins_val.to(device)
-        # ── Read locs BEFORE base shared_step mutates the batch ──────────
+        # Read locs BEFORE base shared_step mutates the batch
         locs_customers: torch.Tensor | None = None
         if self.metric_variant not in ("none", "B"):
             raw_locs = batch.get("locs") if hasattr(batch, "get") else batch["locs"]
             locs_customers = raw_locs.to(device)  # (B, N, 2) — customers only, no depot
 
-        # ── Fallback: compute d_ins on-the-fly if Variant D needs it, but the
+        # Fallback: compute d_ins on-the-fly if Variant D needs it, but the
         # dataset didn't cache it (mirrors POMOSlot — see model.py for indexing notes)
         if (
             self.metric_variant == "D"
@@ -268,19 +247,19 @@ class AMSlot(AttentionModel):
             customers = locs_customers[:, 1:, :]   # (B, N_cust, 2) — matches A_ik
             depot = locs_customers[:, :1, :]        # (B, 1, 2) — node 0 as pseudo-depot
             d_ins_idx, d_ins_val = compute_sparse_insertion_cost(
-                customers, k_neighbors=self.k_neighbors, depot_loc=depot
+                customers, k_neighbors=self.k_neighbors, depot_loc=depot,
+                method=self.ins_method,
             )  # (B, N_cust, k) int16, (B, N_cust, k) float32
 
-        # ── Run standard AM (REINFORCE) step — single-start ──────────────
-        # SlotInjectingEncoder runs inside policy.forward() here.
-        # After this call, slots and A_ik are available via side-channel.
+        # Run standard AM (REINFORCE) step — single-start. Slot encoder runs
+        # inside policy.forward(); slots/A_ik available via side-channel after.
         out = super().shared_step(batch, batch_idx, phase, dataloader_idx)
 
-        # ── Skip aux losses during val/test ──────────────────────────────
-        if phase != "train" or self.metric_variant in ("none", "B"):
+        # Skip aux losses during val/test, or when slots are disabled.
+        if phase != "train" or self.metric_variant in ("none", "B") or self.disable_slots:
             return out
 
-        # ── Read slot side-channel ────────────────────────────────────────
+        # Read slot side-channel
         slots = self.policy.encoder.last_slots  # (B, K, d)
         A_ik  = self.policy.encoder.last_A_ik   # (B, N, K)
 
@@ -288,7 +267,7 @@ class AMSlot(AttentionModel):
             log.warning("SlotInjectingEncoder side-channel is None — skipping aux loss.")
             return out
 
-        # ── Compute auxiliary losses ──────────────────────────────────────
+        # Compute auxiliary losses
         aux_loss = torch.tensor(0.0, device=device)
         log_dict: dict = {}
 
@@ -320,7 +299,7 @@ class AMSlot(AttentionModel):
             aux_loss = aux_loss + self.alpha_metric * metric_loss
             log_dict.update(metric_info)
 
-        # ── Merge auxiliary loss into policy loss ─────────────────────────
+        # Merge auxiliary loss into policy loss
         policy_loss = out.get("loss", None)
         if policy_loss is not None and aux_loss.requires_grad:
             out["loss"] = policy_loss + aux_loss
