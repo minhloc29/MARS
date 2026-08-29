@@ -67,20 +67,14 @@ class POMOSlot(POMO):
         lr_dual: float = 1e-3,
         k_neighbors: int = 15,
         ins_method: str = "construction",
+        disable_slots: bool = False,
         **pomo_kwargs,
     ) -> None:
         assert metric_variant in self.METRIC_VARIANTS, (
             f"metric_variant must be one of {self.METRIC_VARIANTS}, got '{metric_variant}'"
         )
 
-        # Build SlotAttention
-        slot_attn = SlotAttention(
-            num_slots=num_slots,
-            dim=embed_dim,
-            iters=slot_iters,
-        )
-
-        # Build base encoder, wrap it with slot injection
+        # Base encoder used directly when disable_slots (plain POMO — no slots).
         base_encoder = AttentionModelEncoder(
             embed_dim=embed_dim,
             num_heads=pomo_kwargs.pop("num_heads", 8),
@@ -89,15 +83,30 @@ class POMOSlot(POMO):
             normalization=pomo_kwargs.pop("normalization", "instance"),
             feedforward_hidden=pomo_kwargs.pop("feedforward_hidden", 512),
         )
-        slot_encoder = SlotInjectingEncoder(base_encoder, slot_attn)
 
-        # Build AttentionModelPolicy with our slot-injecting encoder
-        policy = AttentionModelPolicy(
-            encoder=slot_encoder,
-            embed_dim=embed_dim,
-            env_name=env.name,
-            use_graph_context=pomo_kwargs.pop("use_graph_context", False),
-        )
+        if disable_slots:
+            # Plain POMO — no slot attention or injection.
+            policy = AttentionModelPolicy(
+                encoder=base_encoder,
+                embed_dim=embed_dim,
+                env_name=env.name,
+                use_graph_context=pomo_kwargs.pop("use_graph_context", False),
+            )
+            slot_attn = None
+        else:
+            # Build SlotAttention, wrap encoder with slot injection
+            slot_attn = SlotAttention(
+                num_slots=num_slots,
+                dim=embed_dim,
+                iters=slot_iters,
+            )
+            slot_encoder = SlotInjectingEncoder(base_encoder, slot_attn)
+            policy = AttentionModelPolicy(
+                encoder=slot_encoder,
+                embed_dim=embed_dim,
+                env_name=env.name,
+                use_graph_context=pomo_kwargs.pop("use_graph_context", False),
+            )
 
         # Init POMO (which sets up REINFORCE, shared baseline, etc.)
         super().__init__(env, policy=policy, **pomo_kwargs)
@@ -110,16 +119,17 @@ class POMOSlot(POMO):
         self.beta_entropy = beta_entropy
         self.k_neighbors = k_neighbors
         self.ins_method = ins_method
+        self.disable_slots = disable_slots
 
         # Keep a reference to slot_attn for display in the model summary
         # (it's actually inside policy.encoder, but named here for clarity)
         self.slot_attn = slot_attn
 
-        # Auxiliary losses
-        self.slot_entropy_loss = SlotEntropyLoss()
+        # Auxiliary losses (skipped when slots are disabled)
+        self.slot_entropy_loss = None if disable_slots else SlotEntropyLoss()
 
         self.metric_loss_fn: MetricPreservationLoss | None = None
-        if metric_variant not in ("none", "B", "A"):
+        if not disable_slots and metric_variant not in ("none", "B", "A"):
             proj_head = ProjectionHead(
                 input_dim=embed_dim,
                 proj_dim=proj_dim,
@@ -133,7 +143,8 @@ class POMOSlot(POMO):
 
         log.info(
             f"POMOSlot: embed_dim={embed_dim}, K={num_slots}, "
-            f"variant={metric_variant}, alpha={alpha_metric}, beta={beta_entropy}"
+            f"variant={metric_variant}, alpha={alpha_metric}, beta={beta_entropy}, "
+            f"disable_slots={disable_slots}"
         )
 
     # configure_optimizers: separate dual param group for log_lambda (dual ascent),
@@ -220,8 +231,8 @@ class POMOSlot(POMO):
         # Run standard POMO step (slot encoder runs inside policy.forward()).
         out = super().shared_step(batch, batch_idx, phase, dataloader_idx)
 
-        # Skip aux losses during val/test
-        if phase != "train" or self.metric_variant in ("none", "B"):
+        # Skip aux losses during val/test, or when slots are disabled.
+        if phase != "train" or self.metric_variant in ("none", "B") or self.disable_slots:
             return out
 
         # Read slot side-channel (policy.encoder is SlotInjectingEncoder)
