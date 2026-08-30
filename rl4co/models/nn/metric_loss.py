@@ -78,51 +78,73 @@ class ProjectionHead(nn.Module):
 # Target distance aggregators
 # ────────────────────────────────────────────────────────────────────────────────
 
-def _aggregate_d_ins_sparse(
-    d_ins_idx: torch.Tensor,   # (B, N, k) int16 on disk, must be cast to long
-    d_ins_val: torch.Tensor,   # (B, N, k) float32
-    A_ik: torch.Tensor,        # (B, N, K) float32
-) -> torch.Tensor:
-    """
-    Aggregate sparse node-level insertion cost to region-level D_ins(slot_k, slot_l).
+# def _aggregate_d_ins_sparse(
+#     d_ins_idx: torch.Tensor,   # (B, N, k) int16 on disk, must be cast to long
+#     d_ins_val: torch.Tensor,   # (B, N, k) float32
+#     A_ik: torch.Tensor,        # (B, N, K) float32
+# ) -> torch.Tensor:
+#     """
+#     Aggregate sparse node-level insertion cost to region-level D_ins(slot_k, slot_l).
 
-    Computes:
-        D_ins(k, l) = sum_{i} sum_{j in kNN(i)} A_ik[i] * A_jl[j] * d_ins(i, j)
+#     Computes:
+#         D_ins(k, l) = sum_{i} sum_{j in kNN(i)} A_ik[i] * A_jl[j] * d_ins(i, j)
 
-    This is equivalent to A^T @ d_ins_dense @ A but without materialising
-    the dense (B, N, N) matrix.
+#     This is equivalent to A^T @ d_ins_dense @ A but without materialising
+#     the dense (B, N, N) matrix.
 
-    Args:
-        d_ins_idx: (B, N, k) int16 — k-NN neighbor indices. Cast to long before gather.
-        d_ins_val: (B, N, k) float32 — insertion costs to k neighbors.
-        A_ik:      (B, N, K) float32 — soft slot assignment matrix.
+#     Args:
+#         d_ins_idx: (B, N, k) int16 — k-NN neighbor indices. Cast to long before gather.
+#         d_ins_val: (B, N, k) float32 — insertion costs to k neighbors.
+#         A_ik:      (B, N, K) float32 — soft slot assignment matrix.
 
-    Returns:
-        D_ins: (B, K, K) float32 — aggregated region-level insertion cost.
-    """
+#     Returns:
+#         D_ins: (B, K, K) float32 — aggregated region-level insertion cost.
+#     """
+#     B, N, k = d_ins_val.shape
+#     K = A_ik.shape[2]
+
+#     # Cast index to long (int16 stored on disk, int64 required by gather)
+#     idx = d_ins_idx.long()  # (B, N, k)
+
+#     # Gather slot assignments for each neighbor j: A_jl shape (B, N, k, K)
+#     # idx: (B, N, k) → expand to (B, N, k, K) for gather along dim=1
+#     idx_expanded = idx.unsqueeze(-1).expand(B, N, k, K)   # (B, N, k, K)
+#     A_neighbors = torch.gather(
+#         A_ik.unsqueeze(2).expand(B, N, k, K),  # (B, N, k, K) — broadcast A_ik
+#         dim=1,
+#         index=idx_expanded,
+#     )  # (B, N, k, K) — A_jl for each neighbor j of each node i
+
+#     # Weighted contribution: d_ins(i,j) * A_jl  → (B, N, k, K)
+#     w = d_ins_val.unsqueeze(-1) * A_neighbors  # (B, N, k, K)
+
+#     # Sum over k neighbors → (B, N, K): total weighted slot-assignment per node i
+#     node_weighted = w.sum(dim=2)  # (B, N, K)
+
+#     # Final: A^T @ node_weighted → (B, K, K)
+#     D_ins = torch.bmm(A_ik.transpose(1, 2), node_weighted)  # (B, K, K)
+#     return D_ins
+
+#NEW: normalization, let's see
+def _aggregate_d_ins_sparse(d_ins_idx, d_ins_val, A_ik, normalize=True, symmetrize=True, eps=1e-8):
     B, N, k = d_ins_val.shape
     K = A_ik.shape[2]
-
-    # Cast index to long (int16 stored on disk, int64 required by gather)
-    idx = d_ins_idx.long()  # (B, N, k)
-
-    # Gather slot assignments for each neighbor j: A_jl shape (B, N, k, K)
-    # idx: (B, N, k) → expand to (B, N, k, K) for gather along dim=1
-    idx_expanded = idx.unsqueeze(-1).expand(B, N, k, K)   # (B, N, k, K)
+    idx = d_ins_idx.long()
+    idx_expanded = idx.unsqueeze(-1).expand(B, N, k, K)
     A_neighbors = torch.gather(
-        A_ik.unsqueeze(2).expand(B, N, k, K),  # (B, N, k, K) — broadcast A_ik
-        dim=1,
-        index=idx_expanded,
-    )  # (B, N, k, K) — A_jl for each neighbor j of each node i
+        A_ik.unsqueeze(2).expand(B, N, k, K), dim=1, index=idx_expanded,
+    )
+    w = d_ins_val.unsqueeze(-1) * A_neighbors
+    node_weighted = w.sum(dim=2)
+    D_ins = torch.bmm(A_ik.transpose(1, 2), node_weighted)  # (B, K, K) -- raw, asymmetric
 
-    # Weighted contribution: d_ins(i,j) * A_jl  → (B, N, k, K)
-    w = d_ins_val.unsqueeze(-1) * A_neighbors  # (B, N, k, K)
+    if symmetrize:
+        D_ins = 0.5 * (D_ins + D_ins.transpose(-1, -2))      # now a well-defined dissimilarity
 
-    # Sum over k neighbors → (B, N, K): total weighted slot-assignment per node i
-    node_weighted = w.sum(dim=2)  # (B, N, K)
+    if normalize:
+        mass = A_ik.sum(dim=1)                                # (B, K)
+        D_ins = D_ins / (mass.unsqueeze(-1) * mass.unsqueeze(-2) + eps)
 
-    # Final: A^T @ node_weighted → (B, K, K)
-    D_ins = torch.bmm(A_ik.transpose(1, 2), node_weighted)  # (B, K, K)
     return D_ins
 
 
