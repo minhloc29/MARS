@@ -18,15 +18,7 @@ import torch
 
 
 def compute_pairwise_distance_matrix(coords: torch.Tensor) -> torch.Tensor:
-    """
-    Computes pairwise Euclidean distance matrix using torch.cdist.
-
-    Args:
-        coords: (batch_size, N, 2) or (N, 2) coordinate tensor.
-
-    Returns:
-        dist_matrix: (batch_size, N, N) or (N, N) pairwise distance matrix.
-    """
+   
     if coords.dim() == 2:
         coords = coords.unsqueeze(0)
         squeeze_batch = True
@@ -50,28 +42,13 @@ def _compute_dense_d_ins(
     locs: torch.Tensor,
     depot_loc: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """
-    Compute dense (B, N, N) symmetrized marginal insertion cost matrix.
-
-    d_ins(i, j) = dist(D, i) + dist(i, j) - dist(D, j)   [Clarke-Wright proxy]
-
-    Symmetrized: d_ins_sym = (d_ins + d_ins^T) / 2
-    Self-pairs set to 0.
-
-    Args:
-        locs:      (B, N, 2) customer coordinates (batch must already be 3D).
-        depot_loc: (B, 1, 2) depot coordinates.
-
-    Returns:
-        d_ins_sym: (B, N, N) float32 — symmetric insertion cost matrix.
-    """
+    
     B, N, _ = locs.shape
     device = locs.device
 
     if depot_loc is None:
         depot_loc = torch.full((B, 1, 2), 0.5, device=device, dtype=locs.dtype)
 
-    # Pairwise customer distances: (B, N, N)
     dist_customers = compute_pairwise_distance_matrix(locs)
 
     # Distance from depot to all customers: (B, N)
@@ -196,10 +173,8 @@ def compute_sparse_insertion_cost(
     else:
         d_ins = _compute_dense_d_ins(locs, depot_loc)
 
-    # Use Euclidean distance to determine kNN neighbours (not d_ins values)
-    # so that we select the k geometrically closest nodes (consistent with training)
     dist_customers = compute_pairwise_distance_matrix(locs)  # (B, N, N)
-    # Exclude self (distance 0) by adding large value on diagonal
+
     dist_customers = dist_customers + torch.eye(N, device=device).unsqueeze(0) * 1e9
 
     k_actual = min(k_neighbors, N - 1)
@@ -207,8 +182,6 @@ def compute_sparse_insertion_cost(
 
     knn_val = torch.gather(d_ins, dim=2, index=knn_idx)  # (B, N, k_actual)
 
-    # Store indices as int16 to save disk space (supports N up to 32767)
-    # Must be cast to .long() before use in torch.gather during training
     assert N <= 32767, f"N={N} exceeds int16 range; use int32 for larger instances"
     knn_idx_i16 = knn_idx.to(torch.int16)
 

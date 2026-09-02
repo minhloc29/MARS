@@ -68,6 +68,8 @@ class POMOSlot(POMO):
         k_neighbors: int = 15,
         ins_method: str = "construction",
         disable_slots: bool = False,
+        normalize_target: bool = True,
+        symmetrize_target: bool = True,
         **pomo_kwargs,
     ) -> None:
         assert metric_variant in self.METRIC_VARIANTS, (
@@ -120,6 +122,8 @@ class POMOSlot(POMO):
         self.k_neighbors = k_neighbors
         self.ins_method = ins_method
         self.disable_slots = disable_slots
+        self.normalize_target = normalize_target
+        self.symmetrize_target = symmetrize_target
 
         # Keep a reference to slot_attn for display in the model summary
         # (it's actually inside policy.encoder, but named here for clarity)
@@ -139,11 +143,14 @@ class POMOSlot(POMO):
                 variant=metric_variant,
                 lambda_init=lambda_init,
                 lr_dual=lr_dual,
+                normalize_target=normalize_target,
+                symmetrize_target=symmetrize_target,
             )
 
         log.info(
             f"POMOSlot: embed_dim={embed_dim}, K={num_slots}, "
             f"variant={metric_variant}, alpha={alpha_metric}, beta={beta_entropy}, "
+            f"normalize_target={normalize_target}, symmetrize_target={symmetrize_target}, "
             f"disable_slots={disable_slots}"
         )
 

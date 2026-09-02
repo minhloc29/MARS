@@ -43,7 +43,6 @@ def _allow_safe_globals() -> None:
 def _load_test_split(path: Path, num_loc: int, dist: str, method: str):
     """Load cached test split exactly as training's SlotDataset would."""
     fpath = path / method / f"cvrp{num_loc}_{dist}_test.pt"
-    
     if not fpath.exists():
         raise FileNotFoundError(
             f"Test dataset not found: {fpath}\n"
@@ -87,6 +86,80 @@ def spearman(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return (xr * yr).sum(dim=-1) / (denom + 1e-8)
 
 
+def make_scatter(
+    lat: torch.Tensor,     # (M,) pooled latent distances
+    tgt: torch.Tensor,     # (M,) pooled target distances
+    rho: float,
+    violation: float,
+    meta: dict,
+    out_path: str,
+    max_points: int = 25_000,
+) -> None:
+    """Scatter of latent vs target slot-pair distance with Spearman rho annotated.
+
+    x = D_slot (insertion target), y = D_latent (phi-space latent). One series ->
+    single hue; identity line y=x marks perfect agreement. Sub-samples dense clouds
+    for tidy overplotting.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    lat_n = lat.detach().cpu().numpy()
+    tgt_n = tgt.detach().cpu().numpy()
+
+    # Deterministic sub-sample to a manageable cloud size.
+    if len(lat_n) > max_points:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(len(lat_n), size=max_points, replace=False)
+        lat_n, tgt_n = lat_n[idx], tgt_n[idx]
+
+    hue = "#2a78d6"        # validated categorical blue (single series)
+    ink = "#0b0b0b"
+    line = "#8a8a86"
+
+    fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
+    ax.scatter(tgt_n, lat_n, s=9, alpha=0.35, color=hue, edgecolors="none", rasterized=True)
+
+    # Identity diagonal: perfect agreement (D_latent == D_slot).
+    lo = min(tgt_n.min(), lat_n.min())
+    hi = max(tgt_n.max(), lat_n.max())
+    ax.plot([lo, hi], [lo, hi], color=line, lw=1.4, ls="--", zorder=1,
+            label="perfect agreement (y=x)")
+
+    ax.set_xlabel("$D_{slot}$  (insertion target dist.)", color=ink)
+    ax.set_ylabel("$D_{latent}$  ($\\phi(z_k)$-space dist.)", color=ink)
+    ax.set_title(
+        f"{meta['model']} · variant D · K={meta['K']} · N={meta['num_loc']}\n"
+        f"slot geometry vs insertion cost — $n$={meta['n_inst']} inst",
+        color=ink,
+        fontsize=10,
+    )
+    # Speak the result directly (never color-alone).
+    box = (
+        f"Spearman $\\rho$ = {rho:.3f} ± {meta['spearman_std']:.3f}\n"
+        f"one-sided violation $V$ = {violation:.4f}"
+    )
+    ax.text(0.03, 0.97, box, transform=ax.transAxes, va="top",
+            fontsize=9, color=ink,
+            bbox=dict(boxstyle="round,pad=0.4", fc="#fcfcfb", ec="#c8c8c3", lw=1))
+    ax.legend(loc="lower right", frameon=False, fontsize=8)
+    ax.grid(True, ls=":", lw=0.6, alpha=0.35, color="#d6d6d2")
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    for s in ("left", "bottom"):
+        ax.spines[s].set_color("#c8c8c3")
+    ax.tick_params(colors="#52514e")
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"Scatter saved -> {out}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate slot-metric geometry (insertion arm)")
     parser.add_argument("--ckpt", type=str, required=True, help="Trained Variant-D (insertion) .ckpt")
@@ -100,8 +173,10 @@ def main() -> None:
     parser.add_argument("--data_dir", type=str, default="./data/slot_datasets_v2")
     parser.add_argument("--n_inst", type=int, default=1024, help="Max instances to evaluate")
     parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--out", type=str, default=None, help="JSON output path")
+    parser.add_argument("--plot", type=str, default=None,
+                        help="Optional PNG path to also write the D_latent vs D_slot scatter with Spearman rho.")
     args = parser.parse_args()
 
     _allow_safe_globals()
@@ -174,7 +249,7 @@ def main() -> None:
 
             # Target geometry: A^T D_ins A (sparse), same as training aggregator.
             D_slot = _aggregate_d_ins_sparse(
-                d_idx[sl].to(dev), d_val[sl].to(dev), A_ik
+                d_idx[sl].to(dev), d_val[sl].to(dev), A_ik, normalize=False, symmetrize=True
             )                                            # (B, K, K)
 
             # Off-diagonal pairs; ordered per-entry so correlation is meaningful.
@@ -233,6 +308,16 @@ def main() -> None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(result, indent=2))
         print(f"Saved -> {out_path}")
+
+    if args.plot:
+        make_scatter(
+            lat=torch.cat(lat_all).flatten(),
+            tgt=torch.cat(tgt_all).flatten(),
+            rho=mean_corr,
+            violation=mean_viol,
+            meta=result,
+            out_path=args.plot,
+        )
 
 
 if __name__ == "__main__":

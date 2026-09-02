@@ -138,6 +138,9 @@ def train(
     slot_iters: int = 3,
     lambda_init: float = 1.0,
     lr_dual: float = 1e-3,
+    beta_entropy: float | None = None,
+    normalize_target: bool = True,
+    symmetrize_target: bool = True,
     epochs: int | None = None,
     batch_size: int | None = None,
     max_instances: int | None = None,
@@ -164,6 +167,8 @@ def train(
         t_cfg["n_train"] = min(t_cfg["n_train"], max_instances)
         t_cfg["n_val"]   = min(t_cfg["n_val"],   max(1, max_instances // 10))
     v_cfg = VARIANT_DEFAULTS[variant]
+    if beta_entropy is not None:
+        v_cfg["beta_entropy"] = beta_entropy
 
     data_dir = Path(data_dir)
     train_path = data_dir / ins_method / f"cvrp{num_loc}_{dist}_train.pt"
@@ -212,6 +217,8 @@ def train(
         slot_iters=slot_iters,
         lambda_init=lambda_init,
         lr_dual=lr_dual,
+        normalize_target=normalize_target,
+        symmetrize_target=symmetrize_target,
         ins_method=ins_method,
         optimizer_kwargs={"lr": t_cfg["lr"]},
     )
@@ -223,12 +230,18 @@ def train(
         model_kwargs["disable_slots"] = True
     model = model_cls(**model_kwargs)
 
-    # run_name uniquely IDs the run (backbone, variant, K, N, dist, seed, ins_method).
+    # run_name uniquely IDs the run (backbone, variant, K, N, dist, seed, ins_method,
+    # and — for Variant D — the normalize/symmetrize target-aggregation flags).
+    norm_tag = ""
+    if variant == "D":
+        norm_tag = f"_n{int(normalize_target)}s{int(symmetrize_target)}"
+
     base_suffix = f"_bl{baseline}" if backbone == "am" and baseline else ""
     if disable_slots:
         run_name = f"{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
     else:
-        run_name = f"{backbone}_slot_{variant}_K{num_slots}_N{num_loc}_{dist}_{ins_method}_seed{seed}{base_suffix}"
+        run_name = (f"{backbone}_slot_{variant}_K{num_slots}_N{num_loc}_{dist}_"
+                    f"{ins_method}{norm_tag}_seed{seed}{base_suffix}")
     log_path = Path(output) / run_name
 
     checkpoint_cb = ModelCheckpoint(
@@ -293,6 +306,8 @@ def train(
         "dist": dist,
         "seed": seed,
         "ins_method": ins_method,
+        "normalize_target": normalize_target,
+        "symmetrize_target": symmetrize_target,
         "best_val_reward": best_reward,
         "elapsed_min": round(elapsed / 60, 1),
         "checkpoint": str(checkpoint_cb.best_model_path),
@@ -303,7 +318,10 @@ def train(
     result_dir.mkdir(parents=True, exist_ok=True)
     result_file = result_dir / f"ablation_N{num_loc}.json"
     results = json.loads(result_file.read_text()) if result_file.exists() else []
-    dedup_key = {k: result[k] for k in ("backbone", "variant", "num_slots", "num_loc", "dist", "seed", "ins_method")}
+    dedup_key = {k: result[k] for k in (
+        "backbone", "variant", "num_slots", "num_loc", "dist", "seed",
+        "ins_method", "normalize_target", "symmetrize_target",
+    )}
     results = [r for r in results if not all(r.get(k) == v for k, v in dedup_key.items())]
     results.append(result)
     result_file.write_text(json.dumps(results, indent=2))
@@ -316,7 +334,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train POMOSlot -- Metric-Aware NCO")
     parser.add_argument("--variant",       type=str,   default="D",       choices=list("ABCD"),
                         help="Ablation variant. E is reserved (not implemented).")
-    parser.add_argument("--num_loc",       type=int,   default=100,       choices=[50, 100, 200, 500])
+    parser.add_argument("--num_loc",       type=int,   default=100,       choices=[50, 100, 200, 500, 1000])
     parser.add_argument("--dist",          type=str,   default="uniform", choices=["uniform", "clustered"])
     parser.add_argument("--data_dir",      type=str,   default="./data/slot_datasets_v2")
     parser.add_argument("--output",        type=str,   default="./output",
@@ -330,6 +348,9 @@ def main():
     parser.add_argument("--slot_iters",    type=int,   default=3)
     parser.add_argument("--lambda_init",   type=float, default=1.0)
     parser.add_argument("--lr_dual",       type=float, default=1e-4)
+    parser.add_argument("--beta_entropy",  type=float, default=0.01,
+                        help="Override the per-variant slot-entropy weight. Set 0.0 to "
+                             "keep slots + metric loss but drop the entropy regulariser.")
     parser.add_argument("--ins_method",    type=str,   default="construction",
                         choices=["savings", "construction", "insertion"],
                         help="d_ins insertion-cost method. Must match the cached dataset's "
@@ -344,6 +365,18 @@ def main():
                         help="REINFORCE baseline for the AM backbone (e.g. rollout, shared). Ignored for pomo.")
     parser.add_argument("--disable_slots", action="store_true",
                         help="Run the backbone as a true no-slot baseline (skips SlotAttention + aux losses).")
+    parser.add_argument("--normalize_target", dest="normalize_target",
+                        action="store_true", default=True,
+                        help="Normalize D_ins aggregation by realized sparse edge mass (default: True).")
+    parser.add_argument("--no_normalize_target", dest="normalize_target",
+                        action="store_false",
+                        help="Use RAW (unnormalized) D_ins aggregation -- for the ablation baseline.")
+    parser.add_argument("--symmetrize_target", dest="symmetrize_target",
+                        action="store_true", default=True,
+                        help="Symmetrize D_ins aggregation (default: True).")
+    parser.add_argument("--no_symmetrize_target", dest="symmetrize_target",
+                        action="store_false",
+                        help="Keep D_ins aggregation asymmetric -- for the ablation baseline.")
     parser.add_argument("--logger",        type=str,   default="csv", choices=["csv", "wandb"],
                         help="Logger: 'csv' (default, lightweight) or 'wandb' (requires wandb login).")
     parser.add_argument("--resume",        type=str,   default=None,
@@ -364,6 +397,9 @@ def main():
         slot_iters=args.slot_iters,
         lambda_init=args.lambda_init,
         lr_dual=args.lr_dual,
+        beta_entropy=args.beta_entropy,
+        normalize_target=args.normalize_target,
+        symmetrize_target=args.symmetrize_target,
         epochs=args.epochs,
         batch_size=args.batch_size,
         max_instances=args.max_instances,

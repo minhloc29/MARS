@@ -84,6 +84,8 @@ class AMSlot(AttentionModel):
         ins_method: str = "construction",
         baseline: str = "rollout",
         disable_slots: bool = False,
+        normalize_target: bool = True,
+        symmetrize_target: bool = True,
         **am_kwargs,
     ) -> None:
         assert metric_variant in self.METRIC_VARIANTS, (
@@ -143,6 +145,8 @@ class AMSlot(AttentionModel):
         self.k_neighbors = k_neighbors
         self.ins_method = ins_method
         self.disable_slots = disable_slots
+        self.normalize_target = normalize_target
+        self.symmetrize_target = symmetrize_target
 
         # Reference for display (lives inside policy.encoder)
         self.slot_attn = slot_attn
@@ -150,7 +154,10 @@ class AMSlot(AttentionModel):
         # Auxiliary losses (skipped when slots are disabled)
         self.slot_entropy_loss = None if disable_slots else SlotEntropyLoss()
         self.metric_loss_fn = (
-            None if disable_slots else self._build_metric_loss(metric_variant, embed_dim, proj_dim, lambda_init, lr_dual)
+            None if disable_slots else self._build_metric_loss(
+                metric_variant, embed_dim, proj_dim, lambda_init, lr_dual,
+                normalize_target, symmetrize_target,
+            )
         )
 
         log.info(
@@ -159,7 +166,8 @@ class AMSlot(AttentionModel):
             f"baseline={baseline}"
         )
 
-    def _build_metric_loss(self, variant, embed_dim, proj_dim, lambda_init, lr_dual):
+    def _build_metric_loss(self, variant, embed_dim, proj_dim, lambda_init, lr_dual,
+                           normalize_target=True, symmetrize_target=True):
         """Construct the metric-preservation loss for metric variants (C/D)."""
         if variant in ("none", "B", "A"):
             return None
@@ -169,6 +177,8 @@ class AMSlot(AttentionModel):
             variant=variant,
             lambda_init=lambda_init,
             lr_dual=lr_dual,
+            normalize_target=normalize_target,
+            symmetrize_target=symmetrize_target,
         )
 
     # configure_optimizers: separate dual param group for log_lambda (dual ascent),

@@ -1,35 +1,3 @@
-"""
-M3 — MetricPreservationLoss (METRA-style) for Metric-Aware Slot NCO.
-
-Implements the core novelty from the proposal:
-
-    L_metric = -E[||phi(z_k) - phi(z_l)||]
-              + lambda * E[max(0, ||phi(z_k) - phi(z_l)|| - D_target(k, l))^2]
-
-where:
-  - phi  : a small MLP projection head (projects slot embeddings to metric space)
-  - D_target(k, l) : target inter-region distance (depends on chosen variant)
-  - lambda : Lagrange multiplier updated via dual ascent (separate param group)
-
-Target D_target per ablation variant:
-  Variant A: reconstruction loss (handled separately in model.py)
-  Variant B: no metric loss (alpha = 0), handled in model.py
-  Variant C: Euclidean distance between slot-centroid coordinates
-  Variant D: insertion-cost distance (proposed) — aggregated sparse d_ins over A_ik
-  # Variant E: future-regret distance — RESERVED, not implemented yet
-
-Sparse d_ins format (B3):
-  d_ins is stored and passed as two tensors:
-    d_ins_idx: (B, N, k) int16  — k-NN neighbor indices (cast to long before use)
-    d_ins_val: (B, N, k) float32 — insertion costs to those neighbors
-
-  The aggregation _aggregate_d_ins_sparse computes D_ins(k,l) without
-  materialising the dense (B, N, N) matrix.
-
-Reference for dual ascent mechanism:
-    METRA, Park et al. (ICLR 2024) — iod/metra.py dual_reg logic
-"""
-
 from __future__ import annotations
 
 import torch
@@ -209,6 +177,8 @@ class MetricPreservationLoss(nn.Module):
         lambda_init: float = 1.0,
         lr_dual: float = 1e-3,
         sample_pairs: int | None = None,
+        normalize_target: bool = True,
+        symmetrize_target: bool = True,
     ) -> None:
         super().__init__()
 
@@ -220,10 +190,21 @@ class MetricPreservationLoss(nn.Module):
         self.variant = variant
         self.lr_dual = lr_dual   # reference only; actual lr set via param group
         self.sample_pairs = sample_pairs
+        self.normalize_target = normalize_target
+        self.symmetrize_target = symmetrize_target
 
         # Lagrange multiplier — stored as log for positivity constraint
         self.log_lambda = nn.Parameter(
             torch.tensor(lambda_init).log(), requires_grad=True
+        )
+
+    def extra_repr(self) -> str:
+        """Visibility in model summaries / logs — surfaces the target-aggregation
+        config so a checkpoint trained one way and evaluated another is obvious
+        immediately rather than after several eval runs."""
+        return (
+            f"variant={self.variant}, normalize_target={self.normalize_target}, "
+            f"symmetrize_target={self.symmetrize_target}"
         )
 
     @property
@@ -245,7 +226,13 @@ class MetricPreservationLoss(nn.Module):
         elif self.variant == "D":
             assert d_ins_idx is not None and d_ins_val is not None, \
                 "d_ins_idx and d_ins_val required for Variant D"
-            return _aggregate_d_ins_sparse(d_ins_idx, d_ins_val, A_ik)  # (B, K, K)
+            return _aggregate_d_ins_sparse(
+                d_ins_idx,
+                d_ins_val,
+                A_ik,
+                normalize=self.normalize_target,
+                symmetrize=self.symmetrize_target,
+            )  # (B, K, K)
         else:
             raise ValueError(f"Unknown variant: {self.variant}")
 
