@@ -209,6 +209,8 @@ class MetricPreservationLoss(nn.Module):
         lambda_init: float = 1.0,
         lr_dual: float = 1e-3,
         sample_pairs: int | None = None,
+        normalize_target: bool = True,
+        symmetrize_target: bool = True,
     ) -> None:
         super().__init__()
 
@@ -220,10 +222,21 @@ class MetricPreservationLoss(nn.Module):
         self.variant = variant
         self.lr_dual = lr_dual   # reference only; actual lr set via param group
         self.sample_pairs = sample_pairs
+        self.normalize_target = normalize_target
+        self.symmetrize_target = symmetrize_target
 
         # Lagrange multiplier — stored as log for positivity constraint
         self.log_lambda = nn.Parameter(
             torch.tensor(lambda_init).log(), requires_grad=True
+        )
+
+    def extra_repr(self) -> str:
+        """Visibility in model summaries / logs — surfaces the target-aggregation
+        config so a checkpoint trained one way and evaluated another is obvious
+        immediately rather than after several eval runs."""
+        return (
+            f"variant={self.variant}, normalize_target={self.normalize_target}, "
+            f"symmetrize_target={self.symmetrize_target}"
         )
 
     @property
@@ -245,7 +258,13 @@ class MetricPreservationLoss(nn.Module):
         elif self.variant == "D":
             assert d_ins_idx is not None and d_ins_val is not None, \
                 "d_ins_idx and d_ins_val required for Variant D"
-            return _aggregate_d_ins_sparse(d_ins_idx, d_ins_val, A_ik)  # (B, K, K)
+            return _aggregate_d_ins_sparse(
+                d_ins_idx,
+                d_ins_val,
+                A_ik,
+                normalize=self.normalize_target,
+                symmetrize=self.symmetrize_target,
+            )  # (B, K, K)
         else:
             raise ValueError(f"Unknown variant: {self.variant}")
 

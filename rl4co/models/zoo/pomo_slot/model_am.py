@@ -84,11 +84,17 @@ class AMSlot(AttentionModel):
         ins_method: str = "construction",
         baseline: str = "rollout",
         disable_slots: bool = False,
+        normalize_target: bool = True,
+        symmetrize_target: bool = True,
+        problem: str = "cvrp",
         **am_kwargs,
     ) -> None:
         assert metric_variant in self.METRIC_VARIANTS, (
             f"metric_variant must be one of {self.METRIC_VARIANTS}, got '{metric_variant}'"
         )
+
+        # Node 0 is the depot only for CVRP-style problems; for TSP all nodes are customers.
+        has_depot = problem != "tsp"
 
         # Base encoder used directly when disable_slots (plain AM — no slots).
         # AM default is 3 encoder layers (lighter than POMO's 6). Overridable.
@@ -117,7 +123,7 @@ class AMSlot(AttentionModel):
                 dim=embed_dim,
                 iters=slot_iters,
             )
-            slot_encoder = SlotInjectingEncoder(base_encoder, slot_attn)
+            slot_encoder = SlotInjectingEncoder(base_encoder, slot_attn, has_depot=has_depot)
             policy = AttentionModelPolicy(
                 encoder=slot_encoder,
                 embed_dim=embed_dim,
@@ -143,6 +149,10 @@ class AMSlot(AttentionModel):
         self.k_neighbors = k_neighbors
         self.ins_method = ins_method
         self.disable_slots = disable_slots
+        self.normalize_target = normalize_target
+        self.symmetrize_target = symmetrize_target
+        self.problem = problem
+        self.has_depot = has_depot
 
         # Reference for display (lives inside policy.encoder)
         self.slot_attn = slot_attn
@@ -150,16 +160,20 @@ class AMSlot(AttentionModel):
         # Auxiliary losses (skipped when slots are disabled)
         self.slot_entropy_loss = None if disable_slots else SlotEntropyLoss()
         self.metric_loss_fn = (
-            None if disable_slots else self._build_metric_loss(metric_variant, embed_dim, proj_dim, lambda_init, lr_dual)
+            None if disable_slots else self._build_metric_loss(
+                metric_variant, embed_dim, proj_dim, lambda_init, lr_dual,
+                normalize_target, symmetrize_target,
+            )
         )
 
         log.info(
             f"AMSlot: embed_dim={embed_dim}, K={num_slots}, "
             f"variant={metric_variant}, alpha={alpha_metric}, beta={beta_entropy}, "
-            f"baseline={baseline}"
+            f"problem={problem}, has_depot={has_depot}, baseline={baseline}"
         )
 
-    def _build_metric_loss(self, variant, embed_dim, proj_dim, lambda_init, lr_dual):
+    def _build_metric_loss(self, variant, embed_dim, proj_dim, lambda_init, lr_dual,
+                           normalize_target=True, symmetrize_target=True):
         """Construct the metric-preservation loss for metric variants (C/D)."""
         if variant in ("none", "B", "A"):
             return None
@@ -169,6 +183,8 @@ class AMSlot(AttentionModel):
             variant=variant,
             lambda_init=lambda_init,
             lr_dual=lr_dual,
+            normalize_target=normalize_target,
+            symmetrize_target=symmetrize_target,
         )
 
     # configure_optimizers: separate dual param group for log_lambda (dual ascent),
@@ -233,7 +249,13 @@ class AMSlot(AttentionModel):
         locs_customers: torch.Tensor | None = None
         if self.metric_variant not in ("none", "B"):
             raw_locs = batch.get("locs") if hasattr(batch, "get") else batch["locs"]
-            locs_customers = raw_locs.to(device)  # (B, N, 2) — customers only, no depot
+            raw_locs = raw_locs.to(device)
+            if self.has_depot:
+                # CVRP: customers are nodes 1..N-1 (node 0 = depot)
+                locs_customers = raw_locs[:, 1:, :]   # (B, N-1, 2)
+            else:
+                # TSP: all N nodes are customers (no depot)
+                locs_customers = raw_locs              # (B, N, 2)
 
         # Fallback: compute d_ins on-the-fly if Variant D needs it, but the
         # dataset didn't cache it (mirrors POMOSlot — see model.py for indexing notes)
@@ -244,12 +266,16 @@ class AMSlot(AttentionModel):
             and locs_customers is not None
             and locs_customers.shape[1] > 1
         ):
-            customers = locs_customers[:, 1:, :]   # (B, N_cust, 2) — matches A_ik
-            depot = locs_customers[:, :1, :]        # (B, 1, 2) — node 0 as pseudo-depot
+            if self.has_depot:
+                d_ins_locs = locs_customers[:, 1:, :]  # (B, N_cust, 2) — matches A_ik
+                depot = locs_customers[:, :1, :]         # (B, 1, 2) — node 0 as pseudo-depot
+            else:
+                d_ins_locs = locs_customers              # (B, N, 2) — all nodes
+                depot = None                             # -> center pseudo-depot
             d_ins_idx, d_ins_val = compute_sparse_insertion_cost(
-                customers, k_neighbors=self.k_neighbors, depot_loc=depot,
+                d_ins_locs, k_neighbors=self.k_neighbors, depot_loc=depot,
                 method=self.ins_method,
-            )  # (B, N_cust, k) int16, (B, N_cust, k) float32
+            )  # (B, N, k) int16, (B, N, k) float32
 
         # Run standard AM (REINFORCE) step — single-start. Slot encoder runs
         # inside policy.forward(); slots/A_ik available via side-channel after.

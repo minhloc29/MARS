@@ -27,7 +27,7 @@ from pathlib import Path
 import torch
 from tensordict import TensorDict
 
-from rl4co.envs import CVRPEnv
+from rl4co.envs import CVRPEnv, TSPEnv
 from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
 from rl4co.models.zoo.pomo_slot.model_am import SingleSharedBaseline
 from rl4co.models.nn.metric_loss import _aggregate_d_ins_sparse
@@ -40,15 +40,15 @@ def _allow_safe_globals() -> None:
         pass
 
 
-def _load_test_split(path: Path, num_loc: int, dist: str, method: str):
+def _load_test_split(path: Path, num_loc: int, dist: str, method: str, env: str = "cvrp"):
     """Load cached test split exactly as training's SlotDataset would."""
-    fpath = path / method / f"cvrp{num_loc}_{dist}_test.pt"
-    
+    fpath = path / method / f"{env}{num_loc}_{dist}_test.pt"
+
     if not fpath.exists():
         raise FileNotFoundError(
             f"Test dataset not found: {fpath}\n"
             "Generate it first, e.g.:\n"
-            f"  python -m rl4co.data.generate_slot_dataset --num_locs {num_loc} "
+            f"  python -m rl4co.data.generate_slot_dataset --env {env} --num_locs {num_loc} "
             f"--dist {dist} --method {method} --out_dir {path} --n_test 1000"
         )
     data = torch.load(fpath, map_location="cpu", weights_only=False)
@@ -65,6 +65,18 @@ def _load_test_split(path: Path, num_loc: int, dist: str, method: str):
             f"[WARN] {fpath} has no 'method' tag (legacy dataset) — assuming it "
             f"matches --method {method!r}. Regenerate with the current generator "
             "to stamp the method tag."
+        )
+    # Problem tag must match --env: TSP data has no depot/demand; CVRP has them.
+    data_problem = data.get("problem")
+    if data_problem is not None and data_problem != env:
+        raise RuntimeError(
+            f"Dataset 'problem' tag {data_problem!r} != --env {env!r}. "
+            f"Regenerate with --env {data_problem} or pass --env {data_problem}."
+        )
+    if data_problem is None:
+        print(
+            f"[WARN] {fpath} has no 'problem' tag (legacy dataset) — assuming CVRP "
+            f"for --env {env!r}."
         )
     return data
 
@@ -92,6 +104,9 @@ def main() -> None:
     parser.add_argument("--ckpt", type=str, required=True, help="Trained Variant-D (insertion) .ckpt")
     parser.add_argument("--model", type=str, default="am", choices=["am", "pomo"],
                         help="Model class. Must match checkpoint.")
+    parser.add_argument("--env", type=str, default="cvrp", choices=["cvrp", "tsp"],
+                        help="Problem the checkpoint was trained on. 'tsp' has no depot "
+                             "(all N nodes are customers); 'cvrp' has a depot + demand.")
     parser.add_argument("--num_loc", type=int, default=100, help="N customers")
     parser.add_argument("--dist", type=str, default="uniform", choices=["uniform", "clustered"])
     parser.add_argument("--method", type=str, default="insertion",
@@ -108,7 +123,9 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     # ── Model ────────────────────────────────────────────────────────────────
-    env = CVRPEnv(generator_kwargs=dict(num_loc=args.num_loc))
+    has_depot = args.env != "tsp"
+    env_cls = TSPEnv if args.env == "tsp" else CVRPEnv
+    env = env_cls(generator_kwargs=dict(num_loc=args.num_loc))
     model_cls = POMOSlot if args.model == "pomo" else AMSlot
     model = model_cls.load_from_checkpoint(args.ckpt, env=env, map_location="cpu")
     model.eval()
@@ -131,10 +148,10 @@ def main() -> None:
     proj_head = model.metric_loss_fn.proj_head
 
     # ── Data (cached test split, same d_ins as training) ──────────────────────
-    data = _load_test_split(Path(args.data_dir), args.num_loc, args.dist, args.method)
+    data = _load_test_split(Path(args.data_dir), args.num_loc, args.dist, args.method, args.env)
     locs    = data["locs"][: args.n_inst]    # (B, N, 2)
-    depot   = data["depot"][: args.n_inst]   # (B, 2)
-    demand  = data["demand"][: args.n_inst]  # (B, N)
+    depot   = data["depot"][: args.n_inst] if has_depot else None   # (B, 2) or None
+    demand  = data["demand"][: args.n_inst] if has_depot else None  # (B, N) or None
     d_idx   = data["d_ins_idx"][: args.n_inst]  # (B, N, k) int16
     d_val   = data["d_ins_val"][: args.n_inst]  # (B, N, k) float32
 
@@ -149,15 +166,12 @@ def main() -> None:
             B = locs[sl].shape[0]
 
             # Build pre-reset TensorDict (same keys as trainer collate).
-            td_in = TensorDict(
-                {
-                    "locs": locs[sl].to(dev),
-                    "depot": depot[sl].to(dev),
-                    "demand": demand[sl].to(dev),
-                    "capacity": torch.ones(B, 1, device=dev),
-                },
-                batch_size=[B],
-            )
+            td_in_dict = {"locs": locs[sl].to(dev)}
+            if has_depot:
+                td_in_dict["depot"] = depot[sl].to(dev)
+                td_in_dict["demand"] = demand[sl].to(dev)
+                td_in_dict["capacity"] = torch.ones(B, 1, device=dev)
+            td_in = TensorDict(td_in_dict, batch_size=[B])
             td = env.reset(td_in)
 
             # Run encoder -> populates last_slots / last_A_ik side-channel.
@@ -209,6 +223,7 @@ def main() -> None:
     result = {
         "ckpt": args.ckpt,
         "model": args.model,
+        "env": args.env,
         "num_loc": args.num_loc,
         "dist": args.dist,
         "method": args.method,

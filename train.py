@@ -18,7 +18,7 @@ except Exception:
 
 # Lazy import to avoid torchrl DLL on some setups
 try:
-    from rl4co.envs import CVRPEnv
+    from rl4co.envs import CVRPEnv, TSPEnv
     from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
     FULL_RL4CO = True
 except Exception as e:
@@ -52,11 +52,14 @@ class SlotDataset(torch.utils.data.Dataset):
             raise RuntimeError(f"Unknown dataset format_version: '{fmt}' in {filepath}")
 
         self.locs     = data["locs"]     # (N_inst, N, 2)
-        self.depot    = data["depot"]    # (N_inst, 2)
-        self.demand   = data["demand"]   # (N_inst, N)
+        # depot/demand exist only for CVRP (TSP has no depot/demand/capacity).
+        self.depot    = data.get("depot", None)    # (N_inst, 2) or None
+        self.demand   = data.get("demand", None)   # (N_inst, N) or None
         self.capacity = data.get("capacity", None)
         # d_ins cost-method tag stamped by the generator; None for legacy datasets.
         self.method: str | None = data.get("method", None)
+        # Problem tag stamped by the generator ("cvrp" | "tsp"); None for legacy.
+        self.problem: str | None = data.get("problem", None)
 
         # Sparse d_ins only needed for Variant D
         needs_dins = variant == "D"
@@ -66,8 +69,8 @@ class SlotDataset(torch.utils.data.Dataset):
 
         if max_instances is not None:
             self.locs     = self.locs[:max_instances]
-            self.depot    = self.depot[:max_instances]
-            self.demand   = self.demand[:max_instances]
+            if self.depot   is not None: self.depot   = self.depot[:max_instances]
+            if self.demand  is not None: self.demand  = self.demand[:max_instances]
             if self.capacity  is not None: self.capacity  = self.capacity[:max_instances]
             if self.d_ins_idx is not None: self.d_ins_idx = self.d_ins_idx[:max_instances]
             if self.d_ins_val is not None: self.d_ins_val = self.d_ins_val[:max_instances]
@@ -78,9 +81,11 @@ class SlotDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         item = {
             "locs":   self.locs[idx],    # (N, 2)
-            "depot":  self.depot[idx],   # (2,)
-            "demand": self.demand[idx],  # (N,)
         }
+        if self.depot is not None:
+            item["depot"] = self.depot[idx]   # (2,)
+        if self.demand is not None:
+            item["demand"] = self.demand[idx]  # (N,)
         if self.capacity is not None:
             item["capacity"] = self.capacity[idx]   # (1,)
         if self.d_ins_idx is not None:
@@ -117,6 +122,7 @@ VARIANT_DEFAULTS = {
 }
 
 TRAIN_DEFAULTS = {
+    20:  dict(epochs=50, batch=512, lr=1e-4, n_train=100_000, n_val=1_000),
     50:  dict(epochs=100, batch=512, lr=1e-4, n_train=100_000, n_val=1_000),
     100: dict(epochs=100, batch=256, lr=1e-4, n_train=100_000, n_val=1_000),
     200: dict(epochs=200, batch=128, lr=5e-5, n_train=100_000, n_val=1_000),
@@ -128,6 +134,7 @@ def train(
     variant: str = "D",
     num_loc: int = 100,
     dist: str = "uniform",
+    env: str = "cvrp",
     data_dir: str = "./data/slot_datasets",
     output: str = "./output",
     seed: int = 42,
@@ -138,6 +145,9 @@ def train(
     slot_iters: int = 3,
     lambda_init: float = 1.0,
     lr_dual: float = 1e-3,
+    beta_entropy: float | None = None,
+    normalize_target: bool = True,
+    symmetrize_target: bool = True,
     epochs: int | None = None,
     batch_size: int | None = None,
     max_instances: int | None = None,
@@ -164,21 +174,35 @@ def train(
         t_cfg["n_train"] = min(t_cfg["n_train"], max_instances)
         t_cfg["n_val"]   = min(t_cfg["n_val"],   max(1, max_instances // 10))
     v_cfg = VARIANT_DEFAULTS[variant]
+    if beta_entropy is not None:
+        v_cfg["beta_entropy"] = beta_entropy
 
     data_dir = Path(data_dir)
-    train_path = data_dir / ins_method / f"cvrp{num_loc}_{dist}_train.pt"
-    val_path   = data_dir / ins_method / f"cvrp{num_loc}_{dist}_val.pt"
+    train_path = data_dir / ins_method / f"{env}{num_loc}_{dist}_train.pt"
+    val_path   = data_dir / ins_method / f"{env}{num_loc}_{dist}_val.pt"
 
     if not train_path.exists():
         raise FileNotFoundError(
             f"Dataset not found: {train_path}\n"
             f"Run: python -m rl4co.data.generate_slot_dataset "
-            f"--num_locs {num_loc} --dist {dist} --out_dir {data_dir}"
+            f"--env {env} --num_locs {num_loc} --dist {dist} --out_dir {data_dir}"
         )
 
     # Data
     train_loader = make_dataloader(train_path, variant, t_cfg["batch"], shuffle=True, max_instances=t_cfg["n_train"])
     val_loader   = make_dataloader(val_path,   variant, t_cfg["batch"], shuffle=False, max_instances=t_cfg["n_val"])
+
+    # Validate the dataset's problem tag matches --env, so we never train on
+    # the wrong problem's data (TSP data has no depot/demand; CVRP has them).
+    data_problem = train_loader.dataset.problem
+    if data_problem is not None and data_problem != env:
+        raise RuntimeError(
+            f"--env={env!r} but cached dataset {train_path} was generated for "
+            f"problem={data_problem!r}. Regenerate with --env {data_problem} or "
+            f"pass --env {data_problem}."
+        )
+    elif data_problem is None:
+        print(f"[WARN] {train_path} has no 'problem' tag (legacy dataset) — assuming CVRP.")
 
     # Validate d_ins cost method (Variant D consumes d_ins). The data was baked
     # with a specific method; refuse a mismatch so we never train on the wrong cost.
@@ -199,12 +223,13 @@ def train(
             print(f"Dataset method '{data_method}' matches --ins_method. OK.")
 
     # Environment
-    env = CVRPEnv(generator_kwargs=dict(num_loc=num_loc))
+    env_cls = TSPEnv if env == "tsp" else CVRPEnv
+    env_obj = env_cls(generator_kwargs=dict(num_loc=num_loc))
 
     # Model
     model_cls = MODEL_CLASSES[backbone]
     model_kwargs = dict(
-        env=env,
+        env=env_obj,
         embed_dim=embed_dim,
         num_slots=num_slots,
         **v_cfg,
@@ -212,7 +237,10 @@ def train(
         slot_iters=slot_iters,
         lambda_init=lambda_init,
         lr_dual=lr_dual,
+        normalize_target=normalize_target,
+        symmetrize_target=symmetrize_target,
         ins_method=ins_method,
+        problem=env,
         optimizer_kwargs={"lr": t_cfg["lr"]},
     )
 
@@ -223,12 +251,18 @@ def train(
         model_kwargs["disable_slots"] = True
     model = model_cls(**model_kwargs)
 
-    # run_name uniquely IDs the run (backbone, variant, K, N, dist, seed, ins_method).
+    # run_name uniquely IDs the run (backbone, variant, K, N, dist, seed, ins_method,
+    # and — for Variant D — the normalize/symmetrize target-aggregation flags).
+    norm_tag = ""
+    if variant == "D":
+        norm_tag = f"_n{int(normalize_target)}s{int(symmetrize_target)}"
+
     base_suffix = f"_bl{baseline}" if backbone == "am" and baseline else ""
     if disable_slots:
-        run_name = f"{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
+        run_name = f"{env}_{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
     else:
-        run_name = f"{backbone}_slot_{variant}_K{num_slots}_N{num_loc}_{dist}_{ins_method}_seed{seed}{base_suffix}"
+        run_name = (f"{env}_{backbone}_slot_{variant}_K{num_slots}_N{num_loc}_{dist}_"
+                    f"{ins_method}{norm_tag}_seed{seed}{base_suffix}")
     log_path = Path(output) / run_name
 
     checkpoint_cb = ModelCheckpoint(
@@ -273,10 +307,10 @@ def train(
     trainer = pl.Trainer(**trainer_kwargs)
 
     print(f"\n{'='*60}")
-    print(f"Training POMOSlot — Variant {variant} | N={num_loc} | {dist}")
+    print(f"Training POMOSlot — {env.upper()} | Variant {variant} | N={num_loc} | {dist}")
     print(f"  Epochs: {t_cfg['epochs']}  Batch: {t_cfg['batch']}  LR: {t_cfg['lr']}")
     print(f"  Slots: K={num_slots}  proj_dim={proj_dim}  iters={slot_iters}")
-    print(f"  ins_method: {ins_method}")
+    print(f"  ins_method: {ins_method}  (depot-less: {env == 'tsp'})")
     print(f"  Output: {log_path}")
     print(f"{'='*60}\n")
 
@@ -286,6 +320,7 @@ def train(
 
     best_reward = checkpoint_cb.best_model_score.item() if checkpoint_cb.best_model_score else None
     result = {
+        "env": env,
         "backbone": backbone,
         "variant": variant,
         "num_slots": num_slots,
@@ -293,6 +328,8 @@ def train(
         "dist": dist,
         "seed": seed,
         "ins_method": ins_method,
+        "normalize_target": normalize_target,
+        "symmetrize_target": symmetrize_target,
         "best_val_reward": best_reward,
         "elapsed_min": round(elapsed / 60, 1),
         "checkpoint": str(checkpoint_cb.best_model_path),
@@ -303,7 +340,10 @@ def train(
     result_dir.mkdir(parents=True, exist_ok=True)
     result_file = result_dir / f"ablation_N{num_loc}.json"
     results = json.loads(result_file.read_text()) if result_file.exists() else []
-    dedup_key = {k: result[k] for k in ("backbone", "variant", "num_slots", "num_loc", "dist", "seed", "ins_method")}
+    dedup_key = {k: result[k] for k in (
+        "env", "backbone", "variant", "num_slots", "num_loc", "dist", "seed",
+        "ins_method", "normalize_target", "symmetrize_target",
+    )}
     results = [r for r in results if not all(r.get(k) == v for k, v in dedup_key.items())]
     results.append(result)
     result_file.write_text(json.dumps(results, indent=2))
@@ -316,8 +356,13 @@ def main():
     parser = argparse.ArgumentParser(description="Train POMOSlot -- Metric-Aware NCO")
     parser.add_argument("--variant",       type=str,   default="D",       choices=list("ABCD"),
                         help="Ablation variant. E is reserved (not implemented).")
-    parser.add_argument("--num_loc",       type=int,   default=100,       choices=[50, 100, 200, 500])
+    parser.add_argument("--num_loc",       type=int,   default=100,       choices=[20, 50, 100, 200, 500])
     parser.add_argument("--dist",          type=str,   default="uniform", choices=["uniform", "clustered"])
+    parser.add_argument("--env",           type=str,   default="cvrp",    choices=["cvrp", "tsp"],
+                        help="Problem to train on: 'cvrp' (depot + demand) or 'tsp' "
+                             "(no depot — all nodes are customers; metric target uses a "
+                             "center pseudo-depot). Must match the cached dataset's "
+                             "'problem' tag and --data_dir naming (cvrp/tsp prefix).")
     parser.add_argument("--data_dir",      type=str,   default="./data/slot_datasets_v2")
     parser.add_argument("--output",        type=str,   default="./output",
                         help="Root dir for logs + results/ablation_N{num_loc}.json")
@@ -330,6 +375,9 @@ def main():
     parser.add_argument("--slot_iters",    type=int,   default=3)
     parser.add_argument("--lambda_init",   type=float, default=1.0)
     parser.add_argument("--lr_dual",       type=float, default=1e-4)
+    parser.add_argument("--beta_entropy",  type=float, default=None,
+                        help="Override the per-variant slot-entropy weight. Set 0.0 to "
+                             "keep slots + metric loss but drop the entropy regulariser.")
     parser.add_argument("--ins_method",    type=str,   default="construction",
                         choices=["savings", "construction", "insertion"],
                         help="d_ins insertion-cost method. Must match the cached dataset's "
@@ -344,6 +392,18 @@ def main():
                         help="REINFORCE baseline for the AM backbone (e.g. rollout, shared). Ignored for pomo.")
     parser.add_argument("--disable_slots", action="store_true",
                         help="Run the backbone as a true no-slot baseline (skips SlotAttention + aux losses).")
+    parser.add_argument("--normalize_target", dest="normalize_target",
+                        action="store_true", default=True,
+                        help="Normalize D_ins aggregation by realized sparse edge mass (default: True).")
+    parser.add_argument("--no_normalize_target", dest="normalize_target",
+                        action="store_false",
+                        help="Use RAW (unnormalized) D_ins aggregation -- for the ablation baseline.")
+    parser.add_argument("--symmetrize_target", dest="symmetrize_target",
+                        action="store_true", default=True,
+                        help="Symmetrize D_ins aggregation (default: True).")
+    parser.add_argument("--no_symmetrize_target", dest="symmetrize_target",
+                        action="store_false",
+                        help="Keep D_ins aggregation asymmetric -- for the ablation baseline.")
     parser.add_argument("--logger",        type=str,   default="csv", choices=["csv", "wandb"],
                         help="Logger: 'csv' (default, lightweight) or 'wandb' (requires wandb login).")
     parser.add_argument("--resume",        type=str,   default=None,
@@ -354,6 +414,7 @@ def main():
         variant=args.variant,
         num_loc=args.num_loc,
         dist=args.dist,
+        env=args.env,
         data_dir=args.data_dir,
         output=args.output,
         seed=args.seed,
@@ -364,6 +425,9 @@ def main():
         slot_iters=args.slot_iters,
         lambda_init=args.lambda_init,
         lr_dual=args.lr_dual,
+        beta_entropy=args.beta_entropy,
+        normalize_target=args.normalize_target,
+        symmetrize_target=args.symmetrize_target,
         epochs=args.epochs,
         batch_size=args.batch_size,
         max_instances=args.max_instances,

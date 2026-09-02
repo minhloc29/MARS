@@ -61,18 +61,22 @@ def _gen_demands(batch: int, n: int, max_demand: int = 9) -> torch.Tensor:
 
 def _compute_sparse_d_ins(
     locs: torch.Tensor,
-    depot: torch.Tensor,
+    depot: torch.Tensor | None,
     k_neighbors: int,
     method: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sparse (B, N, k) insertion cost -> (idx int16, val float32).
-    depot: (B, 2) or (B, 1, 2). method: savings | construction | insertion.
+    depot: (B, 2) or (B, 1, 2), or None for no-depot problems (TSP) — the
+    insertion-cost function then defaults to a center pseudo-depot.
+    method: savings | construction | insertion.
     """
     from rl4co.data.insertion_cost import compute_sparse_insertion_cost
 
-    depot_3d = depot.unsqueeze(1) if depot.dim() == 2 else depot  # (B, 1, 2)
+    depot_loc = None if depot is None else (
+        depot.unsqueeze(1) if depot.dim() == 2 else depot  # (B, 1, 2)
+    )
     return compute_sparse_insertion_cost(
-        locs, k_neighbors=k_neighbors, depot_loc=depot_3d, method=method
+        locs, k_neighbors=k_neighbors, depot_loc=depot_loc, method=method
     )
 
 
@@ -82,12 +86,19 @@ def generate_split(
     dist: str,
     k_neighbors: int,
     method: str,
+    env: str = "cvrp",
     chunk_size: int = 512,
 ) -> dict[str, torch.Tensor | str]:
     """Generate one full split in memory-friendly chunks.
 
-    Returns dict: locs, depot, demand, capacity, d_ins_idx, d_ins_val,
-                  format_version, method.
+    Returns dict: locs, depot, demand, capacity (CVRP only), d_ins_idx, d_ins_val,
+                  format_version, method, problem/env.
+
+    env "cvrp": locs (B, N, 2) with N = #customers, plus depot (B, 2) and demand.
+        Node 0 of the decoder input is the depot (padded by the model).
+    env "tsp":  locs (B, N, 2) with N = #customers and NO depot — all nodes are
+        customers to be routed. d_ins uses a synthetic center pseudo-depot
+        (depot_loc=None -> insertion_cost defaults to (0.5, 0.5)).
     """
     gen_fn = _gen_uniform if dist == "uniform" else _gen_clustered
 
@@ -98,35 +109,43 @@ def generate_split(
         end = min(start + chunk_size, n_instances)
         bs = end - start
 
-        locs   = gen_fn(bs, n)              # (bs, N, 2)
-        depot  = torch.rand(bs, 2)          # (bs, 2) — CVRPEnv expects (B, 2)
-        demand = _gen_demands(bs, n)        # (bs, N) already normalized
-
-        d_idx, d_val = _compute_sparse_d_ins(locs, depot, k_neighbors, method)  # (bs,N,k) each
+        locs = gen_fn(bs, n)              # (bs, N, 2)
+        if env == "tsp":
+            depot = None                  # no depot for TSP
+            demand = None
+            d_idx, d_val = _compute_sparse_d_ins(locs, None, k_neighbors, method)
+        else:
+            depot  = torch.rand(bs, 2)    # (bs, 2) — CVRPEnv expects (B, 2)
+            demand = _gen_demands(bs, n)  # (bs, N) already normalized
+            d_idx, d_val = _compute_sparse_d_ins(locs, depot, k_neighbors, method)
 
         all_locs.append(locs)
-        all_depots.append(depot)
-        all_demands.append(demand)
+        if depot is not None:
+            all_depots.append(depot)
+        if demand is not None:
+            all_demands.append(demand)
         all_dins_idx.append(d_idx)
         all_dins_val.append(d_val)
 
         if (start // chunk_size) % 10 == 0:
             print(
-                f"  [{dist}] N={n} -- generated {end}/{n_instances} instances...",
+                f"  [{env}:{dist}] N={n} -- generated {end}/{n_instances} instances...",
                 flush=True,
             )
 
-    n_total = sum(t.shape[0] for t in all_locs)
-    return {
+    data: dict[str, torch.Tensor | str] = {
         "locs":           torch.cat(all_locs,      dim=0),        # (B, N, 2)
-        "depot":          torch.cat(all_depots,    dim=0),        # (B, 2)
-        "demand":         torch.cat(all_demands,   dim=0),        # (B, N)
-        "capacity":       torch.full((n_total, 1), 1.0),          # (B, 1) always 1.0
         "d_ins_idx":      torch.cat(all_dins_idx,  dim=0),        # (B, N, k) int16
         "d_ins_val":      torch.cat(all_dins_val,  dim=0),        # (B, N, k) float32
         "format_version": "sparse_v2",                            # metadata
         "method":         method,                                 # d_ins cost method tag
+        "problem":        env,                                    # "cvrp" | "tsp"
     }
+    if env != "tsp":
+        data["depot"]    = torch.cat(all_depots,   dim=0)         # (B, 2)
+        data["demand"]   = torch.cat(all_demands,  dim=0)         # (B, N)
+        data["capacity"] = torch.full((n_instances, 1), 1.0)      # (B, 1) always 1.0
+    return data
 
 
 def generate_and_save(
@@ -138,28 +157,33 @@ def generate_and_save(
     n_test: int,
     k_neighbors: int,
     method: str,
+    env: str = "cvrp",
     chunk_size: int = 512,
 ) -> None:
     """Generate and save train/val/test splits to {out_dir}/{method}/ (so
-    different d_ins targets never collide)."""
+    different d_ins targets never collide). env: "cvrp" | "tsp" -> filename
+    prefix (cvrp/tsp) so the two problems never collide either."""
     out_dir = Path(out_dir) / method
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for split, n_instances in [("train", n_train), ("val", n_val), ("test", n_test)]:
         if n_instances == 0:
             continue
-        fpath = out_dir / f"cvrp{n}_{dist}_{split}.pt"
+        fpath = out_dir / f"{env}{n}_{dist}_{split}.pt"
         if fpath.exists():
             print(f"  Skipping {fpath} (already exists).")
             continue
-        print(f"\nGenerating {split} split: {n_instances} instances, N={n}, dist={dist}")
-        data = generate_split(n_instances, n, dist, k_neighbors, method, chunk_size)
+        print(f"\nGenerating {split} split: {n_instances} instances, N={n}, dist={dist}, env={env}")
+        data = generate_split(n_instances, n, dist, k_neighbors, method, env, chunk_size)
         torch.save(data, fpath)
         print(f"  Saved -> {fpath}  (d_ins_idx shape: {data['d_ins_idx'].shape})")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate Slot NCO datasets with cached sparse d_ins")
+    parser.add_argument("--env",         type=str,   default="cvrp", choices=["cvrp", "tsp"],
+                        help="Problem to generate: 'cvrp' (has depot+demand) or 'tsp' "
+                             "(no depot — all nodes are customers; d_ins uses center pseudo-depot).")
     parser.add_argument("--num_locs",    type=int,   default=100,
                         help="Number of customer nodes N")
     parser.add_argument("--dist",        type=str,   default="uniform",
@@ -193,6 +217,7 @@ def main() -> None:
             n_test=args.n_test,
             k_neighbors=args.k_neighbors,
             method=args.method,
+            env=args.env,
             chunk_size=args.chunk_size,
         )
 
