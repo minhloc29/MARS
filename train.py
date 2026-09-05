@@ -21,6 +21,7 @@ try:
     from rl4co.envs import CVRPEnv
     from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
     from rl4co.models.zoo.l2r import L2RModel
+    from rl4co.models.zoo.icam import ICAMCVRP
     FULL_RL4CO = True
 except Exception as e:
     print(f"[WARN] Full rl4co import failed: {e}")
@@ -31,12 +32,13 @@ MODEL_CLASSES = {
     "pomo": POMOSlot,
     "am": AMSlot,
     "l2r": L2RModel,
+    "icam": ICAMCVRP,
 }
-
 
 
 class SlotDataset(torch.utils.data.Dataset):
     """Wraps cached .pt files from generate_slot_dataset.py (sparse_v2)."""
+
     def __init__(self, filepath: str | Path, variant: str = "D", max_instances: int | None = None):
         data = torch.load(filepath, map_location="cpu", weights_only=False)
 
@@ -51,28 +53,34 @@ class SlotDataset(torch.utils.data.Dataset):
                     "Command: python -m rl4co.data.generate_slot_dataset --num_locs N --dist DIST ..."
                 )
         elif fmt != "sparse_v2":
-            raise RuntimeError(f"Unknown dataset format_version: '{fmt}' in {filepath}")
+            raise RuntimeError(
+                f"Unknown dataset format_version: '{fmt}' in {filepath}")
 
-        self.locs     = data["locs"]     # (N_inst, N, 2)
-        self.depot    = data["depot"]    # (N_inst, 2)
-        self.demand   = data["demand"]   # (N_inst, N)
+        self.locs = data["locs"]     # (N_inst, N, 2)
+        self.depot = data["depot"]    # (N_inst, 2)
+        self.demand = data["demand"]   # (N_inst, N)
         self.capacity = data.get("capacity", None)
         # d_ins cost-method tag stamped by the generator; None for legacy datasets.
         self.method: str | None = data.get("method", None)
 
         # Sparse d_ins only needed for Variant D
         needs_dins = variant == "D"
-        self.d_ins_idx = data.get("d_ins_idx", None) if needs_dins else None  # (N_inst,N,k) int16
-        self.d_ins_val = data.get("d_ins_val", None) if needs_dins else None  # (N_inst,N,k) float32
+        self.d_ins_idx = data.get(
+            "d_ins_idx", None) if needs_dins else None  # (N_inst,N,k) int16
+        self.d_ins_val = data.get(
+            "d_ins_val", None) if needs_dins else None  # (N_inst,N,k) float32
         self.variant = variant
 
         if max_instances is not None:
-            self.locs     = self.locs[:max_instances]
-            self.depot    = self.depot[:max_instances]
-            self.demand   = self.demand[:max_instances]
-            if self.capacity  is not None: self.capacity  = self.capacity[:max_instances]
-            if self.d_ins_idx is not None: self.d_ins_idx = self.d_ins_idx[:max_instances]
-            if self.d_ins_val is not None: self.d_ins_val = self.d_ins_val[:max_instances]
+            self.locs = self.locs[:max_instances]
+            self.depot = self.depot[:max_instances]
+            self.demand = self.demand[:max_instances]
+            if self.capacity is not None:
+                self.capacity = self.capacity[:max_instances]
+            if self.d_ins_idx is not None:
+                self.d_ins_idx = self.d_ins_idx[:max_instances]
+            if self.d_ins_val is not None:
+                self.d_ins_val = self.d_ins_val[:max_instances]
 
     def __len__(self):
         return len(self.locs)
@@ -169,14 +177,14 @@ def train(
         t_cfg["batch"] = batch_size
     if max_instances is not None:
         t_cfg["n_train"] = min(t_cfg["n_train"], max_instances)
-        t_cfg["n_val"]   = min(t_cfg["n_val"],   max(1, max_instances // 10))
+        t_cfg["n_val"] = min(t_cfg["n_val"],   max(1, max_instances // 10))
     v_cfg = VARIANT_DEFAULTS[variant]
     if beta_entropy is not None:
         v_cfg["beta_entropy"] = beta_entropy
 
     data_dir = Path(data_dir)
     train_path = data_dir / ins_method / f"cvrp{num_loc}_{dist}_train.pt"
-    val_path   = data_dir / ins_method / f"cvrp{num_loc}_{dist}_val.pt"
+    val_path = data_dir / ins_method / f"cvrp{num_loc}_{dist}_val.pt"
 
     if not train_path.exists():
         raise FileNotFoundError(
@@ -186,8 +194,10 @@ def train(
         )
 
     # Data
-    train_loader = make_dataloader(train_path, variant, t_cfg["batch"], shuffle=True, max_instances=t_cfg["n_train"])
-    val_loader   = make_dataloader(val_path,   variant, t_cfg["batch"], shuffle=False, max_instances=t_cfg["n_val"])
+    train_loader = make_dataloader(
+        train_path, variant, t_cfg["batch"], shuffle=True, max_instances=t_cfg["n_train"])
+    val_loader = make_dataloader(
+        val_path,   variant, t_cfg["batch"], shuffle=False, max_instances=t_cfg["n_val"])
 
     # Validate d_ins cost method (Variant D consumes d_ins). The data was baked
     # with a specific method; refuse a mismatch so we never train on the wrong cost.
@@ -229,9 +239,16 @@ def train(
 
     if backbone == "l2r":
         model_kwargs["lower_neighbors_num"] = lower_neighbors_num
-        model_kwargs["reduction_percentage"] = lower_neighbors_num
-        
-    if backbone == "am":
+        model_kwargs["reduction_percentage"] = reduction_percentage
+    elif backbone == "icam":
+        model_kwargs = dict(
+            env=env,
+            embed_dim=embed_dim,
+            num_starts=num_loc,
+            problem="cvrp",
+            optimizer_kwargs={"lr": t_cfg["lr"]},
+        )
+    elif backbone == "am":
         model_kwargs["baseline"] = baseline if baseline is not None else "shared"
     # disable_slots: run backbone as a true no-slot baseline (no slot/aux).
     if disable_slots:
@@ -295,7 +312,8 @@ def train(
 
     print(f"\n{'='*60}")
     print(f"Training {backbone} — Variant {variant} | N={num_loc} | {dist}")
-    print(f"  Epochs: {t_cfg['epochs']}  Batch: {t_cfg['batch']}  LR: {t_cfg['lr']}")
+    print(
+        f"  Epochs: {t_cfg['epochs']}  Batch: {t_cfg['batch']}  LR: {t_cfg['lr']}")
     print(f"  Slots: K={num_slots}  proj_dim={proj_dim}  iters={slot_iters}")
     print(f"  ins_method: {ins_method}")
     print(f"  Output: {log_path}")
@@ -305,7 +323,8 @@ def train(
     trainer.fit(model, train_loader, val_loader, ckpt_path=resume)
     elapsed = time.time() - t0
 
-    best_reward = checkpoint_cb.best_model_score.item() if checkpoint_cb.best_model_score else None
+    best_reward = checkpoint_cb.best_model_score.item(
+    ) if checkpoint_cb.best_model_score else None
     result = {
         "backbone": backbone,
         "variant": variant,
@@ -325,12 +344,14 @@ def train(
     result_dir = Path(output)
     result_dir.mkdir(parents=True, exist_ok=True)
     result_file = result_dir / f"ablation_N{num_loc}.json"
-    results = json.loads(result_file.read_text()) if result_file.exists() else []
+    results = json.loads(result_file.read_text()
+                         ) if result_file.exists() else []
     dedup_key = {k: result[k] for k in (
         "backbone", "variant", "num_slots", "num_loc", "dist", "seed",
         "ins_method", "normalize_target", "symmetrize_target",
     )}
-    results = [r for r in results if not all(r.get(k) == v for k, v in dedup_key.items())]
+    results = [r for r in results if not all(
+        r.get(k) == v for k, v in dedup_key.items())]
     results.append(result)
     result_file.write_text(json.dumps(results, indent=2))
 
@@ -339,12 +360,16 @@ def train(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train POMOSlot -- Metric-Aware NCO")
+    parser = argparse.ArgumentParser(
+        description="Train POMOSlot -- Metric-Aware NCO")
     parser.add_argument("--variant",       type=str,   default="D",       choices=list("ABCD"),
                         help="Ablation variant. E is reserved (not implemented).")
-    parser.add_argument("--num_loc",       type=int,   default=100,       choices=[50, 100, 200, 500, 1000])
-    parser.add_argument("--dist",          type=str,   default="uniform", choices=["uniform", "clustered"])
-    parser.add_argument("--data_dir",      type=str,   default="./data/slot_datasets_v2")
+    parser.add_argument("--num_loc",       type=int,
+                        default=100,       choices=[50, 100, 200, 500, 1000])
+    parser.add_argument("--dist",          type=str,
+                        default="uniform", choices=["uniform", "clustered"])
+    parser.add_argument("--data_dir",      type=str,
+                        default="./data/slot_datasets_v2")
     parser.add_argument("--output",        type=str,   default="./output",
                         help="Root dir for logs + results/ablation_N{num_loc}.json")
     parser.add_argument("--seed",          type=int,   default=42)
@@ -367,8 +392,8 @@ def main():
     parser.add_argument("--batch_size",    type=int,   default=None)
     parser.add_argument("--max_instances", type=int,   default=None,
                         help="Cap dataset size for quick smoke tests")
-    parser.add_argument("--backbone",      type=str,   default="pomo", choices=["pomo", "am", "l2r"],
-                        help="Backbone: 'pomo' (multi-start, shared baseline) or 'am' (single-start, rollout baseline)")
+    parser.add_argument("--backbone",      type=str,   default="pomo", choices=["pomo", "am", "l2r", "icam"],
+                        help="Backbone: 'pomo', 'am', 'l2r', or native ICAM CVRP")
     parser.add_argument("--baseline",      type=str,   default=None,
                         help="REINFORCE baseline for the AM backbone (e.g. rollout, shared). Ignored for pomo.")
     parser.add_argument("--disable_slots", action="store_true",
@@ -428,5 +453,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
