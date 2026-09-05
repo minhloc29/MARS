@@ -20,6 +20,7 @@ except Exception:
 try:
     from rl4co.envs import CVRPEnv
     from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
+    from rl4co.models.zoo.l2r import L2RModel
     FULL_RL4CO = True
 except Exception as e:
     print(f"[WARN] Full rl4co import failed: {e}")
@@ -29,6 +30,7 @@ except Exception as e:
 MODEL_CLASSES = {
     "pomo": POMOSlot,
     "am": AMSlot,
+    "l2r": L2RModel,
 }
 
 
@@ -150,6 +152,8 @@ def train(
     ins_method: str = "construction",
     logger: str = "csv",
     resume: str | None = None,
+    lower_neighbors_num: int = 50,
+    reduction_percentage: float = 0.1,
 ):
     assert FULL_RL4CO, (
         "Full rl4co import failed. Ensure torchrl DLL is installed correctly "
@@ -223,6 +227,10 @@ def train(
         optimizer_kwargs={"lr": t_cfg["lr"]},
     )
 
+    if backbone == "l2r":
+        model_kwargs["lower_neighbors_num"] = lower_neighbors_num
+        model_kwargs["reduction_percentage"] = lower_neighbors_num
+        
     if backbone == "am":
         model_kwargs["baseline"] = baseline if baseline is not None else "shared"
     # disable_slots: run backbone as a true no-slot baseline (no slot/aux).
@@ -286,7 +294,7 @@ def train(
     trainer = pl.Trainer(**trainer_kwargs)
 
     print(f"\n{'='*60}")
-    print(f"Training POMOSlot — Variant {variant} | N={num_loc} | {dist}")
+    print(f"Training {backbone} — Variant {variant} | N={num_loc} | {dist}")
     print(f"  Epochs: {t_cfg['epochs']}  Batch: {t_cfg['batch']}  LR: {t_cfg['lr']}")
     print(f"  Slots: K={num_slots}  proj_dim={proj_dim}  iters={slot_iters}")
     print(f"  ins_method: {ins_method}")
@@ -359,7 +367,7 @@ def main():
     parser.add_argument("--batch_size",    type=int,   default=None)
     parser.add_argument("--max_instances", type=int,   default=None,
                         help="Cap dataset size for quick smoke tests")
-    parser.add_argument("--backbone",      type=str,   default="pomo", choices=["pomo", "am"],
+    parser.add_argument("--backbone",      type=str,   default="pomo", choices=["pomo", "am", "l2r"],
                         help="Backbone: 'pomo' (multi-start, shared baseline) or 'am' (single-start, rollout baseline)")
     parser.add_argument("--baseline",      type=str,   default=None,
                         help="REINFORCE baseline for the AM backbone (e.g. rollout, shared). Ignored for pomo.")
@@ -381,6 +389,10 @@ def main():
                         help="Logger: 'csv' (default, lightweight) or 'wandb' (requires wandb login).")
     parser.add_argument("--resume",        type=str,   default=None,
                         help="Path to a .ckpt to resume training from its last epoch (Lightning checkpoint).")
+    parser.add_argument("--lower_neighbors_num", type=int, default=50,
+                        help="L2R lower-model candidate count")
+    parser.add_argument("--reduction_percentage", type=float, default=0.1,
+                        help="L2R static farthest-edge reduction fraction")
     args = parser.parse_args()
 
     train(
@@ -409,6 +421,8 @@ def main():
         ins_method=args.ins_method,
         logger=args.logger,
         resume=args.resume,
+        lower_neighbors_num=args.lower_neighbors_num,
+        reduction_percentage=args.reduction_percentage,
     )
 
 
