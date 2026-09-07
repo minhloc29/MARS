@@ -72,7 +72,9 @@ def main() -> None:
                         help="Optional pre-generated .npz eval set (from gen_data.py). "
                              "When given, loads this instead of generating fresh instances "
                              "(default: generate as before).")
-    parser.add_argument("--out", type=str, default=None, help="JSON path to save results (default: results/eval_<run>.json)")
+    parser.add_argument("--out", type=str, default=None,
+                        help="JSON path to save results. Default: auto-named from model, "
+                             "num_loc, augment and seed under results/eval_<run>.json")
     args = parser.parse_args()
 
     num_loc = args.num_loc
@@ -195,10 +197,19 @@ def main() -> None:
           f"mean tour = {result['mean_tour_length']:.4f} "
           f"(mean reward = {result['mean_reward']:.4f})")
 
+
     if args.out:
-        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.out).write_text(json.dumps(result, indent=2))
-        print(f"Saved to {args.out}")
+        out_path = Path(args.out)
+    else:
+        aug_tag = "aug" if args.augment else "noaug"
+        nstart_tag = "" if args.num_starts is None else f"_st{args.num_starts}"
+        out_path = Path("results") / (
+            f"eval_{args.model}_N{num_loc}_{aug_tag}"
+            f"_seed{args.seed}{nstart_tag}.json"
+        )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(result, indent=2))
+    print(f"Saved to {out_path}")
 
 
 if __name__ == "__main__":
