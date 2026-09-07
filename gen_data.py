@@ -1,12 +1,3 @@
-"""Generate the eval CVRP dataset once and cache it to an NPZ file.
-
-Run once per (num_loc, n_inst, seed) combo, then test.py can consume the cached file:
-
-    python gen_data.py --num_loc 100 --n_inst 1024 --seed 1234 \
-        --out data/eval_cvrp100_seed1234.npz
-    python test.py --ckpt PATH --model am --num_loc 100 --n_inst 1024 --seed 1234 \
-        --data data/eval_cvrp100_seed1234.npz
-"""
 from __future__ import annotations
 
 import argparse
@@ -18,6 +9,15 @@ from rl4co.data.utils import save_tensordict_to_npz
 
 
 def main() -> None:
+    # Supported --loc_dist values (see rl4co/envs/common/utils.py get_sampler()):
+    #   uniform             -> Uniform(min_loc, max_loc)                       (default)
+    #   normal / gaussian   -> Normal(loc_mean, loc_std)
+    #   exponential         -> Exponential(rate)
+    #   poisson             -> Poisson(rate)      (use with demand, not locs)
+    #   gaussian_mixture    -> Gaussian_Mixture(num_modes, cdist)
+    #   cluster             -> Cluster(n_cluster)
+    #   mixed               -> Mixed(n_cluster_mix)
+    #   mix_distribution    -> Mix_Distribution(n_cluster, n_cluster_mix)
     parser = argparse.ArgumentParser(description="Generate & cache a CVRP eval dataset")
     parser.add_argument("--num_loc", type=int, required=True,
                         help="Number of CUSTOMERS N (must match --num_loc in test.py).")
@@ -26,15 +26,45 @@ def main() -> None:
                         help="Seed for the generated instances. Use the SAME seed as "
                              "test.py so the eval set is reproducible / comparable.")
     parser.add_argument("--out", type=str, required=True, help="Output .npz path to save.")
+    parser.add_argument("--loc_dist", type=str, default="uniform",
+                        choices=["uniform", "gaussian", "cluster", "gaussian_mixture",
+                                 "mixed", "mix_distribution", "exponential", "poisson"],
+                        help="Customer location distribution. Default: uniform.")
+
+    # Distribution-specific arguments (only the ones matching --loc_dist are consumed).
+    dist_args = parser.add_argument_group("distribution arguments")
+    dist_args.add_argument("--num_modes", type=int, default=None,
+                           help="gaussian_mixture: number of modes.")
+    dist_args.add_argument("--cdist", type=float, default=None,
+                           help="gaussian_mixture: center distance between modes.")
+    dist_args.add_argument("--n_cluster", type=int, default=None,
+                           help="cluster: number of clusters.")
+    dist_args.add_argument("--n_cluster_mix", type=int, default=None,
+                           help="mixed/mix_distribution: number of mixed-cluster points.")
+    dist_args.add_argument("--loc_mean", type=float, default=None,
+                           help="gaussian: mean of the location Normal distribution.")
+    dist_args.add_argument("--loc_std", type=float, default=None,
+                           help="gaussian: std of the location Normal distribution.")
+    dist_args.add_argument("--loc_rate", type=float, default=None,
+                           help="exponential/poisson: rate parameter.")
     args = parser.parse_args()
 
     pl.seed_everything(args.seed, workers=True)
+
+    # Build generator_params: base + the chosen distribution. Only pass the args that
+    # the distribution actually needs, so the unused ones don't leak into the sampler.
+    generator_params = dict(num_loc=args.num_loc, loc_distribution=args.loc_dist)
+    for key in ("num_modes", "cdist", "n_cluster", "n_cluster_mix",
+                "loc_mean", "loc_std", "loc_rate"):
+        value = getattr(args, key, None)
+        if value is not None:
+            generator_params[key] = value
 
     # Mirrors test.py: CVRPEnv with the same generator_params at the same target size.
     # NOTE: use env.generator() directly (not env.dataset()) so we get the raw
     # TensorDict, which is what save_tensordict_to_npz() expects (env.dataset()
     # returns a TensorDictDataset wrapper object).
-    env = CVRPEnv(generator_params=dict(num_loc=args.num_loc))
+    env = CVRPEnv(generator_params=generator_params)
     td = env.generator([args.n_inst])
 
     out = Path(args.out)
