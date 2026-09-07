@@ -10,6 +10,8 @@ from tensordict import TensorDict
 from rl4co.envs import CVRPEnv
 from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
 from rl4co.models.zoo.pomo_slot.model_am import SingleSharedBaseline
+from rl4co.models.zoo.sil import SIL
+from train import SlotDataset
 
 
 def _allow_safe_globals() -> None:
@@ -22,10 +24,12 @@ def _allow_safe_globals() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate a slot-model checkpoint at a target size")
+    parser = argparse.ArgumentParser(description="Evaluate a MARS or SIL checkpoint at a target size")
     parser.add_argument("--ckpt", type=str, required=True, help="Path to a trained .ckpt")
-    parser.add_argument("--model", type=str, default="am", choices=["am", "pomo"],
-                        help="Model class: 'am' (AMSlot) or 'pomo' (POMOSlot). Must match the checkpoint.")
+    parser.add_argument("--model", type=str, default="am", choices=["am", "pomo", "sil"],
+                        help="Model class. Must match the checkpoint.")
+    parser.add_argument("--data_path", type=str, default=None,
+                        help="Cached MARS .pt test split shared across methods; recommended for comparisons")
     parser.add_argument("--num_loc", type=int, required=True,
                         help="Target number of CUSTOMERS N (e.g. 50/100/200/500/1000).")
     parser.add_argument("--n_inst", type=int, default=1024, help="Number of eval instances")
@@ -45,16 +49,20 @@ def main() -> None:
     pl.seed_everything(args.seed, workers=True)
 
     # Load model
-    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     env = CVRPEnv(generator_params=dict(num_loc=num_loc))
-    model_cls = POMOSlot if args.model == "pomo" else AMSlot
-    model = model_cls.load_from_checkpoint(args.ckpt, env=env, map_location="cpu")
+    model_cls = {"pomo": POMOSlot, "am": AMSlot, "sil": SIL}[args.model]
+    model = model_cls.load_from_checkpoint(args.ckpt, env=env, map_location="cpu", weights_only=False)
+    if args.model == "sil":
+        # Inference only needs the learned policy, not the training label cache.
+        model.labels.clear()
+        model.best_policy_state = model.repair_policy_state = None
 
-    # Eval dataloader — fresh instances at target size
-    ds = env.dataset(batch_size=[args.n_inst])
+    # Use the shared cached split when supplied, otherwise seeded fresh instances.
+    ds = (SlotDataset(args.data_path, variant="none", max_instances=args.n_inst)
+          if args.data_path else env.dataset(batch_size=[args.n_inst]))
 
     collate_fn = getattr(ds, "collate_fn", None)
-    if collate_fn is None:
+    if collate_fn is None and not args.data_path:
         collate_fn = torch.stack  # TensorDict supports stacking a list of TensorDicts
 
     loader = torch.utils.data.DataLoader(
@@ -65,8 +73,11 @@ def main() -> None:
 
     # Greedy decode via the policy
     rewards = []
+    actual_num_starts = 1
     with torch.no_grad():
         for batch in loader:
+            if isinstance(batch, dict):
+                batch = TensorDict(batch, batch_size=[batch["demand"].size(0)])
             batch = batch.to(next(model.parameters()).device)
             td = env.reset(batch)
             # CVRP env prepends the depot, so locs == num_loc + 1 rows.
@@ -78,7 +89,11 @@ def main() -> None:
                     f"Refusing to evaluate on the wrong size."
                 )
             out = model.policy(td, env, phase="test", num_starts=args.num_starts)
-            rewards.append(out["reward"].cpu())
+            # Multi-start rollouts are stacked start-major by RL4CO. Report
+            # one best-start score per instance, not B * starts pseudo-instances.
+            batch_size = batch.batch_size[0]
+            actual_num_starts = out["reward"].numel() // batch_size
+            rewards.append(out["reward"].reshape(actual_num_starts, batch_size).max(0).values.cpu())
 
     reward = torch.cat(rewards)
     tour_len = -reward  # CVRP: reward = -tour_length
@@ -89,8 +104,10 @@ def main() -> None:
         "seed": args.seed,
         "mean_reward": float(reward.mean()),
         "mean_tour_length": float(tour_len.mean()),
-        "std_tour_length": float(tour_len.std()),
+        "std_tour_length": float(tour_len.std()) if len(tour_len) > 1 else 0.0,
         "ckpt": str(args.ckpt),
+        "data_path": str(Path(args.data_path).resolve()) if args.data_path else None,
+        "num_starts": actual_num_starts,
     }
 
     print(f"[OK] evaluated at num_loc={num_loc} customers  n={len(reward)}  "

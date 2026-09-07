@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import argparse
+
 from pathlib import Path
 
 import torch
-
 
 # CVRP standard capacities (Kool et al. 2019)
 CAPACITIES = {50: 40.0, 100: 50.0, 200: 70.0, 500: 100.0}
@@ -138,23 +138,39 @@ def generate_and_save(
     n_test: int,
     k_neighbors: int,
     method: str,
-    chunk_size: int = 512,
+    chunk_size: int | None = None,
+    seed: int | None = None,
 ) -> None:
     """Generate and save train/val/test splits to {out_dir}/{method}/ (so
     different d_ins targets never collide)."""
+    if chunk_size is None:
+        # Dense pairwise work scales as B*N*N. Keep each dense tensor near
+        # 64 MB so the several live intermediates remain practical at N=1000.
+        chunk_size = max(1, min(512, 16_000_000 // (n * n)))
+
     out_dir = Path(out_dir) / method
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for split, n_instances in [("train", n_train), ("val", n_val), ("test", n_test)]:
+    splits = [("train", n_train), ("val", n_val), ("test", n_test)]
+    for split_idx, (split, n_instances) in enumerate(splits):
         if n_instances == 0:
             continue
         fpath = out_dir / f"cvrp{n}_{dist}_{split}.pt"
         if fpath.exists():
             print(f"  Skipping {fpath} (already exists).")
             continue
-        print(f"\nGenerating {split} split: {n_instances} instances, N={n}, dist={dist}")
+        # Split-local seeds make recovery deterministic if one output already
+        # exists after an interrupted generation job.
+        if seed is not None:
+            torch.manual_seed(seed + split_idx)
+        print(
+            f"\nGenerating {split} split: {n_instances} instances, N={n}, "
+            f"dist={dist}, chunk_size={chunk_size}"
+        )
         data = generate_split(n_instances, n, dist, k_neighbors, method, chunk_size)
-        torch.save(data, fpath)
+        temporary = fpath.with_suffix(fpath.suffix + ".partial")
+        torch.save(data, temporary)
+        temporary.replace(fpath)
         print(f"  Saved -> {fpath}  (d_ins_idx shape: {data['d_ins_idx'].shape})")
 
 
@@ -173,7 +189,8 @@ def main() -> None:
                         help="d_ins target definition. 'insertion' = Route-Conditioned "
                              "Insertion Cost (RCIC), the recommended Variant D target.")
     parser.add_argument("--k_neighbors", type=int,   default=15)
-    parser.add_argument("--chunk_size",  type=int,   default=512)
+    parser.add_argument("--chunk_size",  type=int,   default=None,
+                        help="Instances per generation chunk (default: adaptive to num_locs)")
     parser.add_argument("--seed",        type=int,   default=None,
                         help="Random seed for reproducibility")
     args = parser.parse_args()
@@ -194,6 +211,7 @@ def main() -> None:
             k_neighbors=args.k_neighbors,
             method=args.method,
             chunk_size=args.chunk_size,
+            seed=args.seed,
         )
 
 

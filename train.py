@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -20,22 +21,33 @@ except Exception:
 try:
     from rl4co.envs import CVRPEnv
     from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
+    from rl4co.models.zoo.sil import SIL
+    from rl4co.models.zoo.lehd import LEHDModel, TTRLModel
+    from rl4co.models.zoo.lehd.model import make_lehd_dataloaders
     FULL_RL4CO = True
 except Exception as e:
     print(f"[WARN] Full rl4co import failed: {e}")
     FULL_RL4CO = False
 
 
+REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_DATA_DIR = REPO_ROOT / "data" / "slot_datasets_v2"
+
+
 MODEL_CLASSES = {
     "pomo": POMOSlot,
     "am": AMSlot,
+    "sil": SIL,
+    "lehd": LEHDModel,
+    "ttpl": TTRLModel,
 }
 
 
 
 class SlotDataset(torch.utils.data.Dataset):
     """Wraps cached .pt files from generate_slot_dataset.py (sparse_v2)."""
-    def __init__(self, filepath: str | Path, variant: str = "D", max_instances: int | None = None):
+    def __init__(self, filepath: str | Path, variant: str = "D", max_instances: int | None = None,
+                 include_instance_id: bool = False):
         data = torch.load(filepath, map_location="cpu", weights_only=False)
 
         # Format version sanity check (reject old dense d_ins)
@@ -63,6 +75,7 @@ class SlotDataset(torch.utils.data.Dataset):
         self.d_ins_idx = data.get("d_ins_idx", None) if needs_dins else None  # (N_inst,N,k) int16
         self.d_ins_val = data.get("d_ins_val", None) if needs_dins else None  # (N_inst,N,k) float32
         self.variant = variant
+        self.include_instance_id = include_instance_id
 
         if max_instances is not None:
             self.locs     = self.locs[:max_instances]
@@ -87,7 +100,17 @@ class SlotDataset(torch.utils.data.Dataset):
             item["d_ins_idx"] = self.d_ins_idx[idx]  # (N, k) int16
         if self.d_ins_val is not None:
             item["d_ins_val"] = self.d_ins_val[idx]  # (N, k) float32
+        if self.include_instance_id:
+            item["instance_id"] = torch.tensor(idx, dtype=torch.long)
         return item
+
+    def signature(self):
+        """Identify the actual cached CVRP inputs before reusing SIL labels."""
+        digest = hashlib.sha256()
+        for tensor in (self.locs, self.depot, self.demand):
+            digest.update(str((tuple(tensor.shape), tensor.dtype)).encode())
+            digest.update(memoryview(tensor.contiguous().numpy()).cast("B"))
+        return digest.hexdigest()
 
 
 def _collate_fn(batch: list[dict]) -> dict:
@@ -96,15 +119,18 @@ def _collate_fn(batch: list[dict]) -> dict:
     return {k: torch.stack([b[k] for b in batch], dim=0) for k in keys}
 
 
-def make_dataloader(filepath: str, variant: str, batch_size: int, shuffle: bool, max_instances: int | None = None):
-    ds = SlotDataset(filepath, variant=variant, max_instances=max_instances)
+def make_dataloader(filepath: str, variant: str, batch_size: int, shuffle: bool, max_instances: int | None = None,
+                    include_instance_id: bool = False, seed: int = 42, num_workers: int = 4):
+    ds = SlotDataset(filepath, variant=variant, max_instances=max_instances,
+                     include_instance_id=include_instance_id)
     return torch.utils.data.DataLoader(
         ds,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True,
+        persistent_workers=num_workers > 0,
+        generator=torch.Generator().manual_seed(seed),
     )
 
 
@@ -121,6 +147,7 @@ TRAIN_DEFAULTS = {
     100: dict(epochs=100, batch=256, lr=1e-4, n_train=100_000, n_val=1_000),
     200: dict(epochs=200, batch=128, lr=5e-5, n_train=100_000, n_val=1_000),
     500: dict(epochs=200, batch=32,  lr=5e-5, n_train=50_000,  n_val=500),
+    1000: dict(epochs=200, batch=64, lr=5e-5, n_train=50_000, n_val=500),
 }
 
 
@@ -128,7 +155,7 @@ def train(
     variant: str = "D",
     num_loc: int = 100,
     dist: str = "uniform",
-    data_dir: str = "./data/slot_datasets",
+    data_dir: str | Path = DEFAULT_DATA_DIR,
     output: str = "./output",
     seed: int = 42,
     device: int = 0,
@@ -150,11 +177,45 @@ def train(
     ins_method: str = "construction",
     logger: str = "csv",
     resume: str | None = None,
+    num_workers: int = 4,
+    sil_repair_budget: int = 5,
+    sil_improve_every: int = 20,
+    sil_max_subtour_length: int = 64,
+    sil_num_layers: int = 6,
+    sil_parallel_reconstruction: bool = True,
+    sil_update_mode: str = "batch",
+    generate_missing_data: bool = False,
+    generation_chunk_size: int | None = None,
+    # ---- LEHD / TTPL baseline arguments ----
+    lehd_data_path: str | None = None,
+    lehd_val_data_path: str | None = None,
+    lehd_decoder_layers: int = 6,
 ):
     assert FULL_RL4CO, (
         "Full rl4co import failed. Ensure torchrl DLL is installed correctly "
         "or run on a compatible machine."
     )
+
+    # ----------------------------------------------------------------
+    # LEHD / TTPL branch — separate training loop using LEHD's own data
+    # ----------------------------------------------------------------
+    if backbone in ("lehd", "ttpl"):
+        return _train_lehd(
+            backbone=backbone,
+            num_loc=num_loc,
+            output=output,
+            seed=seed,
+            device=device,
+            embed_dim=embed_dim,
+            epochs=epochs,
+            batch_size=batch_size,
+            max_instances=max_instances,
+            logger=logger,
+            resume=resume,
+            lehd_data_path=lehd_data_path,
+            lehd_val_data_path=lehd_val_data_path,
+            lehd_decoder_layers=lehd_decoder_layers,
+        )
 
     pl.seed_everything(seed)
     t_cfg = TRAIN_DEFAULTS[num_loc].copy()
@@ -166,7 +227,7 @@ def train(
     if max_instances is not None:
         t_cfg["n_train"] = min(t_cfg["n_train"], max_instances)
         t_cfg["n_val"]   = min(t_cfg["n_val"],   max(1, max_instances // 10))
-    v_cfg = VARIANT_DEFAULTS[variant]
+    v_cfg = VARIANT_DEFAULTS[variant].copy()
     if beta_entropy is not None:
         v_cfg["beta_entropy"] = beta_entropy
 
@@ -174,20 +235,61 @@ def train(
     train_path = data_dir / ins_method / f"cvrp{num_loc}_{dist}_train.pt"
     val_path   = data_dir / ins_method / f"cvrp{num_loc}_{dist}_val.pt"
 
-    if not train_path.exists():
+    missing_paths = [path for path in (train_path, val_path) if not path.exists()]
+    if missing_paths and generate_missing_data:
+        from rl4co.data.generate_slot_dataset import generate_and_save
+
+        print(
+            f"Missing {len(missing_paths)} required split(s); generating the shared "
+            f"N={num_loc} {dist} dataset in {data_dir}."
+        )
+        generate_and_save(
+            out_dir=data_dir,
+            n=num_loc,
+            dist=dist,
+            n_train=t_cfg["n_train"],
+            n_val=t_cfg["n_val"],
+            n_test=t_cfg["n_val"],
+            k_neighbors=15,
+            method=ins_method,
+            chunk_size=generation_chunk_size,
+            seed=seed,
+        )
+        # Dataset generation consumes random numbers. Restore the experiment
+        # seed so a first run and a run reusing the cache initialize identically.
+        pl.seed_everything(seed)
+        missing_paths = [path for path in (train_path, val_path) if not path.exists()]
+
+    if missing_paths:
+        preparation = (
+            f"python -m rl4co.data.generate_slot_dataset --num_locs {num_loc} "
+            f"--dist {dist} --n_train {t_cfg['n_train']} --n_val {t_cfg['n_val']} "
+            f"--n_test {t_cfg['n_val']} --out_dir {data_dir} --method {ins_method} "
+            f"--seed {seed}"
+        )
         raise FileNotFoundError(
-            f"Dataset not found: {train_path}\n"
-            f"Run: python -m rl4co.data.generate_slot_dataset "
-            f"--num_locs {num_loc} --dist {dist} --out_dir {data_dir}"
+            "Missing required cached dataset split(s):\n  "
+            + "\n  ".join(str(path) for path in missing_paths)
+            + "\n\nPrepare the shared MARS/SIL data once with:\n  "
+            + preparation
+            + "\n\nOr append --generate_missing_data to the training command. "
+              "N=1000 preparation is computationally expensive."
         )
 
     # Data
-    train_loader = make_dataloader(train_path, variant, t_cfg["batch"], shuffle=True, max_instances=t_cfg["n_train"])
-    val_loader   = make_dataloader(val_path,   variant, t_cfg["batch"], shuffle=False, max_instances=t_cfg["n_val"])
+    data_variant = "none" if backbone == "sil" else variant
+    loader_kwargs = dict(seed=seed, num_workers=num_workers)
+    train_loader = make_dataloader(train_path, data_variant, t_cfg["batch"], shuffle=True,
+                                   max_instances=t_cfg["n_train"], include_instance_id=backbone == "sil", **loader_kwargs)
+    val_loader = make_dataloader(val_path, data_variant, t_cfg["batch"], shuffle=False,
+                                 max_instances=t_cfg["n_val"], **loader_kwargs)
+    for loader in (train_loader, val_loader):
+        if len(loader.dataset) == 0 or loader.dataset.locs.shape[1] != num_loc:
+            raise ValueError(f"Expected a nonempty dataset with {num_loc} customers")
 
     # Validate d_ins cost method (Variant D consumes d_ins). The data was baked
     # with a specific method; refuse a mismatch so we never train on the wrong cost.
-    if variant == "D":
+    if variant == "D" and backbone != "sil":
         data_method = train_loader.dataset.method
         if data_method is not None and data_method != ins_method:
             raise RuntimeError(
@@ -204,7 +306,7 @@ def train(
             print(f"Dataset method '{data_method}' matches --ins_method. OK.")
 
     # Environment
-    env = CVRPEnv(generator_kwargs=dict(num_loc=num_loc))
+    env = CVRPEnv(generator_params=dict(num_loc=num_loc))
 
     # Model
     model_cls = MODEL_CLASSES[backbone]
@@ -223,12 +325,23 @@ def train(
         optimizer_kwargs={"lr": t_cfg["lr"]},
     )
 
-    if backbone == "am":
+    if backbone == "sil":
+        model_kwargs = dict(
+            env=env, embed_dim=embed_dim, num_layers=sil_num_layers,
+            repair_budget=sil_repair_budget, improve_every=sil_improve_every,
+            max_subtour_length=sil_max_subtour_length,
+            parallel_reconstruction=sil_parallel_reconstruction,
+            update_mode=sil_update_mode,
+            optimizer_kwargs={"lr": t_cfg["lr"]},
+        )
+    elif backbone == "am":
         model_kwargs["baseline"] = baseline if baseline is not None else "shared"
     # disable_slots: run backbone as a true no-slot baseline (no slot/aux).
-    if disable_slots:
+    if disable_slots and backbone != "sil":
         model_kwargs["disable_slots"] = True
     model = model_cls(**model_kwargs)
+    if backbone == "sil":
+        model.dataset_signature = train_loader.dataset.signature()
 
     # run_name uniquely IDs the run (backbone, variant, K, N, dist, seed, ins_method,
     # and — for Variant D — the normalize/symmetrize target-aggregation flags).
@@ -237,7 +350,12 @@ def train(
         norm_tag = f"_n{int(normalize_target)}s{int(symmetrize_target)}"
 
     base_suffix = f"_bl{baseline}" if backbone == "am" and baseline else ""
-    if disable_slots:
+    if backbone == "sil":
+        run_name = (f"sil_N{num_loc}_{dist}_{ins_method}_seed{seed}_d{embed_dim}"
+                    f"_l{sil_num_layers}_r{sil_repair_budget}_i{sil_improve_every}"
+                    f"_s{sil_max_subtour_length}_u{sil_update_mode}"
+                    f"_prc{int(sil_parallel_reconstruction)}")
+    elif disable_slots:
         run_name = f"{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
     else:
         run_name = (f"{backbone}_slot_{variant}_K{num_slots}_N{num_loc}_{dist}_"
@@ -279,16 +397,22 @@ def train(
         strategy="auto",
         callbacks=[checkpoint_cb, early_stop_cb],
         logger=logger_obj,
-        gradient_clip_val=1.0,
+        gradient_clip_val=None if backbone == "sil" else 1.0,
         enable_progress_bar=True,
         log_every_n_steps=10,
     )
     trainer = pl.Trainer(**trainer_kwargs)
 
     print(f"\n{'='*60}")
-    print(f"Training POMOSlot — Variant {variant} | N={num_loc} | {dist}")
+    print(f"Training {model_cls.__name__} | N={num_loc} | {dist}")
     print(f"  Epochs: {t_cfg['epochs']}  Batch: {t_cfg['batch']}  LR: {t_cfg['lr']}")
-    print(f"  Slots: K={num_slots}  proj_dim={proj_dim}  iters={slot_iters}")
+    if backbone == "sil":
+        print(f"  SIL: repair_budget={sil_repair_budget}, improve_every={sil_improve_every}, "
+              f"max_subtour_length={sil_max_subtour_length}, update_mode={sil_update_mode}, "
+              f"PRC={sil_parallel_reconstruction}")
+        print("  Slot/metric/entropy flags do not apply to SIL; ins_method selects the shared data folder.")
+    else:
+        print(f"  Slots: K={num_slots}  proj_dim={proj_dim}  iters={slot_iters}")
     print(f"  ins_method: {ins_method}")
     print(f"  Output: {log_path}")
     print(f"{'='*60}\n")
@@ -300,8 +424,8 @@ def train(
     best_reward = checkpoint_cb.best_model_score.item() if checkpoint_cb.best_model_score else None
     result = {
         "backbone": backbone,
-        "variant": variant,
-        "num_slots": num_slots,
+        "variant": None if backbone == "sil" else variant,
+        "num_slots": None if backbone == "sil" else num_slots,
         "num_loc": num_loc,
         "dist": dist,
         "seed": seed,
@@ -311,7 +435,21 @@ def train(
         "best_val_reward": best_reward,
         "elapsed_min": round(elapsed / 60, 1),
         "checkpoint": str(checkpoint_cb.best_model_path),
+        "embed_dim": embed_dim,
+        "batch_size": t_cfg["batch"],
+        "lr": t_cfg["lr"],
+        "train_path": str(train_path.resolve()),
+        "val_path": str(val_path.resolve()),
+        "n_train": len(train_loader.dataset),
+        "n_val": len(val_loader.dataset),
     }
+    if backbone == "sil":
+        result.update(normalize_target=None, symmetrize_target=None,
+                      sil_repair_budget=sil_repair_budget, sil_improve_every=sil_improve_every,
+                      sil_max_subtour_length=sil_max_subtour_length, sil_num_layers=sil_num_layers,
+                      sil_update_mode=sil_update_mode,
+                      sil_parallel_reconstruction=sil_parallel_reconstruction,
+                      dataset_signature=model.dataset_signature)
 
     # Dedup identical configs: rerun replaces, never appends a duplicate row.
     result_dir = Path(output)
@@ -322,21 +460,180 @@ def train(
         "backbone", "variant", "num_slots", "num_loc", "dist", "seed",
         "ins_method", "normalize_target", "symmetrize_target",
     )}
+    if backbone == "sil":
+        dedup_key.update({k: v for k, v in result.items() if k.startswith("sil_")})
+        dedup_key.update({k: result[k] for k in ("embed_dim", "batch_size", "dataset_signature")})
     results = [r for r in results if not all(r.get(k) == v for k, v in dedup_key.items())]
     results.append(result)
     result_file.write_text(json.dumps(results, indent=2))
 
-    print(f"\nDone. Best val reward: {best_reward:.4f} | {elapsed/60:.1f} min")
+    print(f"\nDone. Best val reward: {best_reward} | {elapsed/60:.1f} min")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# LEHD / TTPL standalone training branch
+# ---------------------------------------------------------------------------
+
+def _train_lehd(
+    backbone: str,
+    num_loc: int,
+    output: str,
+    seed: int,
+    device: int,
+    embed_dim: int,
+    epochs: int | None,
+    batch_size: int | None,
+    max_instances: int | None,
+    logger: str,
+    resume: str | None,
+    lehd_data_path: str | None,
+    lehd_val_data_path: str | None,
+    lehd_decoder_layers: int,
+) -> dict:
+    """Train LEHD or TTPL backbone under the same Lightning Trainer as MARS."""
+    import json
+
+    if lehd_data_path is None:
+        raise ValueError(
+            "--backbone lehd/ttpl requires --lehd_data_path pointing to a "
+            "LEHD-format .txt training file "
+            "(e.g. vrp1000_hgs_train_100w.txt from the LEHD Google Drive)."
+        )
+
+    pl.seed_everything(seed)
+
+    # Use MARS's TRAIN_DEFAULTS for the same epochs / batch / lr as MARS
+    t_cfg = TRAIN_DEFAULTS[num_loc].copy()
+    if epochs is not None:
+        t_cfg["epochs"] = epochs
+    if batch_size is not None:
+        t_cfg["batch"] = batch_size
+
+    n_train = t_cfg["n_train"]
+    n_val   = t_cfg["n_val"]
+    if max_instances is not None:
+        n_train = min(n_train, max_instances)
+        n_val   = min(n_val, max(1, max_instances // 10))
+
+    model_cls = MODEL_CLASSES[backbone]  # LEHDModel or TTRLModel
+    model = model_cls(
+        data_path=lehd_data_path,
+        val_data_path=lehd_val_data_path,
+        num_loc=num_loc,
+        embed_dim=embed_dim,
+        decoder_layer_num=lehd_decoder_layers,
+        n_train_episodes=n_train,
+        n_val_episodes=n_val,
+        optimizer_kwargs={"lr": t_cfg["lr"]},
+    )
+
+    train_loader, val_loader = make_lehd_dataloaders(
+        n_train=n_train,
+        n_val=n_val,
+        batch_size=t_cfg["batch"],
+        seed=seed,
+        num_workers=0,  # data lives inside the model; no worker overhead needed
+    )
+
+    run_name = (
+        f"{backbone}_N{num_loc}_seed{seed}_d{embed_dim}"
+        f"_dec{lehd_decoder_layers}"
+    )
+    log_path = Path(output) / run_name
+
+    checkpoint_cb = ModelCheckpoint(
+        dirpath=log_path / "checkpoints",
+        monitor="val/reward",
+        mode="max",
+        save_top_k=1,
+        filename="best-{epoch:03d}-{val/reward:.4f}",
+    )
+    early_stop_cb = EarlyStopping(
+        monitor="val/reward",
+        patience=20,
+        mode="max",
+    )
+
+    if logger == "wandb":
+        if not HAVE_WANDB:
+            raise RuntimeError(
+                "wandb requested but WandbLogger is not installed. "
+                "Run `pip install wandb lightning` and login with `wandb login`."
+            )
+        logger_obj = WandbLogger(
+            project="MeTRA_Slot_NCO",
+            name=run_name,
+            log_model="all",
+        )
+    else:
+        logger_obj = CSVLogger(save_dir=str(log_path), name="metrics")
+
+    use_cuda = torch.cuda.is_available()
+    trainer = pl.Trainer(
+        max_epochs=t_cfg["epochs"],
+        accelerator="gpu" if use_cuda else "cpu",
+        devices=[device] if use_cuda else 1,
+        strategy="auto",
+        callbacks=[checkpoint_cb, early_stop_cb],
+        logger=logger_obj,
+        gradient_clip_val=None,   # LEHD clips manually per step (not used here)
+        enable_progress_bar=True,
+        log_every_n_steps=10,
+    )
+
+    print(f"\n{'='*60}")
+    print(f"Training {model_cls.__name__} | N={num_loc}")
+    print(f"  Epochs: {t_cfg['epochs']}  Batch: {t_cfg['batch']}  LR: {t_cfg['lr']}")
+    print(f"  embed_dim: {embed_dim}  decoder_layers: {lehd_decoder_layers}")
+    print(f"  n_train: {n_train}  n_val: {n_val}")
+    print(f"  data: {lehd_data_path}")
+    print(f"  Output: {log_path}")
+    print(f"{'='*60}\n")
+
+    t0 = time.time()
+    trainer.fit(model, train_loader, val_loader, ckpt_path=resume)
+    elapsed = time.time() - t0
+
+    best_reward = checkpoint_cb.best_model_score.item() if checkpoint_cb.best_model_score else None
+    result = {
+        "backbone": backbone,
+        "num_loc": num_loc,
+        "seed": seed,
+        "embed_dim": embed_dim,
+        "decoder_layers": lehd_decoder_layers,
+        "best_val_reward": best_reward,
+        "elapsed_min": round(elapsed / 60, 1),
+        "checkpoint": str(checkpoint_cb.best_model_path),
+        "batch_size": t_cfg["batch"],
+        "lr": t_cfg["lr"],
+        "n_train": n_train,
+        "n_val": n_val,
+        "lehd_data_path": lehd_data_path,
+        "lehd_val_data_path": lehd_val_data_path,
+    }
+
+    result_dir = Path(output)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_file = result_dir / f"ablation_N{num_loc}.json"
+    results = json.loads(result_file.read_text()) if result_file.exists() else []
+    dedup_key = {k: result[k] for k in ("backbone", "num_loc", "seed", "embed_dim")}
+    results = [r for r in results if not all(r.get(k) == v for k, v in dedup_key.items())]
+    results.append(result)
+    result_file.write_text(json.dumps(results, indent=2))
+
+    print(f"\nDone. Best val reward: {best_reward} | {elapsed/60:.1f} min")
     return result
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train POMOSlot -- Metric-Aware NCO")
+    parser = argparse.ArgumentParser(description="Train MARS or SIL on shared cached CVRP data")
     parser.add_argument("--variant",       type=str,   default="D",       choices=list("ABCD"),
                         help="Ablation variant. E is reserved (not implemented).")
     parser.add_argument("--num_loc",       type=int,   default=100,       choices=[50, 100, 200, 500, 1000])
     parser.add_argument("--dist",          type=str,   default="uniform", choices=["uniform", "clustered"])
-    parser.add_argument("--data_dir",      type=str,   default="./data/slot_datasets_v2")
+    parser.add_argument("--data_dir",      type=str,   default=str(DEFAULT_DATA_DIR),
+                        help="Shared cached dataset root (default is anchored to the MARS repository)")
     parser.add_argument("--output",        type=str,   default="./output",
                         help="Root dir for logs + results/ablation_N{num_loc}.json")
     parser.add_argument("--seed",          type=int,   default=42)
@@ -359,8 +656,26 @@ def main():
     parser.add_argument("--batch_size",    type=int,   default=None)
     parser.add_argument("--max_instances", type=int,   default=None,
                         help="Cap dataset size for quick smoke tests")
-    parser.add_argument("--backbone",      type=str,   default="pomo", choices=["pomo", "am"],
-                        help="Backbone: 'pomo' (multi-start, shared baseline) or 'am' (single-start, rollout baseline)")
+    parser.add_argument("--backbone",      type=str,   default="pomo",
+                        choices=["pomo", "am", "sil", "lehd", "ttpl"],
+                        help="pomo/am slot models, SIL self-improved baseline, "
+                             "LEHD (NeurIPS23) or TTPL (NeurIPS25) imitation baseline")
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--generate_missing_data", action="store_true",
+                        help="Generate missing shared train/val/test splits before training")
+    parser.add_argument("--generation_chunk_size", type=int, default=None,
+                        help="Dataset generation chunk size (default adapts to num_loc)")
+    parser.add_argument("--sil_repair_budget", type=int, default=5,
+                        help="Reconstruction passes per SIL improvement round (0 disables improvement)")
+    parser.add_argument("--sil_improve_every", type=int, default=20,
+                        help="Epochs of imitation between SIL label improvement rounds")
+    parser.add_argument("--sil_max_subtour_length", type=int, default=64,
+                        help="Maximum sampled SIL subpath length; 64 is the comparable fast default")
+    parser.add_argument("--sil_num_layers", type=int, default=6)
+    parser.add_argument("--sil_update_mode", choices=["batch", "node"], default="batch",
+                        help="batch: one optimizer update per batch (comparable); node: upstream per-node updates")
+    parser.add_argument("--sil_no_prc", dest="sil_parallel_reconstruction", action="store_false",
+                        help="Reconstruct one subpath per instance instead of parallel disjoint subpaths")
     parser.add_argument("--baseline",      type=str,   default=None,
                         help="REINFORCE baseline for the AM backbone (e.g. rollout, shared). Ignored for pomo.")
     parser.add_argument("--disable_slots", action="store_true",
@@ -381,6 +696,14 @@ def main():
                         help="Logger: 'csv' (default, lightweight) or 'wandb' (requires wandb login).")
     parser.add_argument("--resume",        type=str,   default=None,
                         help="Path to a .ckpt to resume training from its last epoch (Lightning checkpoint).")
+    # ---- LEHD / TTPL specific ----
+    parser.add_argument("--lehd_data_path", type=str, default=None,
+                        help="Path to LEHD-format .txt training file (required for --backbone lehd/ttpl). "
+                             "Download from: https://drive.google.com/drive/folders/1LptBUGVxQlCZeWVxmCzUOf9WPlsqOROR")
+    parser.add_argument("--lehd_val_data_path", type=str, default=None,
+                        help="Path to LEHD-format .txt validation file (optional; defaults to training file).")
+    parser.add_argument("--lehd_decoder_layers", type=int, default=6,
+                        help="Number of heavy-decoder Transformer layers for LEHD/TTPL (default: 6).")
     args = parser.parse_args()
 
     train(
@@ -409,10 +732,20 @@ def main():
         ins_method=args.ins_method,
         logger=args.logger,
         resume=args.resume,
+        num_workers=args.num_workers,
+        sil_repair_budget=args.sil_repair_budget,
+        sil_improve_every=args.sil_improve_every,
+        sil_max_subtour_length=args.sil_max_subtour_length,
+        sil_num_layers=args.sil_num_layers,
+        sil_update_mode=args.sil_update_mode,
+        sil_parallel_reconstruction=args.sil_parallel_reconstruction,
+        generate_missing_data=args.generate_missing_data,
+        generation_chunk_size=args.generation_chunk_size,
+        lehd_data_path=args.lehd_data_path,
+        lehd_val_data_path=args.lehd_val_data_path,
+        lehd_decoder_layers=args.lehd_decoder_layers,
     )
 
 
 if __name__ == "__main__":
     main()
-
-
