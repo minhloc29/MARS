@@ -129,9 +129,9 @@ def _collate_fn(batch: list[dict]) -> dict:
     return {k: torch.stack([b[k] for b in batch], dim=0) for k in keys}
 
 
-def make_dataloader(filepath: str, variant: str, batch_size: int, shuffle: bool, max_instances: int | None = None,
+def make_dataloader(filepath: str, metric_variant: str, batch_size: int, shuffle: bool, max_instances: int | None = None,
                     include_instance_id: bool = False, seed: int = 42, num_workers: int = 4):
-    ds = SlotDataset(filepath, variant=variant, max_instances=max_instances,
+    ds = SlotDataset(filepath, variant=metric_variant, max_instances=max_instances,
                      include_instance_id=include_instance_id)
     return torch.utils.data.DataLoader(
         ds,
@@ -144,42 +144,29 @@ def make_dataloader(filepath: str, variant: str, batch_size: int, shuffle: bool,
     )
 
 
-VARIANT_DEFAULTS = {
-    "A": dict(metric_variant="A", alpha_metric=0.1,  beta_entropy=0.01),
-    "B": dict(metric_variant="B", alpha_metric=0.0,  beta_entropy=0.00),
-    "C": dict(metric_variant="C", alpha_metric=0.1,  beta_entropy=0.01),
-    "D": dict(metric_variant="D", alpha_metric=0.1,  beta_entropy=0.01),
-    # "E": future-regret target -- reserved, not implemented
-}
-
-TRAIN_DEFAULTS = {
-    50:  dict(epochs=100, batch=512, lr=1e-4, n_train=100_000, n_val=1_000),
-    100: dict(epochs=100, batch=256, lr=1e-4, n_train=100_000, n_val=1_000),
-    200: dict(epochs=200, batch=128, lr=5e-5, n_train=100_000, n_val=1_000),
-    500: dict(epochs=200, batch=32,  lr=5e-5, n_train=50_000,  n_val=500),
-    1000: dict(epochs=200, batch=64, lr=5e-5, n_train=50_000, n_val=500),
-}
-
-
 def train(
-    variant: str = "D",
     num_loc: int = 100,
     dist: str = "uniform",
     data_dir: str | Path = DEFAULT_DATA_DIR,
     output: str = "./output",
     seed: int = 42,
     device: int = 0,
+    n_train: int = 100_000,
+    n_val: int = 1_000,
+    epochs: int = 100,
+    batch_size: int = 256,
+    lr: float = 1e-4,
     embed_dim: int = 128,
     num_slots: int = 8,
     proj_dim: int = 64,
     slot_iters: int = 3,
     lambda_init: float = 1.0,
     lr_dual: float = 1e-3,
-    beta_entropy: float | None = None,
+    metric_variant: str = "D",
+    alpha_metric: float = 0.1,
+    beta_entropy: float = 0.01,
     normalize_target: bool = True,
     symmetrize_target: bool = True,
-    epochs: int | None = None,
-    batch_size: int | None = None,
     max_instances: int | None = None,
     backbone: str = "pomo",
     baseline: str | None = None,
@@ -221,6 +208,9 @@ def train(
             embed_dim=embed_dim,
             epochs=epochs,
             batch_size=batch_size,
+            lr=lr,
+            n_train=n_train,
+            n_val=n_val,
             max_instances=max_instances,
             logger=logger,
             resume=resume,
@@ -230,18 +220,12 @@ def train(
         )
 
     pl.seed_everything(seed)
-    t_cfg = TRAIN_DEFAULTS[num_loc].copy()
-
-    if epochs is not None:
-        t_cfg["epochs"] = epochs
-    if batch_size is not None:
-        t_cfg["batch"] = batch_size
-    if max_instances is not None:
-        t_cfg["n_train"] = min(t_cfg["n_train"], max_instances)
-        t_cfg["n_val"] = min(t_cfg["n_val"],   max(1, max_instances // 10))
-    v_cfg = VARIANT_DEFAULTS[variant].copy()
-    if beta_entropy is not None:
-        v_cfg["beta_entropy"] = beta_entropy
+    n_train_eff = min(
+        n_train, max_instances) if max_instances is not None else n_train
+    n_val_eff = min(n_val, max(1, max_instances // 10)
+                    ) if max_instances is not None else n_val
+    v_cfg = dict(metric_variant=metric_variant, alpha_metric=alpha_metric,
+                 beta_entropy=beta_entropy)
 
     data_dir = Path(data_dir)
     train_path = data_dir / ins_method / f"cvrp{num_loc}_{dist}_train.pt"
@@ -260,9 +244,9 @@ def train(
             out_dir=data_dir,
             n=num_loc,
             dist=dist,
-            n_train=t_cfg["n_train"],
-            n_val=t_cfg["n_val"],
-            n_test=t_cfg["n_val"],
+            n_train=n_train_eff,
+            n_val=n_val_eff,
+            n_test=n_val_eff,
             k_neighbors=15,
             method=ins_method,
             chunk_size=generation_chunk_size,
@@ -277,8 +261,8 @@ def train(
     if missing_paths:
         preparation = (
             f"python -m rl4co.data.generate_slot_dataset --num_locs {num_loc} "
-            f"--dist {dist} --n_train {t_cfg['n_train']} --n_val {t_cfg['n_val']} "
-            f"--n_test {t_cfg['n_val']} --out_dir {data_dir} --method {ins_method} "
+            f"--dist {dist} --n_train {n_train_eff} --n_val {n_val_eff} "
+            f"--n_test {n_val_eff} --out_dir {data_dir} --method {ins_method} "
             f"--seed {seed}"
         )
         raise FileNotFoundError(
@@ -291,12 +275,12 @@ def train(
         )
 
     # Data
-    data_variant = "none" if backbone == "sil" else variant
+    data_variant = "none" if backbone == "sil" else metric_variant
     loader_kwargs = dict(seed=seed, num_workers=num_workers)
-    train_loader = make_dataloader(train_path, data_variant, t_cfg["batch"], shuffle=True,
-                                   max_instances=t_cfg["n_train"], include_instance_id=backbone == "sil", **loader_kwargs)
-    val_loader = make_dataloader(val_path, data_variant, t_cfg["batch"], shuffle=False,
-                                 max_instances=t_cfg["n_val"], **loader_kwargs)
+    train_loader = make_dataloader(train_path, data_variant, batch_size, shuffle=True,
+                                   max_instances=n_train_eff, include_instance_id=backbone == "sil", **loader_kwargs)
+    val_loader = make_dataloader(val_path, data_variant, batch_size, shuffle=False,
+                                 max_instances=n_val_eff, **loader_kwargs)
     for loader in (train_loader, val_loader):
         if len(loader.dataset) == 0 or loader.dataset.locs.shape[1] != num_loc:
             raise ValueError(
@@ -304,7 +288,7 @@ def train(
 
     # Validate d_ins cost method (Variant D consumes d_ins). The data was baked
     # with a specific method; refuse a mismatch so we never train on the wrong cost.
-    if variant == "D" and backbone != "sil":
+    if metric_variant == "D" and backbone != "sil":
         data_method = train_loader.dataset.method
         if data_method is not None and data_method != ins_method:
             raise RuntimeError(
@@ -337,7 +321,7 @@ def train(
         normalize_target=normalize_target,
         symmetrize_target=symmetrize_target,
         ins_method=ins_method,
-        optimizer_kwargs={"lr": t_cfg["lr"]},
+        optimizer_kwargs={"lr": lr},
     )
 
     if backbone == "l2r":
@@ -349,7 +333,7 @@ def train(
             embed_dim=embed_dim,
             num_starts=num_loc,
             problem="cvrp",
-            optimizer_kwargs={"lr": t_cfg["lr"]},
+            optimizer_kwargs={"lr": lr},
         )
     elif backbone == "sil":
         model_kwargs = dict(
@@ -358,7 +342,7 @@ def train(
             max_subtour_length=sil_max_subtour_length,
             parallel_reconstruction=sil_parallel_reconstruction,
             update_mode=sil_update_mode,
-            optimizer_kwargs={"lr": t_cfg["lr"]},
+            optimizer_kwargs={"lr": lr},
         )
     elif backbone == "am":
         model_kwargs["baseline"] = baseline if baseline is not None else "shared"
@@ -372,7 +356,7 @@ def train(
     # run_name uniquely IDs the run (backbone, variant, K, N, dist, seed, ins_method,
     # and — for Variant D — the normalize/symmetrize target-aggregation flags).
     norm_tag = ""
-    if variant == "D":
+    if metric_variant == "D":
         norm_tag = f"_n{int(normalize_target)}s{int(symmetrize_target)}"
 
     base_suffix = f"_bl{baseline}" if backbone == "am" and baseline else ""
@@ -384,7 +368,7 @@ def train(
     elif disable_slots:
         run_name = f"{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
     else:
-        run_name = (f"{backbone}_slot_{variant}_K{num_slots}_N{num_loc}_{dist}_"
+        run_name = (f"{backbone}_slot_{metric_variant}_K{num_slots}_N{num_loc}_{dist}_"
                     f"{ins_method}{norm_tag}_seed{seed}{base_suffix}")
     log_path = Path(output) / run_name
 
@@ -417,7 +401,7 @@ def train(
     # Trainer (single GPU; --device picks the index)
     use_cuda = torch.cuda.is_available()
     trainer_kwargs = dict(
-        max_epochs=t_cfg["epochs"],
+        max_epochs=epochs,
         accelerator="gpu" if use_cuda else "cpu",
         devices=[device] if use_cuda else 1,
         strategy="auto",
@@ -432,7 +416,7 @@ def train(
     print(f"\n{'='*60}")
     print(f"Training {model_cls.__name__} | N={num_loc} | {dist}")
     print(
-        f"  Epochs: {t_cfg['epochs']}  Batch: {t_cfg['batch']}  LR: {t_cfg['lr']}")
+        f"  Epochs: {epochs}  Batch: {batch_size}  LR: {lr}")
     if backbone == "sil":
         print(f"  SIL: repair_budget={sil_repair_budget}, improve_every={sil_improve_every}, "
               f"max_subtour_length={sil_max_subtour_length}, update_mode={sil_update_mode}, "
@@ -453,7 +437,7 @@ def train(
     ) if checkpoint_cb.best_model_score else None
     result = {
         "backbone": backbone,
-        "variant": None if backbone == "sil" else variant,
+        "metric_variant": None if backbone == "sil" else metric_variant,
         "num_slots": None if backbone == "sil" else num_slots,
         "num_loc": num_loc,
         "dist": dist,
@@ -465,8 +449,8 @@ def train(
         "elapsed_min": round(elapsed / 60, 1),
         "checkpoint": str(checkpoint_cb.best_model_path),
         "embed_dim": embed_dim,
-        "batch_size": t_cfg["batch"],
-        "lr": t_cfg["lr"],
+        "batch_size": batch_size,
+        "lr": lr,
         "train_path": str(train_path.resolve()),
         "val_path": str(val_path.resolve()),
         "n_train": len(train_loader.dataset),
@@ -487,7 +471,7 @@ def train(
     results = json.loads(result_file.read_text()
                          ) if result_file.exists() else []
     dedup_key = {k: result[k] for k in (
-        "backbone", "variant", "num_slots", "num_loc", "dist", "seed",
+        "backbone", "metric_variant", "num_slots", "num_loc", "dist", "seed",
         "ins_method", "normalize_target", "symmetrize_target",
     )}
     if backbone == "sil":
@@ -515,8 +499,11 @@ def _train_lehd(
     seed: int,
     device: int,
     embed_dim: int,
-    epochs: int | None,
-    batch_size: int | None,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    n_train: int,
+    n_val: int,
     max_instances: int | None,
     logger: str,
     resume: str | None,
@@ -536,15 +523,6 @@ def _train_lehd(
 
     pl.seed_everything(seed)
 
-    # Use MARS's TRAIN_DEFAULTS for the same epochs / batch / lr as MARS
-    t_cfg = TRAIN_DEFAULTS[num_loc].copy()
-    if epochs is not None:
-        t_cfg["epochs"] = epochs
-    if batch_size is not None:
-        t_cfg["batch"] = batch_size
-
-    n_train = t_cfg["n_train"]
-    n_val = t_cfg["n_val"]
     if max_instances is not None:
         n_train = min(n_train, max_instances)
         n_val = min(n_val, max(1, max_instances // 10))
@@ -558,13 +536,13 @@ def _train_lehd(
         decoder_layer_num=lehd_decoder_layers,
         n_train_episodes=n_train,
         n_val_episodes=n_val,
-        optimizer_kwargs={"lr": t_cfg["lr"]},
+        optimizer_kwargs={"lr": lr},
     )
 
     train_loader, val_loader = make_lehd_dataloaders(
         n_train=n_train,
         n_val=n_val,
-        batch_size=t_cfg["batch"],
+        batch_size=batch_size,
         seed=seed,
         num_workers=0,  # data lives inside the model; no worker overhead needed
     )
@@ -604,7 +582,7 @@ def _train_lehd(
 
     use_cuda = torch.cuda.is_available()
     trainer = pl.Trainer(
-        max_epochs=t_cfg["epochs"],
+        max_epochs=epochs,
         accelerator="gpu" if use_cuda else "cpu",
         devices=[device] if use_cuda else 1,
         strategy="auto",
@@ -618,8 +596,7 @@ def _train_lehd(
 
     print(f"\n{'='*60}")
     print(f"Training {model_cls.__name__} | N={num_loc}")
-    print(
-        f"  Epochs: {t_cfg['epochs']}  Batch: {t_cfg['batch']}  LR: {t_cfg['lr']}")
+    print(f"  Epochs: {epochs}  Batch: {batch_size}  LR: {lr}")
     print(f"  embed_dim: {embed_dim}  decoder_layers: {lehd_decoder_layers}")
     print(f"  n_train: {n_train}  n_val: {n_val}")
     print(f"  data: {lehd_data_path}")
@@ -641,8 +618,8 @@ def _train_lehd(
         "best_val_reward": best_reward,
         "elapsed_min": round(elapsed / 60, 1),
         "checkpoint": str(checkpoint_cb.best_model_path),
-        "batch_size": t_cfg["batch"],
-        "lr": t_cfg["lr"],
+        "batch_size": batch_size,
+        "lr": lr,
         "n_train": n_train,
         "n_val": n_val,
         "lehd_data_path": lehd_data_path,
@@ -666,120 +643,80 @@ def _train_lehd(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Train MARS or SIL on shared cached CVRP data")
-    parser.add_argument("--variant",       type=str,   default="D",       choices=list("ABCD"),
-                        help="Ablation variant. E is reserved (not implemented).")
-    parser.add_argument("--num_loc",       type=int,
-                        default=100,       choices=[50, 100, 200, 500, 1000])
-    parser.add_argument("--dist",          type=str,
-                        default="uniform", choices=["uniform", "clustered"])
-    parser.add_argument("--data_dir",      type=str,   default=str(DEFAULT_DATA_DIR),
-                        help="Shared cached dataset root (default is anchored to the MARS repository)")
-    parser.add_argument("--output",        type=str,   default="./output",
-                        help="Root dir for logs + results/ablation_N{num_loc}.json")
-    parser.add_argument("--seed",          type=int,   default=42)
-    parser.add_argument("--device",        type=int,   default=0,
-                        help="GPU index (0 or 1) to use; single GPU only.")
-    parser.add_argument("--embed_dim",     type=int,   default=128)
-    parser.add_argument("--num_slots",     type=int,   default=8)
-    parser.add_argument("--proj_dim",      type=int,   default=64)
-    parser.add_argument("--slot_iters",    type=int,   default=3)
-    parser.add_argument("--lambda_init",   type=float, default=1.0)
-    parser.add_argument("--lr_dual",       type=float, default=1e-4)
-    parser.add_argument("--beta_entropy",  type=float, default=0.01,
-                        help="Override the per-variant slot-entropy weight. Set 0.0 to "
-                             "keep slots + metric loss but drop the entropy regulariser.")
-    parser.add_argument("--ins_method",    type=str,   default="construction",
-                        choices=["savings", "construction", "insertion"],
-                        help="d_ins insertion-cost method. Must match the cached dataset's "
-                             "'method' tag (the generator stamps it into the .pt).")
+    parser = argparse.ArgumentParser(description="Train routing models")
+    parser.add_argument("--num_loc", type=int, default=100,
+                        choices=[50, 100, 200, 500, 1000])
+    parser.add_argument("--dist", default="uniform",
+                        choices=["uniform", "clustered"])
+    parser.add_argument("--data_dir", default=str(DEFAULT_DATA_DIR))
+    parser.add_argument("--output", default="./output")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--n_train", type=int, default=100_000)
+    parser.add_argument("--n_val", type=int, default=1_000)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--max_instances", type=int, default=None)
+    parser.add_argument("--backbone", default="pomo",
+                        choices=["pomo", "am", "l2r", "icam", "sil", "lehd", "ttpl"])
+    parser.add_argument("--embed_dim", type=int, default=128)
+    parser.add_argument("--num_slots", type=int, default=8)
+    parser.add_argument("--proj_dim", type=int, default=64)
+    parser.add_argument("--slot_iters", type=int, default=3)
+    parser.add_argument("--lambda_init", type=float, default=1.0)
+    parser.add_argument("--lr_dual", type=float, default=1e-4)
+    parser.add_argument("--metric_variant", default="D",
+                        choices=["none", "A", "B", "C", "D"])
+    parser.add_argument("--alpha_metric", type=float, default=0.1)
+    parser.add_argument("--beta_entropy", type=float, default=0.01)
+    parser.add_argument("--ins_method", default="construction",
+                        choices=["savings", "construction", "insertion"])
     parser.add_argument("--lower_neighbors_num", type=int, default=50)
     parser.add_argument("--reduction_percentage", type=float, default=0.1)
-    parser.add_argument("--epochs",        type=int,   default=None)
-    parser.add_argument("--batch_size",    type=int,   default=None)
-    parser.add_argument("--max_instances", type=int,   default=None,
-                        help="Cap dataset size for quick smoke tests")
-    parser.add_argument("--backbone",      type=str,   default="pomo",
-                        choices=["pomo", "am", "l2r",
-                                 "icam", "sil", "lehd", "ttpl"],
-                        help="pomo/am slot models, SIL self-improved baseline, "
-                             "LEHD (NeurIPS23) or TTPL (NeurIPS25) imitation baseline")
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--generate_missing_data", action="store_true",
-                        help="Generate missing shared train/val/test splits before training")
-    parser.add_argument("--generation_chunk_size", type=int, default=None,
-                        help="Dataset generation chunk size (default adapts to num_loc)")
-    parser.add_argument("--sil_repair_budget", type=int, default=5,
-                        help="Reconstruction passes per SIL improvement round (0 disables improvement)")
-    parser.add_argument("--sil_improve_every", type=int, default=20,
-                        help="Epochs of imitation between SIL label improvement rounds")
-    parser.add_argument("--sil_max_subtour_length", type=int, default=64,
-                        help="Maximum sampled SIL subpath length; 64 is the comparable fast default")
+    parser.add_argument("--generate_missing_data", action="store_true")
+    parser.add_argument("--generation_chunk_size", type=int, default=None)
+    parser.add_argument("--sil_repair_budget", type=int, default=5)
+    parser.add_argument("--sil_improve_every", type=int, default=20)
+    parser.add_argument("--sil_max_subtour_length", type=int, default=64)
     parser.add_argument("--sil_num_layers", type=int, default=6)
-    parser.add_argument("--sil_update_mode", choices=["batch", "node"], default="batch",
-                        help="batch: one optimizer update per batch (comparable); node: upstream per-node updates")
-    parser.add_argument("--sil_no_prc", dest="sil_parallel_reconstruction", action="store_false",
-                        help="Reconstruct one subpath per instance instead of parallel disjoint subpaths")
-    parser.add_argument("--baseline",      type=str,   default=None,
-                        help="REINFORCE baseline for the AM backbone (e.g. rollout, shared). Ignored for pomo.")
-    parser.add_argument("--disable_slots", action="store_true",
-                        help="Run the backbone as a true no-slot baseline (skips SlotAttention + aux losses).")
-    parser.add_argument("--normalize_target", dest="normalize_target",
-                        action="store_true", default=True,
-                        help="Normalize D_ins aggregation by realized sparse edge mass (default: True).")
-    parser.add_argument("--no_normalize_target", dest="normalize_target",
-                        action="store_false",
-                        help="Use RAW (unnormalized) D_ins aggregation -- for the ablation baseline.")
-    parser.add_argument("--symmetrize_target", dest="symmetrize_target",
-                        action="store_true", default=True,
-                        help="Symmetrize D_ins aggregation (default: True).")
-    parser.add_argument("--no_symmetrize_target", dest="symmetrize_target",
-                        action="store_false",
-                        help="Keep D_ins aggregation asymmetric -- for the ablation baseline.")
-    parser.add_argument("--logger",        type=str,   default="csv", choices=["csv", "wandb"],
-                        help="Logger: 'csv' (default, lightweight) or 'wandb' (requires wandb login).")
-    parser.add_argument("--resume",        type=str,   default=None,
-                        help="Path to a .ckpt to resume training from its last epoch (Lightning checkpoint).")
-    # ---- LEHD / TTPL specific ----
-    parser.add_argument("--lehd_data_path", type=str, default=None,
-                        help="Path to LEHD-format .txt training file (required for --backbone lehd/ttpl). "
-                             "Download from: https://drive.google.com/drive/folders/1LptBUGVxQlCZeWVxmCzUOf9WPlsqOROR")
-    parser.add_argument("--lehd_val_data_path", type=str, default=None,
-                        help="Path to LEHD-format .txt validation file (optional; defaults to training file).")
-    parser.add_argument("--lehd_decoder_layers", type=int, default=6,
-                        help="Number of heavy-decoder Transformer layers for LEHD/TTPL (default: 6).")
+    parser.add_argument("--sil_update_mode",
+                        choices=["batch", "node"], default="batch")
+    parser.add_argument(
+        "--sil_no_prc", dest="sil_parallel_reconstruction", action="store_false")
+    parser.add_argument("--baseline", default=None)
+    parser.add_argument("--disable_slots", action="store_true")
+    parser.add_argument("--normalize_target",
+                        action="store_true", default=True)
+    parser.add_argument("--no_normalize_target",
+                        dest="normalize_target", action="store_false")
+    parser.add_argument("--symmetrize_target",
+                        action="store_true", default=True)
+    parser.add_argument("--no_symmetrize_target",
+                        dest="symmetrize_target", action="store_false")
+    parser.add_argument("--logger", default="csv", choices=["csv", "wandb"])
+    parser.add_argument("--resume", default=None)
+    parser.add_argument("--lehd_data_path", default=None)
+    parser.add_argument("--lehd_val_data_path", default=None)
+    parser.add_argument("--lehd_decoder_layers", type=int, default=6)
     args = parser.parse_args()
 
     train(
-        variant=args.variant,
-        num_loc=args.num_loc,
-        dist=args.dist,
-        data_dir=args.data_dir,
-        output=args.output,
-        seed=args.seed,
-        device=args.device,
-        embed_dim=args.embed_dim,
-        num_slots=args.num_slots,
-        proj_dim=args.proj_dim,
-        slot_iters=args.slot_iters,
-        lambda_init=args.lambda_init,
-        lr_dual=args.lr_dual,
-        beta_entropy=args.beta_entropy,
-        normalize_target=args.normalize_target,
-        symmetrize_target=args.symmetrize_target,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        max_instances=args.max_instances,
-        backbone=args.backbone,
-        baseline=args.baseline,
-        disable_slots=args.disable_slots,
-        ins_method=args.ins_method,
+        num_loc=args.num_loc, dist=args.dist, data_dir=args.data_dir,
+        output=args.output, seed=args.seed, device=args.device,
+        n_train=args.n_train, n_val=args.n_val, epochs=args.epochs,
+        batch_size=args.batch_size, lr=args.lr, max_instances=args.max_instances,
+        backbone=args.backbone, embed_dim=args.embed_dim, num_slots=args.num_slots,
+        proj_dim=args.proj_dim, slot_iters=args.slot_iters,
+        lambda_init=args.lambda_init, lr_dual=args.lr_dual,
+        metric_variant=args.metric_variant, alpha_metric=args.alpha_metric,
+        beta_entropy=args.beta_entropy, normalize_target=args.normalize_target,
+        symmetrize_target=args.symmetrize_target, baseline=args.baseline,
+        disable_slots=args.disable_slots, ins_method=args.ins_method,
         lower_neighbors_num=args.lower_neighbors_num,
-        reduction_percentage=args.reduction_percentage,
-        logger=args.logger,
-        resume=args.resume,
-        num_workers=args.num_workers,
+        reduction_percentage=args.reduction_percentage, logger=args.logger,
+        resume=args.resume, num_workers=args.num_workers,
         sil_repair_budget=args.sil_repair_budget,
         sil_improve_every=args.sil_improve_every,
         sil_max_subtour_length=args.sil_max_subtour_length,
