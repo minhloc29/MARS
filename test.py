@@ -156,15 +156,17 @@ def main() -> None:
                     # rows = [aug0(B), aug1(B), ..., aug7(B)]; first B = identity.
                     sa = StateAugmentation(num_augment=8, augment_fn="dihedral8",
                                            first_aug_identity=True)
+                    
                     td = sa(td)                       # batch [B] -> [B*8]
                 out = model.policy(td, env, phase="test", num_starts=args.num_starts)
                 r = out["reward"]
+                print(r)
                 if args.augment:
                     B = td.batch_size[0] // 8          # original batch size
                     # r is [B*8, n_start], cat-ordered. Reduce starts by MEAN
                     # (POMO's logged metric), then the 8 augments by BEST.
                     if r.dim() > 1:  # multi-start
-                        r = r.view(8, B, r.shape[-1]).mean(dim=-1).min(dim=0).values
+                        r = r.view(8, B, -1).mean(dim=-1).min(dim=0).values
                     else:            # single-start
                         r = r.view(8, B).min(dim=0).values
                 else:
