@@ -11,6 +11,7 @@ from rl4co.envs import CVRPEnv
 from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
 from rl4co.models.zoo.pomo_slot.model_am import SingleSharedBaseline
 from rl4co.models.zoo.icam import ICAMCVRP
+from rl4co.data.transforms import StateAugmentation
 from rl4co.data.utils import load_npz_to_tensordict
 
 
@@ -57,6 +58,10 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=256, help="Eval batch size")
     parser.add_argument("--num_starts", type=int, default=None,
                         help="Multi-start greedy for POMO checkpoints (1 = single-start/AM). Default: policy default.")
+    parser.add_argument("--augment", action="store_true",
+                        help="Apply dihedral-8 instance augmentation: decode all 8 "
+                             "rotated/reflected versions of each instance and keep the "
+                             "best (min tour length). 8x compute, ~0.5-1.5% tour gain.")
     parser.add_argument("--seed", type=int, default=1234,
                         help="Seed for the generated eval instances, so every run uses the "
                              "SAME test set (fair cross-checkpoint comparison).")
@@ -112,13 +117,24 @@ def main() -> None:
     # via the shared policy (out["reward"] is [B, n_start] for multi-start).
     # To keep results comparable to POMO's logged metric, reduce over starts
     # with the MEAN (POMO reports the all-starts mean, not the best start).
+    #
+    # Instance augmentation (--augment): duplicate each instance 8x and apply
+    # the dihedral-8 transform to the node coordinates, decode all 8 versions,
+    # then reduce over the augmentation axis with the BEST (min tour length /
+    # max reward). This is the standard POMO-style "augment" evaluation trick.
     rewards = []
     n_batches = len(loader)
-    print(f"[progress] decoding {n_batches} batches of batch_size={args.batch_size}")
+    print(f"[progress] decoding {n_batches} batches of batch_size={args.batch_size}"
+          f"{'  [augment x8]' if args.augment else ''}")
     with torch.no_grad():
         for i, batch in enumerate(loader, 1):
             batch = batch.to(next(model.parameters()).device)
             if args.model == "icam":
+                if args.augment:
+                    raise NotImplementedError(
+                        "--augment not wired for ICAM (_rollout handles its own "
+                        "multi-start). Use the pomo/am backbones for augmentation."
+                    )
                 reward, _ = model._rollout(batch, sampling=False)  # (B, num_starts)
                 mean = reward.mean(dim=1)                          # (B,) mean over starts
                 rewards.append(mean.cpu())
@@ -132,12 +148,28 @@ def main() -> None:
                         f"CVRPEnv generated {n_customers} customers (locs {tuple(td['locs'].shape)}). "
                         f"Refusing to evaluate on the wrong size."
                     )
+                if args.augment:
+                    # StateAugmentation expands the batch by 8 (dihedral-8) and
+                    # keeps locs + demand + capacity aligned. Ordering is CAT:
+                    # rows = [aug0(B), aug1(B), ..., aug7(B)]; first B = identity.
+                    sa = StateAugmentation(num_augment=8, augment_fn="dihedral8",
+                                           first_aug_identity=True)
+                    td = sa(td)                       # batch [B] -> [B*8]
                 out = model.policy(td, env, phase="test", num_starts=args.num_starts)
                 r = out["reward"]
-                # Multi-start POMO: reduce to [B] by the MEAN over starts, matching
-                # how POMO logs val/reward (all-starts mean).
-                if r.dim() > 1:
-                    r = r.mean(dim=1)
+                if args.augment:
+                    B = td.batch_size[0] // 8          # original batch size
+                    # r is [B*8, n_start], cat-ordered. Reduce starts by MEAN
+                    # (POMO's logged metric), then the 8 augments by BEST.
+                    if r.dim() > 1:  # multi-start
+                        r = r.view(8, B, r.shape[-1]).mean(dim=-1).min(dim=0).values
+                    else:            # single-start
+                        r = r.view(8, B).min(dim=0).values
+                else:
+                    # Multi-start POMO: reduce to [B] by the MEAN over starts,
+                    # matching how POMO logs val/reward (all-starts mean).
+                    if r.dim() > 1:
+                        r = r.mean(dim=1)
                 rewards.append(r.cpu())
             # Running mean so you can see progress during the run.
             running_mean = float(torch.cat(rewards).mean())
@@ -152,6 +184,7 @@ def main() -> None:
         "num_loc": num_loc,
         "n_inst": len(reward),
         "seed": args.seed,
+        "augment": args.augment,
         "mean_reward": float(reward.mean()),
         "mean_tour_length": float(tour_len.mean()),
         "std_tour_length": float(tour_len.std()),
