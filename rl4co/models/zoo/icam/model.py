@@ -192,7 +192,10 @@ class ICAMCVRP(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         with torch.no_grad():
             reward, _ = self._rollout(batch, sampling=False)
-        score = reward.max(dim=1).values.mean()
+        # Match POMO's logged val metric: MEAN over all multi-start rollouts,
+        # not the best start. (POMO logs out["reward"].mean() because its
+        # val_metrics only contains "reward", never "max_reward".)
+        score = reward.mean(dim=1).values.mean()
         self.log("val/reward", score, prog_bar=True)
         return -score
 

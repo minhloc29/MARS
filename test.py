@@ -10,6 +10,7 @@ from tensordict import TensorDict
 from rl4co.envs import CVRPEnv
 from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
 from rl4co.models.zoo.pomo_slot.model_am import SingleSharedBaseline
+from rl4co.models.zoo.icam import ICAMCVRP
 from rl4co.data.utils import load_npz_to_tensordict
 
 
@@ -47,8 +48,9 @@ def _allow_safe_globals() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate a slot-model checkpoint at a target size")
     parser.add_argument("--ckpt", type=str, required=True, help="Path to a trained .ckpt")
-    parser.add_argument("--model", type=str, default="am", choices=["am", "pomo"],
-                        help="Model class: 'am' (AMSlot) or 'pomo' (POMOSlot). Must match the checkpoint.")
+    parser.add_argument("--model", type=str, default="am", choices=["am", "pomo", "icam"],
+                        help="Model class: 'am' (AMSlot), 'pomo' (POMOSlot), or 'icam' "
+                             "(native ICAM). Must match the checkpoint.")
     parser.add_argument("--num_loc", type=int, required=True,
                         help="Target number of CUSTOMERS N (e.g. 50/100/200/500/1000).")
     parser.add_argument("--n_inst", type=int, default=1024, help="Number of eval instances")
@@ -80,8 +82,11 @@ def main() -> None:
     # Load model directly onto the compute device (CUDA, MPS, or CPU).
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     env = CVRPEnv(generator_params=dict(num_loc=num_loc))
-    model_cls = POMOSlot if args.model == "pomo" else AMSlot
-    model = model_cls.load_from_checkpoint(args.ckpt, env=env, map_location=device)
+    if args.model == "icam":
+        model = ICAMCVRP.load_from_checkpoint(args.ckpt, env=env, map_location=device)
+    else:
+        model_cls = POMOSlot if args.model == "pomo" else AMSlot
+        model = model_cls.load_from_checkpoint(args.ckpt, env=env, map_location=device)
 
     # Eval dataset — fresh instances at target size, or load a pre-generated NPZ if given.
     if args.data:
@@ -102,24 +107,38 @@ def main() -> None:
 
     model.eval()
 
-    # Greedy decode via the policy
+    # Greedy decode. ICAM uses its own hand-rolled multi-start rollout
+    # (_rollout) which returns reward of shape [B, num_starts]. POMO/AM decode
+    # via the shared policy (out["reward"] is [B, n_start] for multi-start).
+    # To keep results comparable to POMO's logged metric, reduce over starts
+    # with the MEAN (POMO reports the all-starts mean, not the best start).
     rewards = []
     n_batches = len(loader)
     print(f"[progress] decoding {n_batches} batches of batch_size={args.batch_size}")
     with torch.no_grad():
         for i, batch in enumerate(loader, 1):
             batch = batch.to(next(model.parameters()).device)
-            td = env.reset(batch)
-            # CVRP env prepends the depot, so locs == num_loc + 1 rows.
-            n_customers = int(td["locs"].shape[-2]) - 1
-            if n_customers != num_loc:
-                raise RuntimeError(
-                    f"num_loc mismatch: requested --num_loc {num_loc} but the "
-                    f"CVRPEnv generated {n_customers} customers (locs {tuple(td['locs'].shape)}). "
-                    f"Refusing to evaluate on the wrong size."
-                )
-            out = model.policy(td, env, phase="test", num_starts=args.num_starts)
-            rewards.append(out["reward"].cpu())
+            if args.model == "icam":
+                reward, _ = model._rollout(batch, sampling=False)  # (B, num_starts)
+                mean = reward.mean(dim=1)                          # (B,) mean over starts
+                rewards.append(mean.cpu())
+            else:
+                td = env.reset(batch)
+                # CVRP env prepends the depot, so locs == num_loc + 1 rows.
+                n_customers = int(td["locs"].shape[-2]) - 1
+                if n_customers != num_loc:
+                    raise RuntimeError(
+                        f"num_loc mismatch: requested --num_loc {num_loc} but the "
+                        f"CVRPEnv generated {n_customers} customers (locs {tuple(td['locs'].shape)}). "
+                        f"Refusing to evaluate on the wrong size."
+                    )
+                out = model.policy(td, env, phase="test", num_starts=args.num_starts)
+                r = out["reward"]
+                # Multi-start POMO: reduce to [B] by the MEAN over starts, matching
+                # how POMO logs val/reward (all-starts mean).
+                if r.dim() > 1:
+                    r = r.mean(dim=1)
+                rewards.append(r.cpu())
             # Running mean so you can see progress during the run.
             running_mean = float(torch.cat(rewards).mean())
             print(f"[progress] batch {i}/{n_batches}  done  "

@@ -3,17 +3,13 @@ from torch.utils.data import DataLoader
 from rl4co.envs import (
     CVRPEnv,
     CVRPTWEnv,
-    DPPEnv,
-    FLPEnv,
-    MCPEnv,
-    MDPPEnv,
+
     MTSPEnv,
     OPEnv,
     PCTSPEnv,
     PDPEnv,
     PDPRuinRepairEnv,
     SDVRPEnv,
-    SMTWTPEnv,
     SPCTSPEnv,
     TSPEnv,
 )
@@ -39,18 +35,10 @@ def get_env(name, size):
             env = PCTSPEnv(generator_params=dict(num_loc=size))
         case "spctsp":
             env = SPCTSPEnv(generator_params=dict(num_loc=size))
-        case "dpp":
-            env = DPPEnv()
-        case "mdpp":
-            env = MDPPEnv()
-        case "smtwtp":
-            env = SMTWTPEnv()
+
         case "pdp_ruin_repair":
             env = PDPRuinRepairEnv()
-        case "mcp":
-            env = MCPEnv()
-        case "flp":
-            env = FLPEnv()
+    
         case _:
             raise ValueError(f"Unknown env_name: {name}")
 
