@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
+
 from pathlib import Path
 
-import torch
 import lightning.pytorch as pl
+import torch
+
 from tensordict import TensorDict
+
 from rl4co.envs import CVRPEnv
-from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
+from rl4co.models.zoo.invit import INViT
+from rl4co.models.zoo.pomo_slot import AMSlot, POMOSlot
 from rl4co.models.zoo.pomo_slot.model_am import SingleSharedBaseline
 from rl4co.models.zoo.sil import SIL
 from train import SlotDataset
@@ -24,9 +28,9 @@ def _allow_safe_globals() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate a MARS or SIL checkpoint at a target size")
+    parser = argparse.ArgumentParser(description="Evaluate a MARS, SIL, or INViT checkpoint")
     parser.add_argument("--ckpt", type=str, required=True, help="Path to a trained .ckpt")
-    parser.add_argument("--model", type=str, default="am", choices=["am", "pomo", "sil"],
+    parser.add_argument("--model", type=str, default="am", choices=["am", "pomo", "sil", "invit"],
                         help="Model class. Must match the checkpoint.")
     parser.add_argument("--data_path", type=str, default=None,
                         help="Cached MARS .pt test split shared across methods; recommended for comparisons")
@@ -50,7 +54,7 @@ def main() -> None:
 
     # Load model
     env = CVRPEnv(generator_params=dict(num_loc=num_loc))
-    model_cls = {"pomo": POMOSlot, "am": AMSlot, "sil": SIL}[args.model]
+    model_cls = {"pomo": POMOSlot, "am": AMSlot, "sil": SIL, "invit": INViT}[args.model]
     model = model_cls.load_from_checkpoint(args.ckpt, env=env, map_location="cpu", weights_only=False)
     if args.model == "sil":
         # Inference only needs the learned policy, not the training label cache.

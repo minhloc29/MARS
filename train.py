@@ -4,11 +4,13 @@ import argparse
 import hashlib
 import json
 import time
+
 from pathlib import Path
 
-import torch
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
+import torch
+
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
 
 try:
@@ -20,10 +22,11 @@ except Exception:
 # Lazy import to avoid torchrl DLL on some setups
 try:
     from rl4co.envs import CVRPEnv
-    from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
-    from rl4co.models.zoo.sil import SIL
+    from rl4co.models.zoo.invit import INViT
     from rl4co.models.zoo.lehd import LEHDModel, TTRLModel
     from rl4co.models.zoo.lehd.model import make_lehd_dataloaders
+    from rl4co.models.zoo.pomo_slot import AMSlot, POMOSlot
+    from rl4co.models.zoo.sil import SIL
     FULL_RL4CO = True
 except Exception as e:
     print(f"[WARN] Full rl4co import failed: {e}")
@@ -38,6 +41,7 @@ MODEL_CLASSES = {
     "pomo": POMOSlot,
     "am": AMSlot,
     "sil": SIL,
+    "invit": INViT,
     "lehd": LEHDModel,
     "ttpl": TTRLModel,
 }
@@ -81,9 +85,12 @@ class SlotDataset(torch.utils.data.Dataset):
             self.locs     = self.locs[:max_instances]
             self.depot    = self.depot[:max_instances]
             self.demand   = self.demand[:max_instances]
-            if self.capacity  is not None: self.capacity  = self.capacity[:max_instances]
-            if self.d_ins_idx is not None: self.d_ins_idx = self.d_ins_idx[:max_instances]
-            if self.d_ins_val is not None: self.d_ins_val = self.d_ins_val[:max_instances]
+            if self.capacity is not None:
+                self.capacity = self.capacity[:max_instances]
+            if self.d_ins_idx is not None:
+                self.d_ins_idx = self.d_ins_idx[:max_instances]
+            if self.d_ins_val is not None:
+                self.d_ins_val = self.d_ins_val[:max_instances]
 
     def __len__(self):
         return len(self.locs)
@@ -184,6 +191,16 @@ def train(
     sil_num_layers: int = 6,
     sil_parallel_reconstruction: bool = True,
     sil_update_mode: str = "batch",
+    invit_action_size: int = 15,
+    invit_state_sizes: tuple[int, ...] = (35, 50, 65),
+    invit_num_heads: int = 8,
+    invit_state_encoder_layers: int = 2,
+    invit_action_encoder_layers: int = 2,
+    invit_decoder_layers: int = 3,
+    invit_feedforward_dim: int | None = None,
+    invit_baseline_tolerance: float = 1e-3,
+    invit_scheduler_gamma: float = 0.99,
+    invit_backprop_chunk_size: int = 16,
     generate_missing_data: bool = False,
     generation_chunk_size: int | None = None,
     # ---- LEHD / TTPL baseline arguments ----
@@ -270,14 +287,15 @@ def train(
         raise FileNotFoundError(
             "Missing required cached dataset split(s):\n  "
             + "\n  ".join(str(path) for path in missing_paths)
-            + "\n\nPrepare the shared MARS/SIL data once with:\n  "
+            + "\n\nPrepare the shared MARS/SIL/INViT data once with:\n  "
             + preparation
             + "\n\nOr append --generate_missing_data to the training command. "
               "N=1000 preparation is computationally expensive."
         )
 
     # Data
-    data_variant = "none" if backbone == "sil" else variant
+    baseline_backbones = {"sil", "invit"}
+    data_variant = "none" if backbone in baseline_backbones else variant
     loader_kwargs = dict(seed=seed, num_workers=num_workers)
     train_loader = make_dataloader(train_path, data_variant, t_cfg["batch"], shuffle=True,
                                    max_instances=t_cfg["n_train"], include_instance_id=backbone == "sil", **loader_kwargs)
@@ -289,7 +307,7 @@ def train(
 
     # Validate d_ins cost method (Variant D consumes d_ins). The data was baked
     # with a specific method; refuse a mismatch so we never train on the wrong cost.
-    if variant == "D" and backbone != "sil":
+    if variant == "D" and backbone not in baseline_backbones:
         data_method = train_loader.dataset.method
         if data_method is not None and data_method != ins_method:
             raise RuntimeError(
@@ -334,10 +352,26 @@ def train(
             update_mode=sil_update_mode,
             optimizer_kwargs={"lr": t_cfg["lr"]},
         )
+    elif backbone == "invit":
+        model_kwargs = dict(
+            env=env,
+            embed_dim=embed_dim,
+            feedforward_dim=invit_feedforward_dim,
+            num_heads=invit_num_heads,
+            state_sizes=tuple(invit_state_sizes),
+            action_size=invit_action_size,
+            state_encoder_layers=invit_state_encoder_layers,
+            action_encoder_layers=invit_action_encoder_layers,
+            decoder_layers=invit_decoder_layers,
+            baseline_tolerance=invit_baseline_tolerance,
+            scheduler_gamma=invit_scheduler_gamma,
+            backprop_chunk_size=invit_backprop_chunk_size,
+            optimizer_kwargs={"lr": t_cfg["lr"]},
+        )
     elif backbone == "am":
         model_kwargs["baseline"] = baseline if baseline is not None else "shared"
     # disable_slots: run backbone as a true no-slot baseline (no slot/aux).
-    if disable_slots and backbone != "sil":
+    if disable_slots and backbone not in baseline_backbones:
         model_kwargs["disable_slots"] = True
     model = model_cls(**model_kwargs)
     if backbone == "sil":
@@ -355,6 +389,12 @@ def train(
                     f"_l{sil_num_layers}_r{sil_repair_budget}_i{sil_improve_every}"
                     f"_s{sil_max_subtour_length}_u{sil_update_mode}"
                     f"_prc{int(sil_parallel_reconstruction)}")
+    elif backbone == "invit":
+        state_tag = "-".join(map(str, invit_state_sizes))
+        run_name = (f"invit_N{num_loc}_{dist}_{ins_method}_seed{seed}_d{embed_dim}"
+                    f"_a{invit_action_size}_s{state_tag}_h{invit_num_heads}"
+                    f"_se{invit_state_encoder_layers}_ae{invit_action_encoder_layers}"
+                    f"_de{invit_decoder_layers}_c{invit_backprop_chunk_size}")
     elif disable_slots:
         run_name = f"{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
     else:
@@ -397,7 +437,7 @@ def train(
         strategy="auto",
         callbacks=[checkpoint_cb, early_stop_cb],
         logger=logger_obj,
-        gradient_clip_val=None if backbone == "sil" else 1.0,
+        gradient_clip_val=None if backbone in baseline_backbones else 1.0,
         enable_progress_bar=True,
         log_every_n_steps=10,
     )
@@ -411,6 +451,12 @@ def train(
               f"max_subtour_length={sil_max_subtour_length}, update_mode={sil_update_mode}, "
               f"PRC={sil_parallel_reconstruction}")
         print("  Slot/metric/entropy flags do not apply to SIL; ins_method selects the shared data folder.")
+    elif backbone == "invit":
+        print(f"  INViT: actions={invit_action_size}, states={tuple(invit_state_sizes)}, "
+              f"heads={invit_num_heads}, encoders={invit_action_encoder_layers}/"
+              f"{invit_state_encoder_layers}, decoder={invit_decoder_layers}, "
+              f"backprop_chunk={invit_backprop_chunk_size}")
+        print("  Slot/metric/entropy flags do not apply to INViT; ins_method selects the shared data folder.")
     else:
         print(f"  Slots: K={num_slots}  proj_dim={proj_dim}  iters={slot_iters}")
     print(f"  ins_method: {ins_method}")
@@ -424,8 +470,8 @@ def train(
     best_reward = checkpoint_cb.best_model_score.item() if checkpoint_cb.best_model_score else None
     result = {
         "backbone": backbone,
-        "variant": None if backbone == "sil" else variant,
-        "num_slots": None if backbone == "sil" else num_slots,
+        "variant": None if backbone in baseline_backbones else variant,
+        "num_slots": None if backbone in baseline_backbones else num_slots,
         "num_loc": num_loc,
         "dist": dist,
         "seed": seed,
@@ -450,6 +496,21 @@ def train(
                       sil_update_mode=sil_update_mode,
                       sil_parallel_reconstruction=sil_parallel_reconstruction,
                       dataset_signature=model.dataset_signature)
+    elif backbone == "invit":
+        result.update(
+            normalize_target=None,
+            symmetrize_target=None,
+            invit_action_size=invit_action_size,
+            invit_state_sizes=list(invit_state_sizes),
+            invit_num_heads=invit_num_heads,
+            invit_state_encoder_layers=invit_state_encoder_layers,
+            invit_action_encoder_layers=invit_action_encoder_layers,
+            invit_decoder_layers=invit_decoder_layers,
+            invit_feedforward_dim=invit_feedforward_dim or 4 * embed_dim,
+            invit_baseline_tolerance=invit_baseline_tolerance,
+            invit_scheduler_gamma=invit_scheduler_gamma,
+            invit_backprop_chunk_size=invit_backprop_chunk_size,
+        )
 
     # Dedup identical configs: rerun replaces, never appends a duplicate row.
     result_dir = Path(output)
@@ -463,6 +524,9 @@ def train(
     if backbone == "sil":
         dedup_key.update({k: v for k, v in result.items() if k.startswith("sil_")})
         dedup_key.update({k: result[k] for k in ("embed_dim", "batch_size", "dataset_signature")})
+    elif backbone == "invit":
+        dedup_key.update({k: v for k, v in result.items() if k.startswith("invit_")})
+        dedup_key.update({k: result[k] for k in ("embed_dim", "batch_size")})
     results = [r for r in results if not all(r.get(k) == v for k, v in dedup_key.items())]
     results.append(result)
     result_file.write_text(json.dumps(results, indent=2))
@@ -627,7 +691,7 @@ def _train_lehd(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train MARS or SIL on shared cached CVRP data")
+    parser = argparse.ArgumentParser(description="Train MARS, SIL, or INViT on shared cached CVRP data")
     parser.add_argument("--variant",       type=str,   default="D",       choices=list("ABCD"),
                         help="Ablation variant. E is reserved (not implemented).")
     parser.add_argument("--num_loc",       type=int,   default=100,       choices=[50, 100, 200, 500, 1000])
@@ -657,8 +721,8 @@ def main():
     parser.add_argument("--max_instances", type=int,   default=None,
                         help="Cap dataset size for quick smoke tests")
     parser.add_argument("--backbone",      type=str,   default="pomo",
-                        choices=["pomo", "am", "sil", "lehd", "ttpl"],
-                        help="pomo/am slot models, SIL self-improved baseline, "
+                        choices=["pomo", "am", "sil", "invit", "lehd", "ttpl"],
+                        help="pomo/am slot models, SIL or INViT baseline, "
                              "LEHD (NeurIPS23) or TTPL (NeurIPS25) imitation baseline")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--generate_missing_data", action="store_true",
@@ -676,6 +740,20 @@ def main():
                         help="batch: one optimizer update per batch (comparable); node: upstream per-node updates")
     parser.add_argument("--sil_no_prc", dest="sil_parallel_reconstruction", action="store_false",
                         help="Reconstruct one subpath per instance instead of parallel disjoint subpaths")
+    parser.add_argument("--invit_action_size", type=int, default=15,
+                        help="INViT local action-view size (upstream: 15)")
+    parser.add_argument("--invit_state_sizes", type=int, nargs="+", default=[35, 50, 65],
+                        help="INViT nested state-view sizes (upstream: 35 50 65)")
+    parser.add_argument("--invit_num_heads", type=int, default=8)
+    parser.add_argument("--invit_state_encoder_layers", type=int, default=2)
+    parser.add_argument("--invit_action_encoder_layers", type=int, default=2)
+    parser.add_argument("--invit_decoder_layers", type=int, default=3)
+    parser.add_argument("--invit_feedforward_dim", type=int, default=None,
+                        help="INViT feed-forward width (default: 4 * embed_dim)")
+    parser.add_argument("--invit_baseline_tolerance", type=float, default=1e-3)
+    parser.add_argument("--invit_scheduler_gamma", type=float, default=0.99)
+    parser.add_argument("--invit_backprop_chunk_size", type=int, default=16,
+                        help="INViT replay steps per backward pass; bounds N=1000 activation memory")
     parser.add_argument("--baseline",      type=str,   default=None,
                         help="REINFORCE baseline for the AM backbone (e.g. rollout, shared). Ignored for pomo.")
     parser.add_argument("--disable_slots", action="store_true",
@@ -739,6 +817,16 @@ def main():
         sil_num_layers=args.sil_num_layers,
         sil_update_mode=args.sil_update_mode,
         sil_parallel_reconstruction=args.sil_parallel_reconstruction,
+        invit_action_size=args.invit_action_size,
+        invit_state_sizes=tuple(args.invit_state_sizes),
+        invit_num_heads=args.invit_num_heads,
+        invit_state_encoder_layers=args.invit_state_encoder_layers,
+        invit_action_encoder_layers=args.invit_action_encoder_layers,
+        invit_decoder_layers=args.invit_decoder_layers,
+        invit_feedforward_dim=args.invit_feedforward_dim,
+        invit_baseline_tolerance=args.invit_baseline_tolerance,
+        invit_scheduler_gamma=args.invit_scheduler_gamma,
+        invit_backprop_chunk_size=args.invit_backprop_chunk_size,
         generate_missing_data=args.generate_missing_data,
         generation_chunk_size=args.generation_chunk_size,
         lehd_data_path=args.lehd_data_path,
