@@ -17,3 +17,5 @@ from rl4co.models.zoo.nargnn import NARGNNPolicy
 from rl4co.models.zoo.neuopt import NeuOpt, NeuOptPolicy
 from rl4co.models.zoo.pomo import POMO
 from rl4co.models.zoo.symnco import SymNCO, SymNCOPolicy
+from rl4co.models.zoo.sil import SIL, SILPolicy
+from rl4co.models.zoo.lehd import LEHDModel, TTRLModel
