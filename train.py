@@ -17,7 +17,6 @@ try:
 except Exception:
     HAVE_WANDB = False
 
-# Lazy import to avoid torchrl DLL on some setups
 try:
     from rl4co.envs import CVRPEnv
     from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
