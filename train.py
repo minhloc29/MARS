@@ -24,6 +24,7 @@ try:
     from rl4co.models.zoo.sil import SIL
     from rl4co.models.zoo.l2r import L2RModel
     from rl4co.models.zoo.icam import ICAMCVRP
+    from rl4co.models.zoo.invit import INViT
     from rl4co.models.zoo.lehd import LEHDModel, TTRLModel
     from rl4co.models.zoo.lehd.model import make_lehd_dataloaders
     FULL_RL4CO = True
@@ -41,6 +42,7 @@ MODEL_CLASSES = {
     "am": AMSlot,
     "l2r": L2RModel,
     "icam": ICAMCVRP,
+    "invit": INViT,
     "sil": SIL,
     "lehd": LEHDModel,
     "ttpl": TTRLModel,
@@ -189,6 +191,16 @@ def train(
     lehd_data_path: str | None = None,
     lehd_val_data_path: str | None = None,
     lehd_decoder_layers: int = 6,
+    invit_action_size: int = 15,
+    invit_state_sizes: tuple[int, ...] = (35, 50, 65),
+    invit_num_heads: int = 8,
+    invit_state_encoder_layers: int = 2,
+    invit_action_encoder_layers: int = 2,
+    invit_decoder_layers: int = 3,
+    invit_feedforward_dim: int | None = None,
+    invit_baseline_tolerance: float = 1e-3,
+    invit_scheduler_gamma: float = 0.99,
+    invit_backprop_chunk_size: int = 16,
 ):
     assert FULL_RL4CO, (
         "Full rl4co import failed. Ensure torchrl DLL is installed correctly "
@@ -275,7 +287,8 @@ def train(
         )
 
     # Data
-    data_variant = "none" if backbone == "sil" else metric_variant
+    baseline_backbones = {"sil", "invit"}
+    data_variant = "none" if backbone in baseline_backbones else metric_variant
     loader_kwargs = dict(seed=seed, num_workers=num_workers)
     train_loader = make_dataloader(train_path, data_variant, batch_size, shuffle=True,
                                    max_instances=n_train_eff, include_instance_id=backbone == "sil", **loader_kwargs)
@@ -288,7 +301,7 @@ def train(
 
     # Validate d_ins cost method (Variant D consumes d_ins). The data was baked
     # with a specific method; refuse a mismatch so we never train on the wrong cost.
-    if metric_variant == "D" and backbone != "sil":
+    if metric_variant == "D" and backbone not in baseline_backbones:
         data_method = train_loader.dataset.method
         if data_method is not None and data_method != ins_method:
             raise RuntimeError(
@@ -344,10 +357,26 @@ def train(
             update_mode=sil_update_mode,
             optimizer_kwargs={"lr": lr},
         )
+    elif backbone == "invit":
+        model_kwargs = dict(
+            env=env,
+            embed_dim=embed_dim,
+            feedforward_dim=invit_feedforward_dim,
+            num_heads=invit_num_heads,
+            state_sizes=tuple(invit_state_sizes),
+            action_size=invit_action_size,
+            state_encoder_layers=invit_state_encoder_layers,
+            action_encoder_layers=invit_action_encoder_layers,
+            decoder_layers=invit_decoder_layers,
+            baseline_tolerance=invit_baseline_tolerance,
+            scheduler_gamma=invit_scheduler_gamma,
+            backprop_chunk_size=invit_backprop_chunk_size,
+            optimizer_kwargs={"lr": lr},
+        )
     elif backbone == "am":
         model_kwargs["baseline"] = baseline if baseline is not None else "shared"
     # disable_slots: run backbone as a true no-slot baseline (no slot/aux).
-    if disable_slots and backbone != "sil":
+    if disable_slots and backbone not in baseline_backbones:
         model_kwargs["disable_slots"] = True
     model = model_cls(**model_kwargs)
     if backbone == "sil":
@@ -365,6 +394,12 @@ def train(
                     f"_l{sil_num_layers}_r{sil_repair_budget}_i{sil_improve_every}"
                     f"_s{sil_max_subtour_length}_u{sil_update_mode}"
                     f"_prc{int(sil_parallel_reconstruction)}")
+    elif backbone == "invit":
+        state_tag = "-".join(map(str, invit_state_sizes))
+        run_name = (f"invit_N{num_loc}_{dist}_{ins_method}_seed{seed}_d{embed_dim}"
+                    f"_a{invit_action_size}_s{state_tag}_h{invit_num_heads}"
+                    f"_se{invit_state_encoder_layers}_ae{invit_action_encoder_layers}"
+                    f"_de{invit_decoder_layers}_c{invit_backprop_chunk_size}")
     elif disable_slots:
         run_name = f"{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
     else:
@@ -407,7 +442,7 @@ def train(
         strategy="auto",
         callbacks=[checkpoint_cb, early_stop_cb],
         logger=logger_obj,
-        gradient_clip_val=None if backbone == "sil" else 1.0,
+        gradient_clip_val=None if backbone in baseline_backbones else 1.0,
         enable_progress_bar=True,
         log_every_n_steps=10,
     )
@@ -463,6 +498,19 @@ def train(
                       sil_update_mode=sil_update_mode,
                       sil_parallel_reconstruction=sil_parallel_reconstruction,
                       dataset_signature=model.dataset_signature)
+    elif backbone == "invit":
+        result.update(
+            invit_action_size=invit_action_size,
+            invit_state_sizes=list(invit_state_sizes),
+            invit_num_heads=invit_num_heads,
+            invit_state_encoder_layers=invit_state_encoder_layers,
+            invit_action_encoder_layers=invit_action_encoder_layers,
+            invit_decoder_layers=invit_decoder_layers,
+            invit_feedforward_dim=invit_feedforward_dim or 4 * embed_dim,
+            invit_baseline_tolerance=invit_baseline_tolerance,
+            invit_scheduler_gamma=invit_scheduler_gamma,
+            invit_backprop_chunk_size=invit_backprop_chunk_size,
+        )
 
     # Dedup identical configs: rerun replaces, never appends a duplicate row.
     result_dir = Path(output)
@@ -479,6 +527,9 @@ def train(
             {k: v for k, v in result.items() if k.startswith("sil_")})
         dedup_key.update({k: result[k] for k in (
             "embed_dim", "batch_size", "dataset_signature")})
+    elif backbone == "invit":
+        dedup_key.update({k: v for k, v in result.items()
+                         if k.startswith("invit_")})
     results = [r for r in results if not all(
         r.get(k) == v for k, v in dedup_key.items())]
     results.append(result)
@@ -659,7 +710,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max_instances", type=int, default=None)
     parser.add_argument("--backbone", default="pomo",
-                        choices=["pomo", "am", "l2r", "icam", "sil", "lehd", "ttpl"])
+                        choices=["pomo", "am", "l2r", "icam", "sil", "invit", "lehd", "ttpl"])
     parser.add_argument("--embed_dim", type=int, default=128)
     parser.add_argument("--num_slots", type=int, default=8)
     parser.add_argument("--proj_dim", type=int, default=64)
@@ -700,6 +751,17 @@ def main():
     parser.add_argument("--lehd_data_path", default=None)
     parser.add_argument("--lehd_val_data_path", default=None)
     parser.add_argument("--lehd_decoder_layers", type=int, default=6)
+    parser.add_argument("--invit_action_size", type=int, default=15)
+    parser.add_argument("--invit_state_sizes", type=int,
+                        nargs="+", default=[35, 50, 65])
+    parser.add_argument("--invit_num_heads", type=int, default=8)
+    parser.add_argument("--invit_state_encoder_layers", type=int, default=2)
+    parser.add_argument("--invit_action_encoder_layers", type=int, default=2)
+    parser.add_argument("--invit_decoder_layers", type=int, default=3)
+    parser.add_argument("--invit_feedforward_dim", type=int, default=None)
+    parser.add_argument("--invit_baseline_tolerance", type=float, default=1e-3)
+    parser.add_argument("--invit_scheduler_gamma", type=float, default=0.99)
+    parser.add_argument("--invit_backprop_chunk_size", type=int, default=16)
     args = parser.parse_args()
 
     train(
@@ -728,6 +790,16 @@ def main():
         lehd_data_path=args.lehd_data_path,
         lehd_val_data_path=args.lehd_val_data_path,
         lehd_decoder_layers=args.lehd_decoder_layers,
+        invit_action_size=args.invit_action_size,
+        invit_state_sizes=tuple(args.invit_state_sizes),
+        invit_num_heads=args.invit_num_heads,
+        invit_state_encoder_layers=args.invit_state_encoder_layers,
+        invit_action_encoder_layers=args.invit_action_encoder_layers,
+        invit_decoder_layers=args.invit_decoder_layers,
+        invit_feedforward_dim=args.invit_feedforward_dim,
+        invit_baseline_tolerance=args.invit_baseline_tolerance,
+        invit_scheduler_gamma=args.invit_scheduler_gamma,
+        invit_backprop_chunk_size=args.invit_backprop_chunk_size,
     )
 
 

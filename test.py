@@ -13,6 +13,7 @@ from rl4co.models.zoo.pomo_slot.model_am import SingleSharedBaseline
 from rl4co.models.zoo.sil import SIL
 from rl4co.models.zoo.l2r import L2RModel
 from rl4co.models.zoo.icam import ICAMCVRP
+from rl4co.models.zoo.invit import INViT
 from train import SlotDataset
 from rl4co.data.transforms import StateAugmentation
 from rl4co.data.utils import load_npz_to_tensordict
@@ -51,7 +52,7 @@ def main() -> None:
         description="Evaluate a routing checkpoint at a target size")
     parser.add_argument("--ckpt", type=str, required=True,
                         help="Path to a trained .ckpt")
-    parser.add_argument("--model", type=str, default="am", choices=["am", "pomo", "l2r", "icam", "sil"],
+    parser.add_argument("--model", type=str, default="am", choices=["am", "pomo", "l2r", "icam", "sil", "invit"],
                         help="Model class. Must match the checkpoint.")
     parser.add_argument("--data_path", type=str, default=None,
                         help="Cached MARS .pt test split shared across methods; recommended for comparisons")
@@ -84,7 +85,7 @@ def main() -> None:
     device = _pick_device(args.device)
     env = CVRPEnv(generator_params=dict(num_loc=num_loc))
     model_cls = {"pomo": POMOSlot, "am": AMSlot, "l2r": L2RModel,
-                 "icam": ICAMCVRP, "sil": SIL}[args.model]
+                 "icam": ICAMCVRP, "sil": SIL, "invit": INViT}[args.model]
     model_kwargs = {"env": env, "map_location": device, "weights_only": False}
     model = model_cls.load_from_checkpoint(args.ckpt, **model_kwargs)
     model.to(device)
