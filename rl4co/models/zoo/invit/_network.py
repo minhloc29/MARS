@@ -16,6 +16,7 @@ from torch.nn import functional as F
 
 def _scale_local_view(x: torch.Tensor, reference_length: int) -> torch.Tensor:
     """Translate and isotropically scale a nested view, as upstream INViT."""
+    # what is x: x is a tensor of shape (batch_size, num_points, num_features) representing a local view of points in a nested structure. The function scales and translates this view based on the reference points provided in the first `reference_length` points of the tensor. It normalizes the coordinates to fit within a unit cube by subtracting the minimum value and dividing by the extent (max - min) of the reference points. This ensures that the local view is invariant to translation and scaling, which is important for the INViT model to generalize across different instances of the problem.
     reference = x[:, :reference_length]
     minimum = reference.amin(dim=1, keepdim=True)
     extent = (reference.amax(dim=1) - reference.amin(dim=1)).amax(dim=-1)

@@ -11,7 +11,6 @@ from ._network import INViTPolicy
 
 
 class INViT(pl.LightningModule):
-    """Train INViT with its greedy rollout baseline on fixed MARS splits."""
 
     def __init__(
         self,

@@ -724,7 +724,7 @@ def main():
                         choices=["savings", "construction", "insertion"])
     parser.add_argument("--lower_neighbors_num", type=int, default=50)
     parser.add_argument("--reduction_percentage", type=float, default=0.1)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--generate_missing_data", action="store_true")
     parser.add_argument("--generation_chunk_size", type=int, default=None)
     parser.add_argument("--sil_repair_budget", type=int, default=5)
