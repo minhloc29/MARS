@@ -78,7 +78,7 @@ class _LocalPolicy(nn.Module):
 class ELGPolicy(nn.Module):
     def __init__(
         self,
-        embed_dim: int = 128,
+        embed_dim: int = 88,
         num_layers: int = 6,
         num_heads: int = 8,
         feedforward_dim: int | None = None,

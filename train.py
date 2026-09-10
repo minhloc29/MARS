@@ -215,12 +215,14 @@ def train(
     dgl_knn: int = 100,
     dgl_depot_knn: int = 100,
     dgl_pomo_size: int = 16,
+    dgl_embed_dim: int = 128,
     dgl_num_layers: int = 3,
     dgl_num_heads: int = 8,
     dgl_feedforward_dim: int | None = None,
     dgl_improve_every: int = 1,
     # ---- ELG baseline arguments ----
     elg_pomo_size: int = 50,
+    elg_embed_dim: int = 88,
     elg_num_layers: int = 6,
     elg_num_heads: int = 8,
     elg_feedforward_dim: int | None = None,
@@ -404,14 +406,14 @@ def train(
         )
     elif backbone == "dgl":
         model_kwargs = dict(
-            env=env, embed_dim=embed_dim, num_layers=dgl_num_layers,
+            env=env, embed_dim=dgl_embed_dim, num_layers=dgl_num_layers,
             num_heads=dgl_num_heads, feedforward_dim=dgl_feedforward_dim,
             knn=dgl_knn, depot_knn=dgl_depot_knn, pomo_size=dgl_pomo_size,
             improve_every=dgl_improve_every, optimizer_kwargs={"lr": lr},
         )
     elif backbone == "elg":
         model_kwargs = dict(
-            env=env, embed_dim=embed_dim, num_layers=elg_num_layers,
+            env=env, embed_dim=elg_embed_dim, num_layers=elg_num_layers,
             num_heads=elg_num_heads, feedforward_dim=elg_feedforward_dim,
             local_size=elg_local_size, local_dim=elg_local_dim,
             local_heads=elg_local_heads, pomo_size=elg_pomo_size,
@@ -424,6 +426,15 @@ def train(
     if disable_slots and backbone not in baseline_backbones:
         model_kwargs["disable_slots"] = True
     model = model_cls(**model_kwargs)
+    model_embed_dim = (
+        dgl_embed_dim if backbone == "dgl"
+        else elg_embed_dim if backbone == "elg"
+        else embed_dim
+    )
+    total_params = sum(parameter.numel() for parameter in model.parameters())
+    trainable_params = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
     if backbone == "sil":
         model.dataset_signature = train_loader.dataset.signature()
     elif backbone == "dgl":
@@ -448,11 +459,11 @@ def train(
                     f"_se{invit_state_encoder_layers}_ae{invit_action_encoder_layers}"
                     f"_de{invit_decoder_layers}_c{invit_backprop_chunk_size}")
     elif backbone == "dgl":
-        run_name = (f"dgl_N{num_loc}_{dist}_{ins_method}_seed{seed}_d{embed_dim}"
+        run_name = (f"dgl_N{num_loc}_{dist}_{ins_method}_seed{seed}_d{dgl_embed_dim}"
                     f"_k{dgl_knn}-{dgl_depot_knn}_p{dgl_pomo_size}"
                     f"_l{dgl_num_layers}_i{dgl_improve_every}")
     elif backbone == "elg":
-        run_name = (f"elg_N{num_loc}_{dist}_{ins_method}_seed{seed}_d{embed_dim}"
+        run_name = (f"elg_N{num_loc}_{dist}_{ins_method}_seed{seed}_d{elg_embed_dim}"
                     f"_p{elg_pomo_size}_l{elg_num_layers}_local{elg_local_size}"
                     f"_{elg_mode}_w{elg_warmup_epochs}")
     elif disable_slots:
@@ -507,17 +518,18 @@ def train(
     print(f"Training {model_cls.__name__} | N={num_loc} | {dist}")
     print(
         f"  Epochs: {epochs}  Batch: {batch_size}  LR: {lr}")
+    print(f"  Parameters: {trainable_params:,} trainable / {total_params:,} total")
     if backbone == "sil":
         print(f"  SIL: repair_budget={sil_repair_budget}, improve_every={sil_improve_every}, "
               f"max_subtour_length={sil_max_subtour_length}, update_mode={sil_update_mode}, "
               f"PRC={sil_parallel_reconstruction}")
         print("  Slot/metric/entropy flags do not apply to SIL; ins_method selects the shared data folder.")
     elif backbone == "dgl":
-        print(f"  DGL: knn={dgl_knn}, depot_knn={dgl_depot_knn}, pomo={dgl_pomo_size}, "
+        print(f"  DGL: embed_dim={dgl_embed_dim}, knn={dgl_knn}, depot_knn={dgl_depot_knn}, pomo={dgl_pomo_size}, "
               f"layers={dgl_num_layers}, improve_every={dgl_improve_every}")
         print("  Slot/metric/entropy flags do not apply to DGL; ins_method selects the shared data folder.")
     elif backbone == "elg":
-        print(f"  ELG: pomo={elg_pomo_size}, layers={elg_num_layers}, "
+        print(f"  ELG: embed_dim={elg_embed_dim}, pomo={elg_pomo_size}, layers={elg_num_layers}, "
               f"local_size={elg_local_size}, mode={elg_mode}, warmup={elg_warmup_epochs}")
         print("  Slot/metric/entropy flags do not apply to ELG; ins_method selects the shared data folder.")
     else:
@@ -546,9 +558,12 @@ def train(
         "best_val_reward": best_reward,
         "elapsed_min": round(elapsed / 60, 1),
         "checkpoint": str(checkpoint_cb.best_model_path),
-        "embed_dim": embed_dim,
+        "embed_dim": model_embed_dim,
+        "shared_embed_dim_arg": embed_dim,
         "batch_size": batch_size,
         "lr": lr,
+        "trainable_params": trainable_params,
+        "total_params": total_params,
         "train_path": str(train_path.resolve()),
         "val_path": str(val_path.resolve()),
         "n_train": len(train_loader.dataset),
@@ -577,17 +592,19 @@ def train(
     elif backbone == "dgl":
         result.update(
             normalize_target=None, symmetrize_target=None,
+            dgl_embed_dim=dgl_embed_dim,
             dgl_knn=dgl_knn, dgl_depot_knn=dgl_depot_knn,
             dgl_pomo_size=dgl_pomo_size, dgl_num_layers=dgl_num_layers,
-            dgl_num_heads=dgl_num_heads, dgl_feedforward_dim=dgl_feedforward_dim or 4 * embed_dim,
+            dgl_num_heads=dgl_num_heads, dgl_feedforward_dim=dgl_feedforward_dim or 4 * dgl_embed_dim,
             dgl_improve_every=dgl_improve_every,
             dataset_signature=model.dataset_signature,
         )
     elif backbone == "elg":
         result.update(
             normalize_target=None, symmetrize_target=None,
+            elg_embed_dim=elg_embed_dim,
             elg_pomo_size=elg_pomo_size, elg_num_layers=elg_num_layers,
-            elg_num_heads=elg_num_heads, elg_feedforward_dim=elg_feedforward_dim or 4 * embed_dim,
+            elg_num_heads=elg_num_heads, elg_feedforward_dim=elg_feedforward_dim or 4 * elg_embed_dim,
             elg_local_size=elg_local_size, elg_local_dim=elg_local_dim,
             elg_local_heads=elg_local_heads, elg_mode=elg_mode,
             elg_warmup_epochs=elg_warmup_epochs, elg_scale_norm=elg_scale_norm,
@@ -851,11 +868,13 @@ def main():
     parser.add_argument("--dgl_knn", type=int, default=100)
     parser.add_argument("--dgl_depot_knn", type=int, default=100)
     parser.add_argument("--dgl_pomo_size", type=int, default=16)
+    parser.add_argument("--dgl_embed_dim", type=int, default=128)
     parser.add_argument("--dgl_num_layers", type=int, default=3)
     parser.add_argument("--dgl_num_heads", type=int, default=8)
     parser.add_argument("--dgl_feedforward_dim", type=int, default=None)
     parser.add_argument("--dgl_improve_every", type=int, default=1)
     parser.add_argument("--elg_pomo_size", type=int, default=50)
+    parser.add_argument("--elg_embed_dim", type=int, default=88)
     parser.add_argument("--elg_num_layers", type=int, default=6)
     parser.add_argument("--elg_num_heads", type=int, default=8)
     parser.add_argument("--elg_feedforward_dim", type=int, default=None)
@@ -906,11 +925,13 @@ def main():
         dgl_knn=args.dgl_knn,
         dgl_depot_knn=args.dgl_depot_knn,
         dgl_pomo_size=args.dgl_pomo_size,
+        dgl_embed_dim=args.dgl_embed_dim,
         dgl_num_layers=args.dgl_num_layers,
         dgl_num_heads=args.dgl_num_heads,
         dgl_feedforward_dim=args.dgl_feedforward_dim,
         dgl_improve_every=args.dgl_improve_every,
         elg_pomo_size=args.elg_pomo_size,
+        elg_embed_dim=args.elg_embed_dim,
         elg_num_layers=args.elg_num_layers,
         elg_num_heads=args.elg_num_heads,
         elg_feedforward_dim=args.elg_feedforward_dim,

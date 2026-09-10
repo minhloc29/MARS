@@ -13,7 +13,7 @@ class ELG(pl.LightningModule):
     def __init__(
         self,
         env=None,
-        embed_dim: int = 128,
+        embed_dim: int = 88,
         num_layers: int = 6,
         num_heads: int = 8,
         feedforward_dim: int | None = None,

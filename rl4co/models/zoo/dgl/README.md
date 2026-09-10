@@ -12,8 +12,15 @@ to keep the full shared-data solution pool manageable.
 python train.py --backbone dgl --variant D --num_loc 1000 \
   --logger wandb --num_slots 64 --ins_method insertion --device 0 \
   --seed 42 --batch_size 64 --embed_dim 64 --beta_entropy 0.01 \
-  --dgl_knn 100 --dgl_depot_knn 100 --dgl_pomo_size 16
+  --dgl_embed_dim 128 --dgl_knn 100 --dgl_depot_knn 100 \
+  --dgl_pomo_size 16
 ```
+
+The matched default (`dgl_embed_dim=128`, three layers) has **612,737 trainable
+parameters**, versus **610,561** for the shown MARS configuration (+0.36%). The
+128-dimensional setting is also DGL's upstream embedding width. The shared
+`--embed_dim 64` remains accepted so comparison command templates need not
+change; `--dgl_embed_dim` controls DGL itself.
 
 Slot, metric, entropy, and insertion-cost values do not alter DGL; `ins_method`
 only selects the same cached MARS dataset folder. The integrated loop visits each

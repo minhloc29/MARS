@@ -74,3 +74,12 @@ def test_state_uses_normalized_capacity_data():
     state = CVRPState.from_batch(batch)
     assert state.xy.shape == (2, 9, 2)
     assert state.demand[:, 0].eq(0).all()
+
+
+def test_matched_defaults_are_within_one_percent_of_mars():
+    mars_parameters = 610_561
+    dgl = DGL(embed_dim=128, num_layers=3, num_heads=8)
+    elg = ELG(embed_dim=88, num_layers=6, num_heads=8)
+    for model in (dgl, elg):
+        count = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+        assert abs(count - mars_parameters) / mars_parameters < 0.01
