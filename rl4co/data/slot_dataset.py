@@ -13,8 +13,14 @@ training/validation :class:`DataLoader` that POMOSlot/AMSlot consume.
 Keeping this beside the generator (rather than inlined in train.py) gives every
 consumer — train.py, test.py, eval scripts — a single shared reader, so the
 on-disk schema only has to be defined once.
+
+The ``variant`` argument mirrors the POMOSlot/AMSlot ablation switch. d_ins is
+needed only for Variant D, so it is loaded conditionally to save memory on the
+other variants (which still re-read the file's format header).
 """
 from __future__ import annotations
+
+import hashlib
 
 from pathlib import Path
 
@@ -24,7 +30,9 @@ import torch
 class SlotDataset(torch.utils.data.Dataset):
     """Wraps cached .pt files from generate_slot_dataset.py (sparse_v2)."""
 
-    def __init__(self, filepath: str | Path, max_instances: int | None = None):
+    def __init__(self, filepath: str | Path, variant: str = "D",
+                 max_instances: int | None = None,
+                 include_instance_id: bool = False):
         data = torch.load(filepath, map_location="cpu", weights_only=False)
 
         # Format version sanity check (reject old dense d_ins)
@@ -48,9 +56,15 @@ class SlotDataset(torch.utils.data.Dataset):
         # d_ins cost-method tag stamped by the generator; None for legacy datasets.
         self.method: str | None = data.get("method", None)
 
-        # Sparse d_ins is always loaded — the metric-preservation loss consumes it.
-        self.d_ins_idx = data.get("d_ins_idx", None)  # (N_inst,N,k) int16
-        self.d_ins_val = data.get("d_ins_val", None)  # (N_inst,N,k) float32
+        # Sparse d_ins only needed for Variant D; load it conditionally to keep
+        # the other ablation variants memory-light.
+        needs_dins = variant == "D"
+        self.d_ins_idx = data.get(
+            "d_ins_idx", None) if needs_dins else None  # (N_inst,N,k) int16
+        self.d_ins_val = data.get(
+            "d_ins_val", None) if needs_dins else None  # (N_inst,N,k) float32
+        self.variant = variant
+        self.include_instance_id = include_instance_id
 
         if max_instances is not None:
             self.locs = self.locs[:max_instances]
@@ -78,7 +92,17 @@ class SlotDataset(torch.utils.data.Dataset):
             item["d_ins_idx"] = self.d_ins_idx[idx]  # (N, k) int16
         if self.d_ins_val is not None:
             item["d_ins_val"] = self.d_ins_val[idx]  # (N, k) float32
+        if self.include_instance_id:
+            item["instance_id"] = torch.tensor(idx, dtype=torch.long)
         return item
+
+    def signature(self):
+        """Identify the actual cached CVRP inputs before reusing SIL labels."""
+        digest = hashlib.sha256()
+        for tensor in (self.locs, self.depot, self.demand):
+            digest.update(str((tuple(tensor.shape), tensor.dtype)).encode())
+            digest.update(memoryview(tensor.contiguous().numpy()).cast("B"))
+        return digest.hexdigest()
 
 
 def collate_fn(batch: list[dict]) -> dict:
@@ -87,16 +111,26 @@ def collate_fn(batch: list[dict]) -> dict:
     return {k: torch.stack([b[k] for b in batch], dim=0) for k in keys}
 
 
-def make_dataloader(filepath: str | Path, batch_size: int, shuffle: bool,
-                    max_instances: int | None = None) -> torch.utils.data.DataLoader:
+def make_dataloader(
+    filepath: str | Path,
+    batch_size: int,
+    shuffle: bool,
+    max_instances: int | None = None,
+    variant: str = "D",
+    include_instance_id: bool = False,
+    seed: int = 42,
+    num_workers: int = 4,
+) -> torch.utils.data.DataLoader:
     """Build a DataLoader over one cached split .pt file."""
-    ds = SlotDataset(filepath, max_instances=max_instances)
+    ds = SlotDataset(filepath, variant=variant, max_instances=max_instances,
+                     include_instance_id=include_instance_id)
     return torch.utils.data.DataLoader(
         ds,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True,
+        persistent_workers=num_workers > 0,
+        generator=torch.Generator().manual_seed(seed),
         collate_fn=collate_fn,
     )

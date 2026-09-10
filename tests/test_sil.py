@@ -19,7 +19,7 @@ from rl4co.models.zoo.sil.solution import (
     sample_subpaths,
     to_actions,
 )
-from train import SlotDataset, make_dataloader
+from rl4co.data.slot_dataset import SlotDataset, make_dataloader
 
 
 @pytest.fixture(autouse=True)
@@ -56,10 +56,10 @@ def test_shared_data_and_rng_independent_shuffle(tmp_path):
         assert torch.equal(mars[1][key], sil[1][key])
         assert torch.equal(sil[1][key], raw[key][1])
     assert "d_ins_val" not in sil[1] and sil[1]["instance_id"] == 1
-    first = make_dataloader(
-        path, "D", 2, True, include_instance_id=True, num_workers=0)
+    first = make_dataloader(path, 2, True, variant="D",
+                            include_instance_id=True, num_workers=0)
     torch.rand(1000)  # model-specific RNG use must not change data order
-    second = make_dataloader(path, "none", 2, True,
+    second = make_dataloader(path, 2, True, variant="none",
                              include_instance_id=True, num_workers=0)
     assert torch.equal(
         torch.cat([b["instance_id"] for b in first]), torch.cat(
@@ -189,8 +189,8 @@ def test_train_improve_checkpoint_resume(tmp_path):
     path = tmp_path / "data.pt"
     cached_data(path, batch=2, n=6)
     train_loader = make_dataloader(
-        path, "none", 2, True, include_instance_id=True, num_workers=0)
-    val_loader = make_dataloader(path, "none", 2, False, num_workers=0)
+        path, 2, True, variant="none", include_instance_id=True, num_workers=0)
+    val_loader = make_dataloader(path, 2, False, variant="none", num_workers=0)
     env = CVRPEnv(generator_params={"num_loc": 6})
     model = SIL(
         env, embed_dim=16, num_layers=1, improve_every=1, repair_budget=1, max_subtour_length=4
@@ -255,7 +255,7 @@ def test_node_update_mode_retains_upstream_step_schedule(tmp_path):
     path = tmp_path / "data.pt"
     cached_data(path, batch=2, n=6)
     train_loader = make_dataloader(
-        path, "none", 2, True, include_instance_id=True, num_workers=0)
+        path, 2, True, variant="none", include_instance_id=True, num_workers=0)
     env = CVRPEnv(generator_params={"num_loc": 6})
     model = SIL(
         env,

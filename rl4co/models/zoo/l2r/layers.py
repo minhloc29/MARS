@@ -9,7 +9,9 @@ import torch.nn.functional as F
 
 
 def compatibility(model_params, query, nodes, bias, mask):
+
     score = torch.matmul(query, nodes.transpose(1, 2))
+
     score = score / model_params["sqrt_embedding_dim"] + bias
     score = model_params["logit_clipping"] * torch.tanh(score) + mask
     return F.softmax(score, dim=-1).squeeze(1)
@@ -98,6 +100,7 @@ class UpperModel(nn.Module):
         self.params["eval_type"] = strategy
 
     def pre_forward(self, reset_state):
+        # reset state has data type
         depot_demand = torch.zeros(
             reset_state.depot_xy.shape[0], 1, 1, device=reset_state.depot_xy.device)
         depot = torch.cat((reset_state.depot_xy, depot_demand), dim=2)

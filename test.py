@@ -14,7 +14,7 @@ from rl4co.models.zoo.sil import SIL
 from rl4co.models.zoo.l2r import L2RModel
 from rl4co.models.zoo.icam import ICAMCVRP
 from rl4co.models.zoo.invit import INViT
-from train import SlotDataset
+from rl4co.data.slot_dataset import SlotDataset
 from rl4co.data.transforms import StateAugmentation
 from rl4co.data.utils import load_npz_to_tensordict
 

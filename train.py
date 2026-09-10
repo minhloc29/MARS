@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import time
 
@@ -18,6 +17,8 @@ try:
     HAVE_WANDB = True
 except Exception:
     HAVE_WANDB = False
+
+from rl4co.data.slot_dataset import make_dataloader
 
 try:
     from rl4co.envs import CVRPEnv
@@ -39,9 +40,6 @@ except Exception as e:
 REPO_ROOT = Path(__file__).resolve().parent
 LOCAL_DATA_DIR = REPO_ROOT / "data" / "slot_datasets_v2"
 MARS_DATA_DIR = REPO_ROOT.parent / "MARS" / "data" / "slot_datasets_v2"
-# This integration checkout and the original MARS checkout commonly live next
-# to one another. Reuse the existing 5 GB cache by default instead of requiring
-# a duplicate; a local cache remains preferred when one is present.
 DEFAULT_DATA_DIR = LOCAL_DATA_DIR if LOCAL_DATA_DIR.exists() else MARS_DATA_DIR
 
 
@@ -59,101 +57,53 @@ MODEL_CLASSES = {
 }
 
 
-class SlotDataset(torch.utils.data.Dataset):
-    """Wraps cached .pt files from generate_slot_dataset.py (sparse_v2)."""
-
-    def __init__(self, filepath: str | Path, variant: str = "D", max_instances: int | None = None,
-                 include_instance_id: bool = False):
-        data = torch.load(filepath, map_location="cpu", weights_only=False)
-
-        # Format version sanity check (reject old dense d_ins)
-        fmt = data.get("format_version", None)
-        if fmt is None:
-            if "d_ins" in data:
-                raise RuntimeError(
-                    f"Old dense d_ins format detected in {filepath}.\n"
-                    "Please regenerate datasets using the updated generate_slot_dataset.py "
-                    "which produces sparse_v2 format (d_ins_idx + d_ins_val).\n"
-                    "Command: python -m rl4co.data.generate_slot_dataset --num_locs N --dist DIST ..."
-                )
-        elif fmt != "sparse_v2":
-            raise RuntimeError(
-                f"Unknown dataset format_version: '{fmt}' in {filepath}")
-
-        self.locs = data["locs"]     # (N_inst, N, 2)
-        self.depot = data["depot"]    # (N_inst, 2)
-        self.demand = data["demand"]   # (N_inst, N)
-        self.capacity = data.get("capacity", None)
-        # d_ins cost-method tag stamped by the generator; None for legacy datasets.
-        self.method: str | None = data.get("method", None)
-
-        # Sparse d_ins only needed for Variant D
-        needs_dins = variant == "D"
-        self.d_ins_idx = data.get(
-            "d_ins_idx", None) if needs_dins else None  # (N_inst,N,k) int16
-        self.d_ins_val = data.get(
-            "d_ins_val", None) if needs_dins else None  # (N_inst,N,k) float32
-        self.variant = variant
-        self.include_instance_id = include_instance_id
-
-        if max_instances is not None:
-            self.locs = self.locs[:max_instances]
-            self.depot = self.depot[:max_instances]
-            self.demand = self.demand[:max_instances]
-            if self.capacity is not None:
-                self.capacity = self.capacity[:max_instances]
-            if self.d_ins_idx is not None:
-                self.d_ins_idx = self.d_ins_idx[:max_instances]
-            if self.d_ins_val is not None:
-                self.d_ins_val = self.d_ins_val[:max_instances]
-
-    def __len__(self):
-        return len(self.locs)
-
-    def __getitem__(self, idx):
-        item = {
-            "locs":   self.locs[idx],    # (N, 2)
-            "depot":  self.depot[idx],   # (2,)
-            "demand": self.demand[idx],  # (N,)
-        }
-        if self.capacity is not None:
-            item["capacity"] = self.capacity[idx]   # (1,)
-        if self.d_ins_idx is not None:
-            item["d_ins_idx"] = self.d_ins_idx[idx]  # (N, k) int16
-        if self.d_ins_val is not None:
-            item["d_ins_val"] = self.d_ins_val[idx]  # (N, k) float32
-        if self.include_instance_id:
-            item["instance_id"] = torch.tensor(idx, dtype=torch.long)
-        return item
-
-    def signature(self):
-        """Identify the actual cached CVRP inputs before reusing SIL labels."""
-        digest = hashlib.sha256()
-        for tensor in (self.locs, self.depot, self.demand):
-            digest.update(str((tuple(tensor.shape), tensor.dtype)).encode())
-            digest.update(memoryview(tensor.contiguous().numpy()).cast("B"))
-        return digest.hexdigest()
+BASELINE_BACKBONES = {"sil", "invit", "dgl", "elg"}
 
 
-def _collate_fn(batch: list[dict]) -> dict:
-    """Collate dicts -> batched dict; shared_step converts to TensorDict internally."""
-    keys = batch[0].keys()
-    return {k: torch.stack([b[k] for b in batch], dim=0) for k in keys}
-
-
-def make_dataloader(filepath: str, metric_variant: str, batch_size: int, shuffle: bool, max_instances: int | None = None,
-                    include_instance_id: bool = False, seed: int = 42, num_workers: int = 4):
-    ds = SlotDataset(filepath, variant=metric_variant, max_instances=max_instances,
-                     include_instance_id=include_instance_id)
-    return torch.utils.data.DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=num_workers > 0,
-        generator=torch.Generator().manual_seed(seed),
+def _make_trainer(run_name: str, log_path: Path, epochs: int, device: int,
+                  logger: str, gradient_clip_val: float | None):
+  
+    checkpoint_cb = ModelCheckpoint(
+        dirpath=log_path / "checkpoints",
+        monitor="val/reward",
+        mode="max",
+        save_top_k=1,
+        filename="best-{epoch:03d}-{val/reward:.4f}",
     )
+    early_stop_cb = EarlyStopping(
+        monitor="val/reward",
+        patience=20,
+        mode="max",
+    )
+
+    if logger == "wandb":
+        if not HAVE_WANDB:
+            raise RuntimeError(
+                "wandb requested but WandbLogger is not installed. "
+                "Run `pip install wandb lightning` and login with `wandb login`."
+            )
+        logger_obj = WandbLogger(
+            project="MeTRA_Slot_NCO",
+            name=run_name,
+            log_model="all",
+        )
+    else:
+        logger_obj = CSVLogger(save_dir=str(log_path), name="metrics")
+
+    # Trainer (single GPU; --device picks the index)
+    use_cuda = torch.cuda.is_available()
+    trainer = pl.Trainer(
+        max_epochs=epochs,
+        accelerator="gpu" if use_cuda else "cpu",
+        devices=[device] if use_cuda else 1,
+        strategy="auto",
+        callbacks=[checkpoint_cb, early_stop_cb],
+        logger=logger_obj,
+        gradient_clip_val=gradient_clip_val,
+        enable_progress_bar=True,
+        log_every_n_steps=10,
+    )
+    return trainer, checkpoint_cb, early_stop_cb
 
 
 def train(
@@ -316,13 +266,13 @@ def train(
         )
 
     # Data
-    baseline_backbones = {"sil", "invit", "dgl", "elg"}
-    data_variant = "none" if backbone in baseline_backbones else metric_variant
+    data_variant = "none" if backbone in BASELINE_BACKBONES else metric_variant
     loader_kwargs = dict(seed=seed, num_workers=num_workers)
-    train_loader = make_dataloader(train_path, data_variant, batch_size, shuffle=True,
-                                   max_instances=n_train_eff, include_instance_id=backbone in {"sil", "dgl"}, **loader_kwargs)
-    val_loader = make_dataloader(val_path, data_variant, batch_size, shuffle=False,
-                                 max_instances=n_val_eff, **loader_kwargs)
+    train_loader = make_dataloader(train_path, batch_size, shuffle=True,
+                                   variant=data_variant, max_instances=n_train_eff,
+                                   include_instance_id=backbone in {"sil", "dgl"}, **loader_kwargs)
+    val_loader = make_dataloader(val_path, batch_size, shuffle=False,
+                                 variant=data_variant, max_instances=n_val_eff, **loader_kwargs)
     for loader in (train_loader, val_loader):
         if len(loader.dataset) == 0 or loader.dataset.locs.shape[1] != num_loc:
             raise ValueError(
@@ -330,7 +280,7 @@ def train(
 
     # Validate d_ins cost method (Variant D consumes d_ins). The data was baked
     # with a specific method; refuse a mismatch so we never train on the wrong cost.
-    if metric_variant == "D" and backbone not in baseline_backbones:
+    if metric_variant == "D" and backbone not in BASELINE_BACKBONES:
         data_method = train_loader.dataset.method
         if data_method is not None and data_method != ins_method:
             raise RuntimeError(
@@ -421,7 +371,7 @@ def train(
     elif backbone == "am":
         model_kwargs["baseline"] = baseline if baseline is not None else "shared"
     # disable_slots: run backbone as a true no-slot baseline (no slot/aux).
-    if disable_slots and backbone not in baseline_backbones:
+    if disable_slots and backbone not in BASELINE_BACKBONES:
         model_kwargs["disable_slots"] = True
     model = model_cls(**model_kwargs)
     if backbone == "sil":
@@ -462,46 +412,10 @@ def train(
                     f"{ins_method}{norm_tag}_seed{seed}{base_suffix}")
     log_path = Path(output) / run_name
 
-    checkpoint_cb = ModelCheckpoint(
-        dirpath=log_path / "checkpoints",
-        monitor="val/reward",
-        mode="max",
-        save_top_k=1,
-        filename="best-{epoch:03d}-{val/reward:.4f}",
+    trainer, checkpoint_cb, _ = _make_trainer(
+        run_name, log_path, epochs, device, logger,
+        gradient_clip_val=None if backbone in BASELINE_BACKBONES else 1.0,
     )
-    early_stop_cb = EarlyStopping(
-        monitor="val/reward",
-        patience=20,
-        mode="max",
-    )
-    if logger == "wandb":
-        if not HAVE_WANDB:
-            raise RuntimeError(
-                "wandb requested but WandbLogger is not installed. "
-                "Run `pip install wandb lightning` and login with `wandb login`."
-            )
-        logger_obj = WandbLogger(
-            project="MeTRA_Slot_NCO",
-            name=run_name,
-            log_model="all",
-        )
-    else:
-        logger_obj = CSVLogger(save_dir=str(log_path), name="metrics")
-
-    # Trainer (single GPU; --device picks the index)
-    use_cuda = torch.cuda.is_available()
-    trainer_kwargs = dict(
-        max_epochs=epochs,
-        accelerator="gpu" if use_cuda else "cpu",
-        devices=[device] if use_cuda else 1,
-        strategy="auto",
-        callbacks=[checkpoint_cb, early_stop_cb],
-        logger=logger_obj,
-        gradient_clip_val=None if backbone in baseline_backbones else 1.0,
-        enable_progress_bar=True,
-        log_every_n_steps=10,
-    )
-    trainer = pl.Trainer(**trainer_kwargs)
 
     print(f"\n{'='*60}")
     print(f"Training {model_cls.__name__} | N={num_loc} | {dist}")
@@ -535,8 +449,8 @@ def train(
     ) if checkpoint_cb.best_model_score else None
     result = {
         "backbone": backbone,
-        "metric_variant": None if backbone in baseline_backbones else metric_variant,
-        "num_slots": None if backbone in baseline_backbones else num_slots,
+        "metric_variant": None if backbone in BASELINE_BACKBONES else metric_variant,
+        "num_slots": None if backbone in BASELINE_BACKBONES else num_slots,
         "num_loc": num_loc,
         "dist": dist,
         "seed": seed,
@@ -625,10 +539,6 @@ def train(
     return result
 
 
-# ---------------------------------------------------------------------------
-# LEHD / TTPL standalone training branch
-# ---------------------------------------------------------------------------
-
 def _train_lehd(
     backbone: str,
     num_loc: int,
@@ -690,46 +600,8 @@ def _train_lehd(
     )
     log_path = Path(output) / run_name
 
-    checkpoint_cb = ModelCheckpoint(
-        dirpath=log_path / "checkpoints",
-        monitor="val/reward",
-        mode="max",
-        save_top_k=1,
-        filename="best-{epoch:03d}-{val/reward:.4f}",
-    )
-    early_stop_cb = EarlyStopping(
-        monitor="val/reward",
-        patience=20,
-        mode="max",
-    )
-
-    if logger == "wandb":
-        if not HAVE_WANDB:
-            raise RuntimeError(
-                "wandb requested but WandbLogger is not installed. "
-                "Run `pip install wandb lightning` and login with `wandb login`."
-            )
-        logger_obj = WandbLogger(
-            project="MeTRA_Slot_NCO",
-            name=run_name,
-            log_model="all",
-        )
-    else:
-        logger_obj = CSVLogger(save_dir=str(log_path), name="metrics")
-
-    use_cuda = torch.cuda.is_available()
-    trainer = pl.Trainer(
-        max_epochs=epochs,
-        accelerator="gpu" if use_cuda else "cpu",
-        devices=[device] if use_cuda else 1,
-        strategy="auto",
-        callbacks=[checkpoint_cb, early_stop_cb],
-        logger=logger_obj,
-        # LEHD clips manually per step (not used here)
-        gradient_clip_val=None,
-        enable_progress_bar=True,
-        log_every_n_steps=10,
-    )
+    trainer, checkpoint_cb, _ = _make_trainer(
+        run_name, log_path, epochs, device, logger, gradient_clip_val=None)
 
     print(f"\n{'='*60}")
     print(f"Training {model_cls.__name__} | N={num_loc}")
