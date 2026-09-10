@@ -95,8 +95,10 @@ This will create a new virtual environment in `.venv/` and install all dependenc
 
 ## Usage
 
-For MARS slot models and the integrated SIL CVRP baseline on the same cached
-datasets, see [SIL training and comparison commands](rl4co/models/zoo/sil/README.md).
+MARS and the integrated CVRP baselines can train on the same cached instance
+splits through `train.py`. Method-specific commands and fairness notes are in the
+[SIL](rl4co/models/zoo/sil/README.md), [DGL](rl4co/models/zoo/dgl/README.md), and
+[ELG](rl4co/models/zoo/elg/README.md) guides.
 
 
 Train model with default configuration (AM on TSP environment):

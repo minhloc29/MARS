@@ -4,11 +4,13 @@ import argparse
 import hashlib
 import json
 import time
+
 from pathlib import Path
 
-import torch
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
+import torch
+
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
 
 try:
@@ -19,13 +21,15 @@ except Exception:
 
 try:
     from rl4co.envs import CVRPEnv
-    from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
-    from rl4co.models.zoo.sil import SIL
-    from rl4co.models.zoo.l2r import L2RModel
+    from rl4co.models.zoo.dgl import DGL
+    from rl4co.models.zoo.elg import ELG
     from rl4co.models.zoo.icam import ICAMCVRP
     from rl4co.models.zoo.invit import INViT
+    from rl4co.models.zoo.l2r import L2RModel
     from rl4co.models.zoo.lehd import LEHDModel, TTRLModel
     from rl4co.models.zoo.lehd.model import make_lehd_dataloaders
+    from rl4co.models.zoo.pomo_slot import AMSlot, POMOSlot
+    from rl4co.models.zoo.sil import SIL
     FULL_RL4CO = True
 except Exception as e:
     print(f"[WARN] Full rl4co import failed: {e}")
@@ -33,7 +37,12 @@ except Exception as e:
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_DATA_DIR = REPO_ROOT / "data" / "slot_datasets_v2"
+LOCAL_DATA_DIR = REPO_ROOT / "data" / "slot_datasets_v2"
+MARS_DATA_DIR = REPO_ROOT.parent / "MARS" / "data" / "slot_datasets_v2"
+# This integration checkout and the original MARS checkout commonly live next
+# to one another. Reuse the existing 5 GB cache by default instead of requiring
+# a duplicate; a local cache remains preferred when one is present.
+DEFAULT_DATA_DIR = LOCAL_DATA_DIR if LOCAL_DATA_DIR.exists() else MARS_DATA_DIR
 
 
 MODEL_CLASSES = {
@@ -42,6 +51,8 @@ MODEL_CLASSES = {
     "l2r": L2RModel,
     "icam": ICAMCVRP,
     "invit": INViT,
+    "dgl": DGL,
+    "elg": ELG,
     "sil": SIL,
     "lehd": LEHDModel,
     "ttpl": TTRLModel,
@@ -200,6 +211,25 @@ def train(
     invit_baseline_tolerance: float = 1e-3,
     invit_scheduler_gamma: float = 0.99,
     invit_backprop_chunk_size: int = 16,
+    # ---- DGL baseline arguments ----
+    dgl_knn: int = 100,
+    dgl_depot_knn: int = 100,
+    dgl_pomo_size: int = 16,
+    dgl_num_layers: int = 3,
+    dgl_num_heads: int = 8,
+    dgl_feedforward_dim: int | None = None,
+    dgl_improve_every: int = 1,
+    # ---- ELG baseline arguments ----
+    elg_pomo_size: int = 50,
+    elg_num_layers: int = 6,
+    elg_num_heads: int = 8,
+    elg_feedforward_dim: int | None = None,
+    elg_local_size: int = 40,
+    elg_local_dim: int = 32,
+    elg_local_heads: int = 4,
+    elg_mode: str = "joint",
+    elg_warmup_epochs: int = 0,
+    elg_scale_norm: bool = True,
 ):
     assert FULL_RL4CO, (
         "Full rl4co import failed. Ensure torchrl DLL is installed correctly "
@@ -286,11 +316,11 @@ def train(
         )
 
     # Data
-    baseline_backbones = {"sil", "invit"}
+    baseline_backbones = {"sil", "invit", "dgl", "elg"}
     data_variant = "none" if backbone in baseline_backbones else metric_variant
     loader_kwargs = dict(seed=seed, num_workers=num_workers)
     train_loader = make_dataloader(train_path, data_variant, batch_size, shuffle=True,
-                                   max_instances=n_train_eff, include_instance_id=backbone == "sil", **loader_kwargs)
+                                   max_instances=n_train_eff, include_instance_id=backbone in {"sil", "dgl"}, **loader_kwargs)
     val_loader = make_dataloader(val_path, data_variant, batch_size, shuffle=False,
                                  max_instances=n_val_eff, **loader_kwargs)
     for loader in (train_loader, val_loader):
@@ -372,6 +402,22 @@ def train(
             backprop_chunk_size=invit_backprop_chunk_size,
             optimizer_kwargs={"lr": lr},
         )
+    elif backbone == "dgl":
+        model_kwargs = dict(
+            env=env, embed_dim=embed_dim, num_layers=dgl_num_layers,
+            num_heads=dgl_num_heads, feedforward_dim=dgl_feedforward_dim,
+            knn=dgl_knn, depot_knn=dgl_depot_knn, pomo_size=dgl_pomo_size,
+            improve_every=dgl_improve_every, optimizer_kwargs={"lr": lr},
+        )
+    elif backbone == "elg":
+        model_kwargs = dict(
+            env=env, embed_dim=embed_dim, num_layers=elg_num_layers,
+            num_heads=elg_num_heads, feedforward_dim=elg_feedforward_dim,
+            local_size=elg_local_size, local_dim=elg_local_dim,
+            local_heads=elg_local_heads, pomo_size=elg_pomo_size,
+            mode=elg_mode, warmup_epochs=elg_warmup_epochs,
+            scale_norm=elg_scale_norm, optimizer_kwargs={"lr": lr},
+        )
     elif backbone == "am":
         model_kwargs["baseline"] = baseline if baseline is not None else "shared"
     # disable_slots: run backbone as a true no-slot baseline (no slot/aux).
@@ -379,6 +425,8 @@ def train(
         model_kwargs["disable_slots"] = True
     model = model_cls(**model_kwargs)
     if backbone == "sil":
+        model.dataset_signature = train_loader.dataset.signature()
+    elif backbone == "dgl":
         model.dataset_signature = train_loader.dataset.signature()
 
     # run_name uniquely IDs the run (backbone, variant, K, N, dist, seed, ins_method,
@@ -399,6 +447,14 @@ def train(
                     f"_a{invit_action_size}_s{state_tag}_h{invit_num_heads}"
                     f"_se{invit_state_encoder_layers}_ae{invit_action_encoder_layers}"
                     f"_de{invit_decoder_layers}_c{invit_backprop_chunk_size}")
+    elif backbone == "dgl":
+        run_name = (f"dgl_N{num_loc}_{dist}_{ins_method}_seed{seed}_d{embed_dim}"
+                    f"_k{dgl_knn}-{dgl_depot_knn}_p{dgl_pomo_size}"
+                    f"_l{dgl_num_layers}_i{dgl_improve_every}")
+    elif backbone == "elg":
+        run_name = (f"elg_N{num_loc}_{dist}_{ins_method}_seed{seed}_d{embed_dim}"
+                    f"_p{elg_pomo_size}_l{elg_num_layers}_local{elg_local_size}"
+                    f"_{elg_mode}_w{elg_warmup_epochs}")
     elif disable_slots:
         run_name = f"{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
     else:
@@ -456,6 +512,14 @@ def train(
               f"max_subtour_length={sil_max_subtour_length}, update_mode={sil_update_mode}, "
               f"PRC={sil_parallel_reconstruction}")
         print("  Slot/metric/entropy flags do not apply to SIL; ins_method selects the shared data folder.")
+    elif backbone == "dgl":
+        print(f"  DGL: knn={dgl_knn}, depot_knn={dgl_depot_knn}, pomo={dgl_pomo_size}, "
+              f"layers={dgl_num_layers}, improve_every={dgl_improve_every}")
+        print("  Slot/metric/entropy flags do not apply to DGL; ins_method selects the shared data folder.")
+    elif backbone == "elg":
+        print(f"  ELG: pomo={elg_pomo_size}, layers={elg_num_layers}, "
+              f"local_size={elg_local_size}, mode={elg_mode}, warmup={elg_warmup_epochs}")
+        print("  Slot/metric/entropy flags do not apply to ELG; ins_method selects the shared data folder.")
     else:
         print(
             f"  Slots: K={num_slots}  proj_dim={proj_dim}  iters={slot_iters}")
@@ -471,8 +535,8 @@ def train(
     ) if checkpoint_cb.best_model_score else None
     result = {
         "backbone": backbone,
-        "metric_variant": None if backbone == "sil" else metric_variant,
-        "num_slots": None if backbone == "sil" else num_slots,
+        "metric_variant": None if backbone in baseline_backbones else metric_variant,
+        "num_slots": None if backbone in baseline_backbones else num_slots,
         "num_loc": num_loc,
         "dist": dist,
         "seed": seed,
@@ -510,6 +574,24 @@ def train(
             invit_scheduler_gamma=invit_scheduler_gamma,
             invit_backprop_chunk_size=invit_backprop_chunk_size,
         )
+    elif backbone == "dgl":
+        result.update(
+            normalize_target=None, symmetrize_target=None,
+            dgl_knn=dgl_knn, dgl_depot_knn=dgl_depot_knn,
+            dgl_pomo_size=dgl_pomo_size, dgl_num_layers=dgl_num_layers,
+            dgl_num_heads=dgl_num_heads, dgl_feedforward_dim=dgl_feedforward_dim or 4 * embed_dim,
+            dgl_improve_every=dgl_improve_every,
+            dataset_signature=model.dataset_signature,
+        )
+    elif backbone == "elg":
+        result.update(
+            normalize_target=None, symmetrize_target=None,
+            elg_pomo_size=elg_pomo_size, elg_num_layers=elg_num_layers,
+            elg_num_heads=elg_num_heads, elg_feedforward_dim=elg_feedforward_dim or 4 * embed_dim,
+            elg_local_size=elg_local_size, elg_local_dim=elg_local_dim,
+            elg_local_heads=elg_local_heads, elg_mode=elg_mode,
+            elg_warmup_epochs=elg_warmup_epochs, elg_scale_norm=elg_scale_norm,
+        )
 
     # Dedup identical configs: rerun replaces, never appends a duplicate row.
     result_dir = Path(output)
@@ -529,6 +611,11 @@ def train(
     elif backbone == "invit":
         dedup_key.update({k: v for k, v in result.items()
                          if k.startswith("invit_")})
+    elif backbone == "dgl":
+        dedup_key.update({k: v for k, v in result.items() if k.startswith("dgl_")})
+        dedup_key.update({"dataset_signature": result["dataset_signature"]})
+    elif backbone == "elg":
+        dedup_key.update({k: v for k, v in result.items() if k.startswith("elg_")})
     results = [r for r in results if not all(
         r.get(k) == v for k, v in dedup_key.items())]
     results.append(result)
@@ -709,14 +796,14 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max_instances", type=int, default=None)
     parser.add_argument("--backbone", default="pomo",
-                        choices=["pomo", "am", "l2r", "icam", "sil", "invit", "lehd", "ttpl"])
+                        choices=["pomo", "am", "l2r", "icam", "sil", "invit", "dgl", "elg", "lehd", "ttpl"])
     parser.add_argument("--embed_dim", type=int, default=128)
     parser.add_argument("--num_slots", type=int, default=8)
     parser.add_argument("--proj_dim", type=int, default=64)
     parser.add_argument("--slot_iters", type=int, default=3)
     parser.add_argument("--lambda_init", type=float, default=1.0)
     parser.add_argument("--lr_dual", type=float, default=1e-4)
-    parser.add_argument("--metric_variant", default="D",
+    parser.add_argument("--metric_variant", "--variant", default="D",
                         choices=["none", "A", "B", "C", "D"])
     parser.add_argument("--alpha_metric", type=float, default=0.1)
     parser.add_argument("--beta_entropy", type=float, default=0.01)
@@ -761,6 +848,23 @@ def main():
     parser.add_argument("--invit_baseline_tolerance", type=float, default=1e-3)
     parser.add_argument("--invit_scheduler_gamma", type=float, default=0.99)
     parser.add_argument("--invit_backprop_chunk_size", type=int, default=16)
+    parser.add_argument("--dgl_knn", type=int, default=100)
+    parser.add_argument("--dgl_depot_knn", type=int, default=100)
+    parser.add_argument("--dgl_pomo_size", type=int, default=16)
+    parser.add_argument("--dgl_num_layers", type=int, default=3)
+    parser.add_argument("--dgl_num_heads", type=int, default=8)
+    parser.add_argument("--dgl_feedforward_dim", type=int, default=None)
+    parser.add_argument("--dgl_improve_every", type=int, default=1)
+    parser.add_argument("--elg_pomo_size", type=int, default=50)
+    parser.add_argument("--elg_num_layers", type=int, default=6)
+    parser.add_argument("--elg_num_heads", type=int, default=8)
+    parser.add_argument("--elg_feedforward_dim", type=int, default=None)
+    parser.add_argument("--elg_local_size", type=int, default=40)
+    parser.add_argument("--elg_local_dim", type=int, default=32)
+    parser.add_argument("--elg_local_heads", type=int, default=4)
+    parser.add_argument("--elg_mode", choices=["joint", "only_global", "only_local"], default="joint")
+    parser.add_argument("--elg_warmup_epochs", type=int, default=0)
+    parser.add_argument("--elg_no_scale_norm", dest="elg_scale_norm", action="store_false")
     args = parser.parse_args()
 
     train(
@@ -799,6 +903,23 @@ def main():
         invit_baseline_tolerance=args.invit_baseline_tolerance,
         invit_scheduler_gamma=args.invit_scheduler_gamma,
         invit_backprop_chunk_size=args.invit_backprop_chunk_size,
+        dgl_knn=args.dgl_knn,
+        dgl_depot_knn=args.dgl_depot_knn,
+        dgl_pomo_size=args.dgl_pomo_size,
+        dgl_num_layers=args.dgl_num_layers,
+        dgl_num_heads=args.dgl_num_heads,
+        dgl_feedforward_dim=args.dgl_feedforward_dim,
+        dgl_improve_every=args.dgl_improve_every,
+        elg_pomo_size=args.elg_pomo_size,
+        elg_num_layers=args.elg_num_layers,
+        elg_num_heads=args.elg_num_heads,
+        elg_feedforward_dim=args.elg_feedforward_dim,
+        elg_local_size=args.elg_local_size,
+        elg_local_dim=args.elg_local_dim,
+        elg_local_heads=args.elg_local_heads,
+        elg_mode=args.elg_mode,
+        elg_warmup_epochs=args.elg_warmup_epochs,
+        elg_scale_norm=args.elg_scale_norm,
     )
 
 
