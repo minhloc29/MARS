@@ -47,6 +47,40 @@ def _pick_device(value: str | None) -> torch.device:
     return torch.device("cpu")
 
 
+def _load_npz(data_path: str, num_loc: int) -> TensorDict:
+   
+    td = load_npz_to_tensordict(data_path)
+
+    # _reset prepends the depot row, so locs here must be the N customers only.
+    n_rows = td["locs"].shape[-2]
+    if n_rows == num_loc + 1:
+        if "depot" not in td.keys():
+            raise RuntimeError(
+                f"{data_path}: locs has {n_rows} rows (= num_loc+1, depot already "
+                "included) but no separate 'depot' key — the env always prepends the "
+                "depot, so locs must be the {num_loc} customers only."
+            )
+        td.set("locs", td["locs"][:, 1:])  # strip the depot row the env will re-add
+    elif n_rows != num_loc:
+        raise RuntimeError(
+            f"{data_path}: num_loc mismatch — requested --num_loc {num_loc} but locs has "
+            f"{n_rows} rows. Expected {num_loc} customers with a separate 'depot' key."
+        )
+    return td
+
+
+def _batch_iter(ds, batch_size: int):
+    """Yield fixed-size batches from either a batched TensorDict (npz) or a
+    list of TensorDicts (generated), without DataLoader collation."""
+    n = ds.shape[0] if isinstance(ds, TensorDict) else len(ds)
+    is_td = isinstance(ds, TensorDict)
+    for i in range(0, n, batch_size):
+        chunk = ds[i:i + batch_size]
+        if not is_td:
+            chunk = torch.stack(chunk)
+        yield chunk
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate a routing checkpoint at a target size")
@@ -61,7 +95,7 @@ def main() -> None:
     parser.add_argument("--n_inst", type=int, default=1000,
                         help="Number of eval instances")
     parser.add_argument("--batch_size", type=int,
-                        default=256, help="Eval batch size")
+                        default=128, help="Eval batch size")
     parser.add_argument("--num_starts", type=int, default=None,
                         help="Multi-start greedy for POMO checkpoints (1 = single-start/AM). Default: policy default.")
     parser.add_argument("--augment", action="store_true",
@@ -94,20 +128,11 @@ def main() -> None:
         model.labels.clear()
         model.best_policy_state = model.repair_policy_state = None
 
-    # Use the shared cached split when supplied, otherwise seeded fresh instances.
+    # Use the shared cached npz split when supplied, otherwise seeded fresh instances.
     if args.data_path:
-        ds = load_npz_to_tensordict(args.data_path)
+        ds = _load_npz(args.data_path, num_loc)
     else:
-        ds = (SlotDataset(args.data_path, variant="none", max_instances=args.n_inst)
-              if args.data_path else env.dataset(batch_size=[args.n_inst]))
-
-    collate_fn = getattr(ds, "collate_fn", None)
-    if collate_fn is None and not args.data_path:
-        collate_fn = torch.stack  # TensorDict supports stacking a list of TensorDicts
-
-    loader = torch.utils.data.DataLoader(
-        ds, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn
-    )
+        ds = env.dataset(batch_size=[args.n_inst])
 
     model.eval()
 
@@ -115,7 +140,7 @@ def main() -> None:
     rewards = []
     actual_num_starts = 1
     with torch.no_grad():
-        for batch in loader:
+        for batch in _batch_iter(ds, args.batch_size):
             if isinstance(batch, dict):
                 batch = TensorDict(batch, batch_size=[batch["demand"].size(0)])
             batch = batch.to(device)
@@ -181,6 +206,11 @@ def main() -> None:
         Path(args.out).write_text(json.dumps(result, indent=2))
         print(f"Saved to {args.out}")
 
+    elif args.out is None:
+        out_path = Path("results") / f"eval_{args.model}_{num_loc}_{args.seed}.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(result, indent=2))
+        print(f"Saved to {out_path}")
 
 if __name__ == "__main__":
     main()
