@@ -21,11 +21,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate & cache a CVRP eval dataset")
     parser.add_argument("--num_loc", type=int, required=True,
                         help="Number of CUSTOMERS N (must match --num_loc in test.py).")
-    parser.add_argument("--n_inst", type=int, default=1024, help="Number of instances")
+    parser.add_argument("--n_inst", type=int, default=1000, help="Number of instances")
     parser.add_argument("--seed", type=int, default=1234,
                         help="Seed for the generated instances. Use the SAME seed as "
                              "test.py so the eval set is reproducible / comparable.")
-    parser.add_argument("--out", type=str, required=True, help="Output .npz path to save.")
+    parser.add_argument("--out", type=str, help="Output .npz path to save.")
     parser.add_argument("--loc_dist", type=str, default="uniform",
                         choices=["uniform", "gaussian", "cluster", "gaussian_mixture",
                                  "mixed", "mix_distribution", "exponential", "poisson"],
@@ -41,9 +41,9 @@ def main() -> None:
                            help="cluster: number of clusters.")
     dist_args.add_argument("--n_cluster_mix", type=int, default=None,
                            help="mixed/mix_distribution: number of mixed-cluster points.")
-    dist_args.add_argument("--loc_mean", type=float, default=None,
+    dist_args.add_argument("--loc_mean", type=float, default=0.5,
                            help="gaussian: mean of the location Normal distribution.")
-    dist_args.add_argument("--loc_std", type=float, default=None,
+    dist_args.add_argument("--loc_std", type=float, default=0.2,
                            help="gaussian: std of the location Normal distribution.")
     dist_args.add_argument("--loc_rate", type=float, default=None,
                            help="exponential/poisson: rate parameter.")
@@ -67,7 +67,16 @@ def main() -> None:
     env = CVRPEnv(generator_params=generator_params)
     td = env.generator([args.n_inst])
 
-    out = Path(args.out)
+    if args.out is None:
+            if args.loc_dist == "uniform":
+                out = Path(f"data/test/cvrp_{args.num_loc}_uniform_seed{args.seed}.npz")
+            elif args.loc_dist == "gaussian":
+                out = Path(f"data/test/cvrp_{args.num_loc}_gaussian_mean{args.loc_mean}_std{args.loc_std}_seed{args.seed}.npz")
+            elif args.loc_dist == "cluster":
+                out = Path(f"data/test/cvrp_{args.num_loc}_cluster_n{args.n_cluster}_seed{args.seed}.npz")
+    else:
+        out = Path(args.out)
+    
     out.parent.mkdir(parents=True, exist_ok=True)
     save_tensordict_to_npz(td, out)
     print(f"[OK] generated {len(td)} CVRP instances at num_loc={args.num_loc} "

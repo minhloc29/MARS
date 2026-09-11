@@ -58,7 +58,7 @@ def main() -> None:
                         help="Cached MARS .pt test split shared across methods; recommended for comparisons")
     parser.add_argument("--num_loc", type=int, required=True,
                         help="Target number of CUSTOMERS N (e.g. 50/100/200/500/1000).")
-    parser.add_argument("--n_inst", type=int, default=1024,
+    parser.add_argument("--n_inst", type=int, default=1000,
                         help="Number of eval instances")
     parser.add_argument("--batch_size", type=int,
                         default=256, help="Eval batch size")
@@ -95,8 +95,8 @@ def main() -> None:
         model.best_policy_state = model.repair_policy_state = None
 
     # Use the shared cached split when supplied, otherwise seeded fresh instances.
-    if args.data:
-        ds = load_npz_to_tensordict(args.data)
+    if args.data_path:
+        ds = load_npz_to_tensordict(args.data_path)
     else:
         ds = (SlotDataset(args.data_path, variant="none", max_instances=args.n_inst)
               if args.data_path else env.dataset(batch_size=[args.n_inst]))
