@@ -60,9 +60,10 @@ MODEL_CLASSES = {
 BASELINE_BACKBONES = {"sil", "invit", "dgl", "elg"}
 
 
-def _make_trainer(run_name: str, log_path: Path, epochs: int, device: int,
-                  logger: str, gradient_clip_val: float | None):
-  
+def _make_trainer(run_name: str, log_path: Path, epochs: int,
+                  device: int | list[int], logger: str,
+                  gradient_clip_val: float | None):
+
     checkpoint_cb = ModelCheckpoint(
         dirpath=log_path / "checkpoints",
         monitor="val/reward",
@@ -90,13 +91,15 @@ def _make_trainer(run_name: str, log_path: Path, epochs: int, device: int,
     else:
         logger_obj = CSVLogger(save_dir=str(log_path), name="metrics")
 
-    # Trainer (single GPU; --device picks the index)
     use_cuda = torch.cuda.is_available()
+    devices = device if isinstance(device, list) else [device]
+    # One device: single-GPU run. Two or more: parallel DDP (data-parallel).
+    strategy = "ddp" if len(devices) > 1 else "auto"
     trainer = pl.Trainer(
         max_epochs=epochs,
         accelerator="gpu" if use_cuda else "cpu",
-        devices=[device] if use_cuda else 1,
-        strategy="auto",
+        devices=devices if use_cuda else 1,
+        strategy=strategy,
         callbacks=[checkpoint_cb, early_stop_cb],
         logger=logger_obj,
         gradient_clip_val=gradient_clip_val,
@@ -112,7 +115,7 @@ def train(
     data_dir: str | Path = DEFAULT_DATA_DIR,
     output: str = "./output",
     seed: int = 42,
-    device: int = 0,
+    device: int | list[int] = 0,
     n_train: int = 100_000,
     n_val: int = 1_000,
     epochs: int = 100,
@@ -544,7 +547,7 @@ def _train_lehd(
     num_loc: int,
     output: str,
     seed: int,
-    device: int,
+    device: int | list[int],
     embed_dim: int,
     epochs: int,
     batch_size: int,
@@ -660,7 +663,9 @@ def main():
     parser.add_argument("--data_dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--output", default="./output")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--device", type=int, nargs="+", default=[0],
+                        help="GPU id(s) to use. Pass multiple, e.g. `--device 0 1`, "
+                             "for parallel DDP training; single value uses one GPU.")
     parser.add_argument("--n_train", type=int, default=100_000)
     parser.add_argument("--n_val", type=int, default=1_000)
     parser.add_argument("--epochs", type=int, default=100)
