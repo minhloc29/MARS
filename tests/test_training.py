@@ -34,7 +34,6 @@ from rl4co.models.zoo import (
     SymNCO,
 )
 from rl4co.utils import RL4COTrainer
-from rl4co.utils.meta_trainer import ReptileCallback
 
 # Get env variable MAC_OS_GITHUB_RUNNER
 if "MAC_OS_GITHUB_RUNNER" in os.environ:
@@ -131,7 +130,7 @@ def test_mdam():
     trainer.test(model)
 
 
-def test_pomo_reptile():
+def test_pomo_training():
     env = TSPEnv(generator_params=dict(num_loc=20))
     policy = AttentionModelPolicy(
         env_name=env.name,
@@ -149,18 +148,8 @@ def test_pomo_reptile():
         val_data_size=10,
         test_data_size=10,
     )
-    meta_callback = ReptileCallback(
-        data_type="size",
-        sch_bar=0.9,
-        num_tasks=2,
-        alpha=0.99,
-        alpha_decay=0.999,
-        min_size=20,
-        max_size=50,
-    )
     trainer = RL4COTrainer(
         max_epochs=2,
-        callbacks=[meta_callback],
         devices=1,
         accelerator=accelerator,
         limit_train_batches=3,

@@ -48,7 +48,7 @@ class L2RModel(pl.LightningModule):
 
     def _make_dataset(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         required = {"locs", "depot", "demand", "capacity"}
-        missing = required.difference(batch)
+        missing = required.difference(batch.keys())
         if missing:
             raise KeyError(
                 f"L2R CVRP batch is missing keys: {sorted(missing)}")
@@ -58,9 +58,15 @@ class L2RModel(pl.LightningModule):
         demand = batch["demand"].to(dtype=torch.float32)
         if demand.max() > 1.0 + 1e-6:
             demand = demand / capacity
+        node_xy = batch["locs"].to(dtype=torch.float32)
+        # Canonical format: locs = customers only (B, N, 2) with a separate
+        # depot key, matching training. If locs also embeds the depot as its
+        # first row (B, N+1, 2), strip it so node_xy aligns with node_demand.
+        if node_xy.shape[1] == demand.shape[1] + 1:
+            node_xy = node_xy[:, 1:]
         return {
             "depot_xy": batch["depot"].to(dtype=torch.float32).unsqueeze(1),
-            "node_xy": batch["locs"].to(dtype=torch.float32),
+            "node_xy": node_xy,
             "node_demand": demand,
         }
 

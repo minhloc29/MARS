@@ -28,6 +28,7 @@ class SlotInjectingEncoder(nn.Module):
 
     def forward(self, td) -> tuple[torch.Tensor, torch.Tensor]:
         # Run base encoder
+        # td is
         hidden, init_embeds = self.base_encoder(td)  # (B, N+1, d)
 
         # Slot Attention on customer nodes only

@@ -64,13 +64,15 @@ class CVRPEnv(RL4COEnvBase):
         self._make_spec(self.generator)
 
     def _step(self, td: TensorDict) -> TensorDict:
+        # td data type is
         current_node = td["action"][:, None]  # Add dimension for step
-        n_loc = td["demand"].size(-1)  # Excludes depot
+        n_loc = td["demand"].size(-1)  # Excludes depot # example is
 
         # Not selected_demand is demand of first node (by clamp) so incorrect for nodes that visit depot!
         selected_demand = gather_by_index(
             td["demand"], torch.clamp(current_node - 1, 0, n_loc - 1), squeeze=False
         )
+
 
         # Increase capacity if depot is not visited, otherwise set to 0
         used_capacity = (td["used_capacity"] + selected_demand) * (current_node != 0).float()
