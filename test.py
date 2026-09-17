@@ -59,7 +59,7 @@ def main() -> None:
                         help="Number of eval instances")
     parser.add_argument("--batch_size", type=int, default=128,
                         help="Eval batch size")
-    parser.add_argument("--num_starts", type=int, default=None,
+    parser.add_argument("--num_starts", type=int, default=50,
                         help="Multi-start greedy for POMO/AM checkpoints.")
     parser.add_argument("--decode", type=str, default="greedy",
                         choices=["greedy", "sampling", "multistart_greedy",

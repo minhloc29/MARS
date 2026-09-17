@@ -53,6 +53,16 @@ class POMO(REINFORCE):
         num_starts: int = None,
         **kwargs,
     ):
+        policy_kwargs = {**policy_kwargs}
+        for key in ("embed_dim", "num_encoder_layers", "num_heads",
+                    "feedforward_hidden", "normalization", "use_graph_context"):
+            if key in kwargs:
+                policy_kwargs[key] = kwargs.pop(key)
+        for key in ("num_slots", "metric_variant", "alpha_metric", "beta_entropy",
+                    "slot_iters", "proj_dim", "lambda_init", "lr_dual",
+                    "k_neighbors", "ins_method", "disable_slots",
+                    "normalize_target", "symmetrize_target"):
+            kwargs.pop(key, None)
         self.save_hyperparameters(logger=False)
 
         if policy is None:
