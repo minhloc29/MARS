@@ -25,8 +25,6 @@ from rl4co.models.zoo.amppo import AMPPO
 from rl4co.models.zoo.dgl import DGL, DGLPolicy
 from rl4co.models.zoo.elg import ELG, ELGPolicy
 from rl4co.models.zoo.glop import GLOP, GLOPPolicy
-from rl4co.models.zoo.ham import HeterogeneousAttentionModel, HeterogeneousAttentionModelPolicy
 from rl4co.models.zoo.mvmoe import MVMoE_AM, MVMoE_POMO
-from rl4co.models.zoo.neuopt import NeuOpt, NeuOptPolicy
 from rl4co.models.zoo.pomo import POMO
 from rl4co.models.zoo.symnco import SymNCO, SymNCOPolicy
