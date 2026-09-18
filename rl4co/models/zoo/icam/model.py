@@ -197,7 +197,8 @@ class ICAMCVRP(pl.LightningModule):
         # val_metrics only contains "reward", never "max_reward".)
         score = reward.mean(dim=1).mean()
         self.log("val/reward", score, prog_bar=True)
-        return -score
+        return -scorebkai@123
+    
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), **self.optimizer_kwargs)

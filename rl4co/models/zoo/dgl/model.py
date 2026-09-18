@@ -10,7 +10,7 @@ from .policy import DGLPolicy
 
 
 def _nearest_neighbor_labels(batch):
-    """Build the feasible greedy pool used before DGL has learned improvements."""
+
     state = CVRPState.from_batch(batch)
     b = state.batch_size
     state.actions.append(torch.zeros(b, 1, dtype=torch.long, device=state.xy.device))
