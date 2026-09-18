@@ -22,18 +22,11 @@ from rl4co.models.rl.reinforce.baselines import REINFORCEBaseline, get_reinforce
 from rl4co.models.rl.reinforce.reinforce import REINFORCE
 from rl4co.models.zoo.am import AttentionModel, AttentionModelPolicy
 from rl4co.models.zoo.amppo import AMPPO
-from rl4co.models.zoo.dact import DACT, DACTPolicy
 from rl4co.models.zoo.dgl import DGL, DGLPolicy
-from rl4co.models.zoo.deepaco import DeepACO, DeepACOPolicy
-from rl4co.models.zoo.eas import EAS, EASEmb, EASLay
 from rl4co.models.zoo.elg import ELG, ELGPolicy
-from rl4co.models.zoo.gfacs import GFACS, GFACSPolicy
 from rl4co.models.zoo.glop import GLOP, GLOPPolicy
 from rl4co.models.zoo.ham import HeterogeneousAttentionModel, HeterogeneousAttentionModelPolicy
-from rl4co.models.zoo.mdam import MDAM, MDAMPolicy
 from rl4co.models.zoo.mvmoe import MVMoE_AM, MVMoE_POMO
-from rl4co.models.zoo.n2s import N2S, N2SPolicy
-from rl4co.models.zoo.nargnn import NARGNNPolicy
 from rl4co.models.zoo.neuopt import NeuOpt, NeuOptPolicy
 from rl4co.models.zoo.pomo import POMO
 from rl4co.models.zoo.symnco import SymNCO, SymNCOPolicy
