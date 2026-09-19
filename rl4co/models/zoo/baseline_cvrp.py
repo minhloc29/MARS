@@ -54,7 +54,7 @@ class CVRPState:
             distance=torch.cdist(xy, xy),
             visited=torch.zeros(b, width, n1, dtype=torch.bool, device=xy.device),
             load=torch.ones(b, width, device=xy.device),
-            current=torch.  (b, width, dtype=torch.long, device=xy.device),
+            current=torch.zeros(b, width, dtype=torch.long, device=xy.device),
             finished=torch.zeros(b, width, dtype=torch.bool, device=xy.device),
             actions=[],
         )
