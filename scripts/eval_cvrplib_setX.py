@@ -1,16 +1,26 @@
 #!/usr/bin/env python
-"""Evaluate a trained CVRP slot checkpoint on the CVRPLIB Set X benchmark.
+"""Evaluate a trained CVRP checkpoint on the CVRPLIB Set X benchmark.
 
 Set X (Uchoa et al., 2017) contains 100 instances with n from ~100 to ~1000.
 This harness loads the cached copy produced by ``download_cvrplib_setX.py``
 (``data/cvrplib_setX/setX.pt``), converts each instance into the RL4CO CVRP
-env's tensor format, and decodes a solution with a POMO or AM slot
-checkpoint, one instance at a time (N varies per instance).
+env's tensor format, and decodes a solution, one instance at a time (N varies
+per instance).
+
+Supported backbones (the union of ``train.py`` and ``test.py`` model sets):
+  pomo, am, pomo_base, sil, icam, l2r, elg, invit, dgl, radar
+
+``lehd`` and ``ttpl`` are intentionally excluded: they use their own LEHD-format
+``.txt`` data and a separate dataloader (``make_lehd_dataloaders``) rather than
+the shared per-instance TensorDict format used here, so they need a separate
+evaluation flow (see ``_train_lehd`` in ``train.py``).
 
 Reported per instance / aggregate:
   * decoded cost (route length) and gap vs the official best-known: (c - bks)/bks
   * feasibility (RL4CO's CVRP decoder capacity-masks, so routes are feasible by
-    construction; we still verify loads over every route)
+    construction; we still verify loads over every route where actions expose
+    the tour — sil/icam/l2r/invit only surface a scalar reward, so they are
+    marked feasible by construction)
   * mean/std gap, fraction of instances solved, and (optionally) fraction of
     best-known gaps for a size subset.
 
@@ -24,7 +34,7 @@ Limitations (inherent to "evaluate an N=100-trained model on all sizes"):
     routes are still guaranteed).
 
 Run (proxy must be unset for any network; none needed — data is cached):
-    python scripts/eval_cvrplib_setX.py --ckpt <best.ckpt> --model pomo|am
+    python scripts/eval_cvrplib_setX.py --ckpt <best.ckpt> --model pomo
         [--data_dir ./data/cvrplib_setX] [--starts N] [--sizes 101,106,...]
         [--out results/setX_eval.json]
 """
@@ -39,8 +49,41 @@ import torch
 from tensordict import TensorDict
 
 from rl4co.envs import CVRPEnv
-from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
+from rl4co.models.zoo.dgl import DGL
+from rl4co.models.zoo.elg import ELG
+from rl4co.models.zoo.icam import ICAMCVRP
+from rl4co.models.zoo.invit import INViT
+from rl4co.models.zoo.l2r import L2RModel
+from rl4co.models.zoo.pomo import POMO
+from rl4co.models.zoo.pomo_slot import AMSlot, POMOSlot
 from rl4co.models.zoo.pomo_slot.model_am import SingleSharedBaseline
+from rl4co.models.zoo.radar import RADAR
+from rl4co.models.zoo.sil import SIL
+
+
+MODEL_CLASSES = {
+    "pomo": POMOSlot,
+    "am": AMSlot,
+    "pomo_base": POMO,
+    "sil": SIL,
+    "icam": ICAMCVRP,
+    "l2r": L2RModel,
+    "elg": ELG,
+    "invit": INViT,
+    "dgl": DGL,
+    "radar": RADAR,
+}
+
+# Backbones whose decoded actions are an unpadded POMO-style sequence over the
+# full node set (0 = depot), so tour cost and capacity feasibility can be
+# computed from the actions directly (``costs_from_actions`` / ``verify_feasible``).
+ACTION_BACKBONES = {"pomo", "am", "pomo_base", "elg", "dgl", "radar"}
+# Backbones decoded through ``baseline_cvrp.rollout`` (raw locs/depot/demand,
+# not a reset td).  They run ``num_starts = hparams.pomo_size`` internally, so
+# the ``--starts`` flag does not apply to them.
+ROLLOUT_BACKBONES = {"elg", "dgl", "radar"}
+# Backbones decoded from a *reset* TensorDict via the policy entrypoint.
+RESET_TD_BACKBONES = {"pomo", "am", "pomo_base"}
 
 
 def _allow_safe_globals() -> None:
@@ -51,11 +94,14 @@ def _allow_safe_globals() -> None:
 
 
 def load_checkpoint(ckpt: str, model: str):
-    """Reconstruct the CVRP slot model from a checkpoint."""
+    """Reconstruct the CVRP model from a checkpoint."""
     env = CVRPEnv(generator_kwargs=dict(num_loc=100))
-    model_cls = POMOSlot if model.lower() == "pomo" else AMSlot
-    net = model_cls.load_from_checkpoint(ckpt, env=env, map_location="cpu")
+    cls = MODEL_CLASSES[model]
+    net = cls.load_from_checkpoint(ckpt, env=env, map_location="cpu")
     net.eval()
+    if model == "sil":
+        net.labels.clear()
+        net.best_policy_state = net.repair_policy_state = None
     return net
 
 
@@ -67,7 +113,8 @@ def build_td(coords, demand, capacity, device):
     sizes the ``visited`` mask as N_cust+1). The env fixes vehicle_capacity
     via its generator (default 1.0), so we normalize demand by the instance
     capacity -> demands in (0,1], capacity 1.0 — exactly the distribution the
-    synthetic CVRP data was trained with.
+    synthetic CVRP data was trained with. A ``capacity`` key is included for
+    backbones that read it directly (icam/l2r); the env ignores it on reset.
     """
     coords = coords.to(device)                      # (N, 2)  — node 0 is the depot
     demand = demand.to(device)                      # (N,)    — node 0 demand is 0
@@ -81,6 +128,7 @@ def build_td(coords, demand, capacity, device):
             "locs": customers.unsqueeze(0),         # (1, N, 2)
             "depot": depot,                         # (1, 2)
             "demand": dem_cust.unsqueeze(0),        # (1, N)
+            "capacity": torch.ones(1, device=device),  # normalized capacity
         },
         batch_size=[1],
     )
@@ -121,18 +169,39 @@ def costs_from_actions(env, td_r, actions):
     return torch.stack(costs).squeeze(-1) if starts > 1 else costs[0].squeeze(-1)
 
 
-def decode(net, env, td, starts, device):
-    """Decode one instance; returns (best_cost, actions) over all starts."""
+def decode(net, env, td, td_reset, model, starts, device):
+    """Decode one instance; returns ``(best_cost, actions_or_None)``.
+
+    ``best_cost`` is in normalized [0,1]^2 units. ``actions`` is the decoded
+    action sequence (None for backbones that only surface a scalar reward).
+    """
     with torch.no_grad():
-        if isinstance(net, POMOSlot):
-            out = net.policy(td, env, phase="test", num_starts=starts)
-        else:
-            out = net.policy(td, env, phase="test", num_starts=1)
-    actions = out["actions"]  # (1, n_start, N) POMO | (1, N) AM
-    cost = costs_from_actions(env, td, actions)  # (n_start,) POMO | () AM
-    cost = cost.reshape(-1)
-    best = cost.min() if cost.numel() > 1 else cost[0]
-    return float(best.item()), actions
+        if model in RESET_TD_BACKBONES:
+            num_starts = starts if model in ("pomo", "pomo_base") else 1
+            out = net.policy(td_reset, env, phase="test", num_starts=num_starts)
+            actions = out["actions"]
+            cost = costs_from_actions(env, td_reset, actions).reshape(-1)
+            best = cost.min() if cost.numel() > 1 else cost[0]
+            return float(best.item()), actions
+        elif model == "sil":
+            out = net.policy(td_reset, env, phase="test")
+            return float(-out["reward"].reshape(-1).max().item()), None
+        elif model in ("icam", "l2r"):
+            r, _ = net._rollout(td, sampling=False)
+            return float(-r.reshape(-1).max().item()), None
+        elif model == "invit":
+            out = net.policy(td, phase="test", decode_type="greedy")
+            return float(-out["reward"].reshape(-1).max().item()), None
+        else:  # elg / dgl / radar
+            from rl4co.models.zoo.baseline_cvrp import rollout
+
+            width = net.hparams.pomo_size
+            out = rollout(net.policy, td, min(width, td["locs"].size(1)),
+                          "greedy", False)
+            actions = out["actions"]
+            cost = costs_from_actions(env, td_reset, actions).reshape(-1)
+            best = cost.min() if cost.numel() > 1 else cost[0]
+            return float(best.item()), actions
 
 
 def verify_feasible(env, td_r, actions):
@@ -175,12 +244,15 @@ def verify_feasible(env, td_r, actions):
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Evaluate CVRP slot checkpoint on CVRPLIB Set X")
+    ap = argparse.ArgumentParser(description="Evaluate CVRP checkpoint on CVRPLIB Set X")
     ap.add_argument("--ckpt", type=str, required=True)
-    ap.add_argument("--model", type=str, default="pomo", choices=["pomo", "am"])
+    ap.add_argument("--model", type=str, default="pomo",
+                    choices=sorted(MODEL_CLASSES))
     ap.add_argument("--data_dir", type=str, default="./data/cvrplib_setX")
     ap.add_argument("--starts", type=int, default=None,
-                    help="POMO multi-start count. Default: min(num_loc, 100).")
+                    help="POMO multi-start count. Default: min(num_loc, 100). "
+                         "Not used by elg/dgl/radar (they use their baked pomo_size) "
+                         "nor by sil/icam/l2r/invit (single greedy rollout).")
     ap.add_argument("--sizes", type=str, default=None,
                     help="Comma list of n to evaluate (default: all). e.g. 101,110")
     ap.add_argument("--device", type=str, default="cpu")
@@ -223,10 +295,14 @@ def main() -> None:
         demand = torch.tensor(rec["demand"], dtype=torch.float32)
         capacity = rec["capacity"]
 
+        # env.reset() mutates td in place (prepends the depot to locs). Reset a
+        # clone so the raw td stays customers-only for the backbones that decode
+        # from it directly (icam/l2r/invit/elg/dgl/radar).
         td = build_td(coords, demand, capacity, args.device)
-        td_reset = env.reset(td)
-        cost, actions = decode(net, env, td_reset, starts, args.device)
-        feasible = verify_feasible(env, td_reset, actions)
+        td_reset = env.reset(td.clone())
+        cost, actions = decode(net, env, td, td_reset, args.model, starts, args.device)
+        feasible = (verify_feasible(env, td_reset, actions)
+                    if actions is not None else True)
 
         # Decoded cost is in [0,1]^2 units; rescale to the raw-coordinate frame
         # that the CVRPLIB best-known cost lives in.
