@@ -93,6 +93,46 @@ source .venv/bin/activate
 
 This will create a new virtual environment in `.venv/` and install all dependencies.
 
+### Server installation for MARS experiments
+
+For a Conda-based GPU server, use the included installer from the repository
+root:
+
+```bash
+./scripts/install_server_conda.sh
+conda activate mars
+wandb login  # only needed when using --logger wandb
+```
+
+Set `CONDA_ENV_NAME` to choose another environment name:
+
+```bash
+CONDA_ENV_NAME=mars-nco ./scripts/install_server_conda.sh
+```
+
+For a standard Python virtual environment instead, use:
+
+```bash
+./scripts/install_server.sh
+source .venv/bin/activate
+wandb login  # only needed when using --logger wandb
+```
+
+The default installs a known-compatible CUDA 12.4 PyTorch stack. For a CPU-only
+machine or another wheel index, override `PYTORCH_INDEX_URL`, for example:
+
+```bash
+PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cpu ./scripts/install_server.sh
+```
+
+The installer does not download experiment datasets. Copy the `data/` directory
+from the existing server or generate the shared datasets with
+`python -m rl4co.data.generate_slot_dataset`.
+
+On GPUs with 4 GB VRAM, begin with a smaller batch size such as 32 or 64. The
+full N=100 POMO/RADAR configurations with 100 parallel starts may also require a
+smaller `--radar_pomo_size` or equivalent baseline-specific rollout width.
+
 ## Usage
 
 MARS also includes SIL and INViT CVRP baselines that train on the same cached

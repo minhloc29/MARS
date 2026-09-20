@@ -98,12 +98,20 @@ the best validation weights are used as the repair teacher.
 | `--sil_improve_every` | 20 | Imitation epochs between improvement rounds |
 | `--sil_max_subtour_length` | 64 | Maximum imitation/reconstruction length |
 | `--sil_num_layers` | 6 | Cross-attention decoder depth |
+| `--sil_feedforward_hidden` | 512 | Transformer feed-forward width; use 208 for parameter matching |
 | `--sil_update_mode` | `batch` | One update per batch; `node` restores upstream behavior |
 | `--sil_no_prc` | off | Reconstruct only one subpath per instance per pass |
 
 The fast defaults are intended for a controlled MARS comparison. To reproduce
 the original expensive update schedule at N=1000, pass
 `--sil_update_mode node --sil_max_subtour_length 1000 --sil_repair_budget 100`.
+
+For a parameter-matched comparison, keep the six SIL layers and eight heads but
+pass `--sil_feedforward_hidden 208`. With `--embed_dim 64`, this gives SIL
+588,098 trainable parameters versus 610,561 for the corresponding MARS POMO
+configuration. The older 512-wide SIL has 1,058,690 parameters. Because the
+feed-forward tensor shapes change, a 512-wide checkpoint cannot resume into the
+208-wide model.
 
 The first block uses insertion labels. An experiment shorter than 21 epochs at
 the default interval will not exercise learned label improvement. For a small

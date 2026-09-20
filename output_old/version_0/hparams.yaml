@@ -1,0 +1,14 @@
+embed_dim: 128
+num_layers_state: 2
+num_layers_action: 2
+num_layers_decoder: 3
+num_heads: 8
+feedforward_hidden: 512
+action_k: 15
+state_k:
+- 35
+- 50
+- 65
+tol: 0.001
+optimizer_kwargs:
+  lr: 2.0e-05

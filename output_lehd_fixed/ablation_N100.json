@@ -1,0 +1,18 @@
+[
+  {
+    "backbone": "lehd",
+    "num_loc": 100,
+    "seed": 42,
+    "embed_dim": 64,
+    "decoder_layers": 6,
+    "best_val_reward": -33.35117721557617,
+    "elapsed_min": 905.0,
+    "checkpoint": "/media/data3/users/longnd/DrugResponsePrediction/DatasetDRP/output/nco/MARS/output_lehd_fixed/lehd_N100_seed42_d64_dec6/checkpoints/best-epoch=011-val/reward=-33.3512.ckpt",
+    "batch_size": 256,
+    "lr": 0.0001,
+    "n_train": 100000,
+    "n_val": 1000,
+    "lehd_data_path": "data/lehd/data/CVRP/training dataset/vrp100_hgs_train_100w.txt",
+    "lehd_val_data_path": "data/lehd/data/CVRP/testing dataset/vrp100_test_lkh.txt"
+  }
+]

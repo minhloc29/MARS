@@ -67,6 +67,13 @@ def test_shared_data_and_rng_independent_shuffle(tmp_path):
     assert TRAIN_DEFAULTS[1000]["batch"] == 64
 
 
+def test_parameter_matched_sil_size():
+    policy = SILPolicy(
+        embed_dim=64, num_layers=6, num_heads=8, feedforward_hidden=208
+    )
+    assert sum(parameter.numel() for parameter in policy.parameters()) == 588_098
+
+
 @pytest.mark.parametrize("batch", [1, 3])
 def test_feasible_labels_decode_and_mars_reward(batch):
     env = CVRPEnv(generator_params={"num_loc": 10})

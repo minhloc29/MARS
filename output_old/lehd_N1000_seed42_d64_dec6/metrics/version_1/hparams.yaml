@@ -1,0 +1,12 @@
+data_path: /media/data3/users/longnd/DrugResponsePrediction/DatasetDRP/output/nco/NCO_code/single_objective/LEHD/CVRP/data/vrp1000_test_lkh.txt
+val_data_path: null
+num_loc: 1000
+embed_dim: 64
+decoder_layer_num: 6
+head_num: 8
+qkv_dim: 16
+ff_hidden: 512
+n_train_episodes: 8
+n_val_episodes: 1
+optimizer_kwargs:
+  lr: 5.0e-05

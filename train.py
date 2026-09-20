@@ -189,6 +189,7 @@ def train(
     sil_improve_every: int = 20,
     sil_max_subtour_length: int = 64,
     sil_num_layers: int = 6,
+    sil_feedforward_hidden: int = 512,
     sil_parallel_reconstruction: bool = True,
     sil_update_mode: str = "batch",
     invit_action_size: int = 15,
@@ -346,6 +347,7 @@ def train(
     if backbone == "sil":
         model_kwargs = dict(
             env=env, embed_dim=embed_dim, num_layers=sil_num_layers,
+            feedforward_hidden=sil_feedforward_hidden,
             repair_budget=sil_repair_budget, improve_every=sil_improve_every,
             max_subtour_length=sil_max_subtour_length,
             parallel_reconstruction=sil_parallel_reconstruction,
@@ -385,8 +387,9 @@ def train(
 
     base_suffix = f"_bl{baseline}" if backbone == "am" and baseline else ""
     if backbone == "sil":
+        feedforward_tag = f"_f{sil_feedforward_hidden}" if sil_feedforward_hidden != 512 else ""
         run_name = (f"sil_N{num_loc}_{dist}_{ins_method}_seed{seed}_d{embed_dim}"
-                    f"_l{sil_num_layers}_r{sil_repair_budget}_i{sil_improve_every}"
+                    f"_l{sil_num_layers}{feedforward_tag}_r{sil_repair_budget}_i{sil_improve_every}"
                     f"_s{sil_max_subtour_length}_u{sil_update_mode}"
                     f"_prc{int(sil_parallel_reconstruction)}")
     elif backbone == "invit":
@@ -449,6 +452,7 @@ def train(
     if backbone == "sil":
         print(f"  SIL: repair_budget={sil_repair_budget}, improve_every={sil_improve_every}, "
               f"max_subtour_length={sil_max_subtour_length}, update_mode={sil_update_mode}, "
+              f"layers={sil_num_layers}, feedforward={sil_feedforward_hidden}, "
               f"PRC={sil_parallel_reconstruction}")
         print("  Slot/metric/entropy flags do not apply to SIL; ins_method selects the shared data folder.")
     elif backbone == "invit":
@@ -493,6 +497,7 @@ def train(
         result.update(normalize_target=None, symmetrize_target=None,
                       sil_repair_budget=sil_repair_budget, sil_improve_every=sil_improve_every,
                       sil_max_subtour_length=sil_max_subtour_length, sil_num_layers=sil_num_layers,
+                      sil_feedforward_hidden=sil_feedforward_hidden,
                       sil_update_mode=sil_update_mode,
                       sil_parallel_reconstruction=sil_parallel_reconstruction,
                       dataset_signature=model.dataset_signature)
@@ -736,6 +741,8 @@ def main():
     parser.add_argument("--sil_max_subtour_length", type=int, default=64,
                         help="Maximum sampled SIL subpath length; 64 is the comparable fast default")
     parser.add_argument("--sil_num_layers", type=int, default=6)
+    parser.add_argument("--sil_feedforward_hidden", type=int, default=512,
+                        help="SIL Transformer feed-forward width; use 208 for 588,098 parameters at d=64/l=6")
     parser.add_argument("--sil_update_mode", choices=["batch", "node"], default="batch",
                         help="batch: one optimizer update per batch (comparable); node: upstream per-node updates")
     parser.add_argument("--sil_no_prc", dest="sil_parallel_reconstruction", action="store_false",
@@ -815,6 +822,7 @@ def main():
         sil_improve_every=args.sil_improve_every,
         sil_max_subtour_length=args.sil_max_subtour_length,
         sil_num_layers=args.sil_num_layers,
+        sil_feedforward_hidden=args.sil_feedforward_hidden,
         sil_update_mode=args.sil_update_mode,
         sil_parallel_reconstruction=args.sil_parallel_reconstruction,
         invit_action_size=args.invit_action_size,

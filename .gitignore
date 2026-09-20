@@ -4,6 +4,7 @@
 *.npy
 *.pkl
 *.txt
+!requirements-server.txt
 
 # Logs
 /logs

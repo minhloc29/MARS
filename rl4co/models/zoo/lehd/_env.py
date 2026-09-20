@@ -392,8 +392,10 @@ class LEHDVRPEnv:
         """Tour length for a batch of solutions."""
         V = order_node.shape[1]
         flag = order_flag.clone()
-        flag_next = flag.clone()
-        flag_next[:, 0] = 0
+        route_start = flag.bool()
+        # The rolled predecessor at position zero is the final customer, so
+        # forcing a depot target here closes the final route.
+        route_start[:, 0] = True
 
         # For each step: distance to next node if continuing, or depot+customer if flag=1
         node_idx = order_node
@@ -406,20 +408,20 @@ class LEHDVRPEnv:
         # Positions in problems: node i is at index i in xy (0=depot, 1..V=customers)
         order_loc = _gather(xy, node_idx)
         roll_loc = _gather(xy, roll_idx)
-        flag_loc = flag.unsqueeze(2).expand(-1, V, 2)
-        # When flag=1, previous leg ends at depot rather than previous node
+        # A flag marks the first customer of a new route.  Match the original
+        # LEHD calculation: for a route start, count both previous->depot and
+        # depot->current; otherwise count previous->current exactly once.
         leg_to_depot = torch.where(
             flag.bool().unsqueeze(2).expand(-1, V, 2),
             depot_loc, order_loc
         )
-        flag_loc2 = flag_next.unsqueeze(2).expand(-1, V, 2)
-        leg_from_depot = torch.where(
-            flag_next.bool().unsqueeze(2).expand(-1, V, 2),
-            depot_loc, roll_loc
+        previous_leg_target = torch.where(
+            route_start.unsqueeze(2).expand(-1, V, 2),
+            depot_loc, order_loc
         )
         lengths = (
             (order_loc - leg_to_depot).pow(2).sum(2).sqrt()
-            + (roll_loc - leg_from_depot).pow(2).sum(2).sqrt()
+            + (roll_loc - previous_leg_target).pow(2).sum(2).sqrt()
         ).sum(1)
         return lengths
 
