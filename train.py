@@ -30,11 +30,14 @@ try:
     from rl4co.models.zoo.lehd import LEHDModel, TTRLModel
     from rl4co.models.zoo.lehd.model import make_lehd_dataloaders
     from rl4co.models.zoo.pomo_slot import AMSlot, POMOSlot
+    from rl4co.models.zoo.radar import RADAR
     from rl4co.models.zoo.sil import SIL
     FULL_RL4CO = True
 except Exception as e:
-    print(f"[WARN] Full rl4co import failed: {e}")
-    FULL_RL4CO = False
+    raise RuntimeError(
+        "Failed to import the routing environments or model backbones. "
+        "Check that this clone contains all modules referenced by its package initializers."
+    ) from e
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -51,13 +54,14 @@ MODEL_CLASSES = {
     "invit": INViT,
     "dgl": DGL,
     "elg": ELG,
+    "radar": RADAR,
     "sil": SIL,
     "lehd": LEHDModel,
     "ttpl": TTRLModel,
 }
 
 
-BASELINE_BACKBONES = {"sil", "invit", "dgl", "elg"}
+BASELINE_BACKBONES = {"sil", "invit", "dgl", "elg", "radar"}
 
 
 def _make_trainer(run_name: str, log_path: Path, epochs: int,
@@ -183,6 +187,17 @@ def train(
     elg_mode: str = "joint",
     elg_warmup_epochs: int = 0,
     elg_scale_norm: bool = True,
+    # ---- RADAR baseline arguments ----
+    radar_embed_dim: int = 64,
+    radar_encoder_layers: int = 6,
+    radar_num_heads: int = 8,
+    radar_ff_dim: int = 256,
+    radar_ms_hidden_dim: int = 16,
+    radar_svd_rank: int = 10,
+    radar_logit_clipping: float = 10.0,
+    radar_sinkhorn_iters: int = 10,
+    radar_pomo_size: int = 100,
+    radar_scale_norm: bool = False,
 ):
     assert FULL_RL4CO, (
         "Full rl4co import failed. Ensure torchrl DLL is installed correctly "
@@ -371,6 +386,21 @@ def train(
             mode=elg_mode, warmup_epochs=elg_warmup_epochs,
             scale_norm=elg_scale_norm, optimizer_kwargs={"lr": lr},
         )
+    elif backbone == "radar":
+        model_kwargs = dict(
+            env=env,
+            embed_dim=radar_embed_dim,
+            encoder_layers=radar_encoder_layers,
+            num_heads=radar_num_heads,
+            ff_dim=radar_ff_dim,
+            ms_hidden_dim=radar_ms_hidden_dim,
+            svd_rank=radar_svd_rank,
+            logit_clipping=radar_logit_clipping,
+            sinkhorn_iters=radar_sinkhorn_iters,
+            pomo_size=radar_pomo_size,
+            scale_norm=radar_scale_norm,
+            optimizer_kwargs={"lr": lr},
+        )
     elif backbone == "am":
         model_kwargs["baseline"] = baseline if baseline is not None else "shared"
     # disable_slots: run backbone as a true no-slot baseline (no slot/aux).
@@ -408,6 +438,13 @@ def train(
         run_name = (f"elg_N{num_loc}_{dist}_{ins_method}_seed{seed}_d{embed_dim}"
                     f"_p{elg_pomo_size}_l{elg_num_layers}_local{elg_local_size}"
                     f"_{elg_mode}_w{elg_warmup_epochs}")
+    elif backbone == "radar":
+        run_name = (f"radar_N{num_loc}_{dist}_{ins_method}_seed{seed}"
+                    f"_d{radar_embed_dim}_l{radar_encoder_layers}"
+                    f"_h{radar_num_heads}_ff{radar_ff_dim}"
+                    f"_p{radar_pomo_size}_k{radar_svd_rank}"
+                    f"_ms{radar_ms_hidden_dim}_c{radar_logit_clipping:g}"
+                    f"_si{radar_sinkhorn_iters}_sn{int(radar_scale_norm)}")
     elif disable_slots:
         run_name = f"{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
     else:
@@ -437,6 +474,11 @@ def train(
         print(f"  ELG: pomo={elg_pomo_size}, layers={elg_num_layers}, "
               f"local_size={elg_local_size}, mode={elg_mode}, warmup={elg_warmup_epochs}")
         print("  Slot/metric/entropy flags do not apply to ELG; ins_method selects the shared data folder.")
+    elif backbone == "radar":
+        print(f"  RADAR: embed={radar_embed_dim}, layers={radar_encoder_layers}, "
+              f"heads={radar_num_heads}, ff={radar_ff_dim}, pomo={radar_pomo_size}, "
+              f"svd_rank={radar_svd_rank}, sinkhorn_iters={radar_sinkhorn_iters}")
+        print("  Slot/metric/entropy flags do not apply to RADAR; ins_method selects the shared data folder.")
     else:
         print(
             f"  Slots: K={num_slots}  proj_dim={proj_dim}  iters={slot_iters}")
@@ -509,6 +551,15 @@ def train(
             elg_local_heads=elg_local_heads, elg_mode=elg_mode,
             elg_warmup_epochs=elg_warmup_epochs, elg_scale_norm=elg_scale_norm,
         )
+    elif backbone == "radar":
+        result.update(
+            normalize_target=None, symmetrize_target=None,
+            radar_embed_dim=radar_embed_dim, radar_encoder_layers=radar_encoder_layers,
+            radar_num_heads=radar_num_heads, radar_ff_dim=radar_ff_dim,
+            radar_ms_hidden_dim=radar_ms_hidden_dim, radar_svd_rank=radar_svd_rank,
+            radar_logit_clipping=radar_logit_clipping, radar_sinkhorn_iters=radar_sinkhorn_iters,
+            radar_pomo_size=radar_pomo_size, radar_scale_norm=radar_scale_norm,
+        )
 
     # Dedup identical configs: rerun replaces, never appends a duplicate row.
     result_dir = Path(output)
@@ -533,6 +584,8 @@ def train(
         dedup_key.update({"dataset_signature": result["dataset_signature"]})
     elif backbone == "elg":
         dedup_key.update({k: v for k, v in result.items() if k.startswith("elg_")})
+    elif backbone == "radar":
+        dedup_key.update({k: v for k, v in result.items() if k.startswith("radar_")})
     results = [r for r in results if not all(
         r.get(k) == v for k, v in dedup_key.items())]
     results.append(result)
@@ -673,7 +726,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max_instances", type=int, default=None)
     parser.add_argument("--backbone", default="pomo",
-                        choices=["pomo", "am", "l2r", "icam", "sil", "invit", "dgl", "elg", "lehd", "ttpl"])
+                        choices=["pomo", "am", "l2r", "icam", "sil", "invit", "dgl", "elg", "radar", "lehd", "ttpl"])
     parser.add_argument("--embed_dim", type=int, default=128)
     parser.add_argument("--num_slots", type=int, default=8)
     parser.add_argument("--proj_dim", type=int, default=64)
@@ -742,6 +795,25 @@ def main():
     parser.add_argument("--elg_mode", choices=["joint", "only_global", "only_local"], default="joint")
     parser.add_argument("--elg_warmup_epochs", type=int, default=0)
     parser.add_argument("--elg_no_scale_norm", dest="elg_scale_norm", action="store_false")
+    # ---- RADAR baseline arguments ----
+    parser.add_argument("--radar_embed_dim", type=int, default=64)
+    parser.add_argument("--radar_encoder_layers", type=int, default=6)
+    parser.add_argument("--radar_num_heads", type=int, default=8)
+    parser.add_argument("--radar_ff_dim", type=int, default=256)
+    parser.add_argument("--radar_ms_hidden_dim", type=int, default=16)
+    parser.add_argument("--radar_svd_rank", type=int, default=10)
+    parser.add_argument("--radar_logit_clipping", type=float, default=10.0)
+    parser.add_argument("--radar_sinkhorn_iters", type=int, default=10)
+    parser.add_argument("--radar_pomo_size", type=int, default=100)
+    parser.add_argument(
+        "--radar_scale_norm", action="store_true",
+        help="Normalize RADAR's POMO advantage (off by default for fidelity)",
+    )
+    parser.add_argument(
+        "--radar_no_scale_norm", dest="radar_scale_norm", action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.set_defaults(radar_scale_norm=False)
     args = parser.parse_args()
 
     train(
@@ -797,6 +869,16 @@ def main():
         elg_mode=args.elg_mode,
         elg_warmup_epochs=args.elg_warmup_epochs,
         elg_scale_norm=args.elg_scale_norm,
+        radar_embed_dim=args.radar_embed_dim,
+        radar_encoder_layers=args.radar_encoder_layers,
+        radar_num_heads=args.radar_num_heads,
+        radar_ff_dim=args.radar_ff_dim,
+        radar_ms_hidden_dim=args.radar_ms_hidden_dim,
+        radar_svd_rank=args.radar_svd_rank,
+        radar_logit_clipping=args.radar_logit_clipping,
+        radar_sinkhorn_iters=args.radar_sinkhorn_iters,
+        radar_pomo_size=args.radar_pomo_size,
+        radar_scale_norm=args.radar_scale_norm,
     )
 
 
