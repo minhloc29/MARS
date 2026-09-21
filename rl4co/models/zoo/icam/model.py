@@ -197,7 +197,7 @@ class ICAMCVRP(pl.LightningModule):
         # val_metrics only contains "reward", never "max_reward".)
         score = reward.mean(dim=1).mean()
         self.log("val/reward", score, prog_bar=True)
-        return -scorebkai@123
+        return -score
     
 
     def configure_optimizers(self):
