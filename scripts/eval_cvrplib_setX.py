@@ -276,6 +276,17 @@ def main() -> None:
     env = net.env
     starts = args.starts or 100
 
+    # Diagnostic: the size the checkpoint was trained/configured for, vs the
+    # Set-X sizes we're about to evaluate. A mismatch is the usual cause of
+    # capacity violations during decode.
+    hparams = getattr(net, "hparams", None)
+    tr_num_loc = getattr(hparams, "num_loc", None) if hparams else None
+    tr_pomo = getattr(hparams, "pomo_size", None) if hparams else None
+    print(f"[info] checkpoint trained num_loc={tr_num_loc}  pomo_size={tr_pomo}"
+          f"  | env generator num_loc="
+          f"{getattr(env.generator, 'num_loc', None)}  vehicle_capacity="
+          f"{getattr(env.generator, 'vehicle_capacity', None)}")
+
     results = []
     agg = {"count": 0, "gap_sum": 0.0, "gap_sq": 0.0, "feasible": 0, "cost_sum": 0.0}
     print(f"\n=== CVRPLIB Set X eval | {args.model} | starts_pomo={starts} ===\n")
@@ -300,7 +311,21 @@ def main() -> None:
         # from it directly (icam/l2r/invit/elg/dgl/radar).
         td = build_td(coords, demand, capacity, args.device)
         td_reset = env.reset(td.clone())
-        cost, actions = decode(net, env, td, td_reset, args.model, starts, args.device)
+        try:
+            cost, actions = decode(
+                net, env, td, td_reset, args.model, starts, args.device)
+        except Exception as e:
+            # A decode that violates capacity (or any other error) for a single
+            # instance must not abort the whole Set-X run. Flag it infeasible and
+            # continue so we can see which instances/sizes are affected.
+            print(f"  ! {name}: decode failed -> {type(e).__name__}: {e}")
+            results.append({
+                "name": name, "n": n, "capacity": capacity,
+                "cost": None, "best": round(bks, 2) if bks == bks else None,
+                "gap": None, "feasible": False,
+            })
+            agg["count"] += 1
+            continue
         feasible = (verify_feasible(env, td_reset, actions)
                     if actions is not None else True)
 
