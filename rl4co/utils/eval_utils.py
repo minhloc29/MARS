@@ -128,6 +128,8 @@ def evaluate(model, args, env, ds):
     dec = REGISTRY[args.model]
     rewards = []
     num_starts = 1
+    import time
+    t0 = time.perf_counter()
     with torch.no_grad():
         for batch in batch_iter(ds, args.batch_size):
             if isinstance(batch, dict):
@@ -135,6 +137,7 @@ def evaluate(model, args, env, ds):
             batch = batch.to(args.device)
             reward_batch, num_starts = dec(model, batch, args, env)
             rewards.append(reward_batch.cpu())
+    elapsed = time.perf_counter() - t0
     reward = torch.cat(rewards)
     tour_len = -reward
     return {
@@ -143,4 +146,6 @@ def evaluate(model, args, env, ds):
         "mean_tour_length": float(tour_len.mean()),
         "std_tour_length": float(tour_len.std()) if len(tour_len) > 1 else 0.0,
         "num_starts": num_starts,
+        "elapsed_seconds": elapsed,
+        "throughput_per_sec": len(reward) / elapsed if elapsed > 0 else 0.0,
     }

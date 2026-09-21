@@ -104,7 +104,9 @@ def main() -> None:
     print(f"[OK] evaluated at num_loc={args.num_loc} customers  "
           f"n={result['n_inst']}  "
           f"mean tour = {result['mean_tour_length']:.4f} "
-          f"(mean reward = {result['mean_reward']:.4f})")
+          f"(mean reward = {result['mean_reward']:.4f})  "
+          f"inference = {result['elapsed_seconds']:.2f}s "
+          f"({result['throughput_per_sec']:.0f} inst/s)")
 
     out_path = args.out or Path("results") / \
         f"eval_{args.model}_{args.num_loc}_{args.seed}.json"
