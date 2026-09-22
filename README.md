@@ -100,6 +100,9 @@ splits through `train.py`. Method-specific commands and fairness notes are in th
 [SIL](rl4co/models/zoo/sil/README.md), [DGL](rl4co/models/zoo/dgl/README.md), and
 [ELG](rl4co/models/zoo/elg/README.md) guides.
 
+To draw depot-to-depot CVRP tours from a LEHD checkpoint or exported routes
+from another backbone, see the [CVRP figure guide](scripts/README_cvrp_figures.md).
+
 
 Train model with default configuration (AM on TSP environment):
 ```bash
