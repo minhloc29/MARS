@@ -1,0 +1,7 @@
+PROBLEM_FILE = D:\MARS\scratch\lkh_work\cvrp_n20_e163b7e2eabb.vrp
+OUTPUT_TOUR_FILE = D:\MARS\scratch\lkh_work\cvrp_n20_e163b7e2eabb.tour
+RUNS = 1
+MAX_TRIALS = 1000
+SEED = 42
+TRACE_LEVEL = 1
+TIME_LIMIT = 5
