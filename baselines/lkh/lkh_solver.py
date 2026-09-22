@@ -19,9 +19,18 @@ from baselines.utils import (
 
 def check_lkh_available(lkh_executable: str | Path | None = None) -> Path:
     """Verify that LKH executable exists and is runnable."""
+    import sys
+
+    is_windows = sys.platform == "win32"
+
     if lkh_executable:
         p = Path(lkh_executable).resolve()
-        if p.exists() and (p.is_file() or p.suffix in (".exe", "")):
+        if p.exists() and p.is_file():
+            if not is_windows:
+                try:
+                    os.chmod(p, p.stat().st_mode | 0o111)
+                except OSError:
+                    pass
             return p
         which = shutil.which(str(lkh_executable))
         if which:
@@ -30,18 +39,39 @@ def check_lkh_available(lkh_executable: str | Path | None = None) -> Path:
             f"Specified LKH executable not found: {lkh_executable}"
         )
 
-    # Check default repo location baselines/lkh/LKH.exe or LKH
     default_dir = Path(__file__).resolve().parent
-    for name in ("LKH.exe", "LKH-3.exe", "LKH", "lkh3", "lkh"):
+
+    # On Windows prefer .exe; on Linux/macOS search for native ELF binary (never .exe)
+    if is_windows:
+        candidates = ("LKH.exe", "LKH-3.exe", "LKH", "lkh3", "lkh")
+    else:
+        candidates = ("LKH", "LKH-3", "lkh3", "lkh")
+
+    for name in candidates:
         cand = default_dir / name
         if cand.exists() and cand.is_file():
+            if not is_windows:
+                try:
+                    os.chmod(cand, cand.stat().st_mode | 0o111)
+                except OSError:
+                    pass
             return cand
 
     # Check system PATH
-    for name in ("LKH", "LKH.exe", "lkh", "lkh3"):
+    for name in candidates:
         which = shutil.which(name)
         if which:
             return Path(which).resolve()
+
+    if not is_windows:
+        raise FileNotFoundError(
+            "LKH native binary not found for Linux/macOS. "
+            "Please compile LKH on your server by running:\n"
+            "  cd baselines/lkh && "
+            "curl -O http://akira.ruc.dk/~keld/research/LKH-3/LKH-3.0.14.tgz && "
+            "tar -xzf LKH-3.0.14.tgz && cd LKH-3.0.14 && make && cp LKH .. && cd .. && rm -rf LKH-3.0.14*\n"
+            "or pass its path explicitly via --lkh_executable."
+        )
 
     raise FileNotFoundError(
         "LKH executable not found. Please place 'LKH.exe' in 'baselines/lkh/' "

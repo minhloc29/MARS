@@ -36,9 +36,33 @@ pip install pyvrp numpy tqdm pytest
   cp LKH ../baselines/lkh/LKH
   ```
 
+## 2. Sinh dữ liệu kiểm thử (Data Generation)
+
+Nếu trong thư mục `data/` chưa có sẵn dữ liệu test cho các kích thước, bạn có thể sinh dữ liệu chuẩn (chuẩn Kool et al. 2019) trực tiếp bằng file `scripts/gen_data.py`:
+
+### Sinh đầy đủ toàn bộ kích thước (50, 100, 200, 500, 1000) và 2 phân phối (Uniform & Gaussian):
+```bash
+python scripts/gen_data.py \
+  --sizes 50 100 200 500 1000 \
+  --loc_dist uniform gaussian \
+  --n_inst 1000 \
+  --seed 1234
+```
+
+> **Tùy chỉnh linh hoạt**:
+> - Nếu muốn chạy thử nhanh với ít instance hơn (ví dụ 100 bài mỗi size để test trước):
+>   ```bash
+>   python scripts/gen_data.py --sizes 50 100 200 500 1000 --loc_dist uniform gaussian --n_inst 100
+>   ```
+> - Hoặc sinh cho 1 size duy nhất (ví dụ N=100 Uniform):
+>   ```bash
+>   python scripts/gen_data.py --num_loc 100 --loc_dist uniform --n_inst 1000
+>   ```
+> - Dữ liệu sẽ được tự động nén và lưu tại: `data/test/cvrp_{N}_{dist}_seed1234.npz` (chỉ cần `numpy`, tự động chạy mượt mà ngay cả khi máy không có PyTorch/Lightning).
+
 ---
 
-## 2. Chạy kiểm thử nhanh (Verification Test)
+## 3. Chạy kiểm thử nhanh (Verification Test)
 
 Trước khi chạy dữ liệu lớn, hãy chạy test tự động để đảm bảo môi trường máy bạn đã nhận diện đầy đủ cả 2 solver:
 
@@ -57,9 +81,9 @@ tests/test_classical_baselines.py::test_lkh_solve_native PASSED
 
 ---
 
-## 3. Hướng dẫn chạy Benchmark (`run_classical_baselines.py`)
+## 4. Hướng dẫn chạy Benchmark (`run_classical_baselines.py`)
 
-### 3.1. Chạy thử nghiệm nhanh (Quick Run)
+### 4.1. Chạy thử nghiệm nhanh (Quick Run)
 Chạy thử 5 bài toán $N=50$ để kiểm tra tốc độ:
 
 ```bash
@@ -72,7 +96,7 @@ python run_classical_baselines.py --solver lkh --sizes 50 --dists uniform --n_in
 
 ---
 
-### 3.2. Chạy Benchmark đầy đủ (Full Run: Sizes 50, 100, 200, 500, 1000)
+### 4.2. Chạy Benchmark đầy đủ (Full Run: Sizes 50, 100, 200, 500, 1000)
 
 Khi chạy chính thức trên toàn bộ kích thước và cả 2 phân phối:
 
@@ -100,7 +124,7 @@ python run_classical_baselines.py \
 
 ---
 
-## 4. Giải thích các tham số dòng lệnh quan trọng
+## 5. Giải thích các tham số dòng lệnh quan trọng
 
 | Tham số | Mặc định | Ý nghĩa |
 | :--- | :--- | :--- |
@@ -117,7 +141,7 @@ python run_classical_baselines.py \
 
 ---
 
-## 5. Kết quả đầu ra (Results)
+## 6. Kết quả đầu ra (Results)
 
 Mỗi lần chạy xong một cặp `(size, dist)`, kết quả được lưu tại thư mục `results/`:
 - Ví dụ: `results/eval_hgs_100_uniform.json`, `results/eval_lkh_100_uniform.json`.
