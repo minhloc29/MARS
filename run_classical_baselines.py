@@ -19,31 +19,42 @@ from baselines.utils import CVRPInstance, iter_instances, load_instance_batch
 def _solve_worker(args: tuple[int, CVRPInstance, str, dict[str, Any]]) -> dict[str, Any]:
     """Worker function for ProcessPoolExecutor."""
     idx, instance, solver, kwargs = args
-    if solver == "hgs":
-        res = solve_hgs(
-            instance=instance,
-            time_limit=kwargs.get("time_limit", 10.0),
-            max_iterations=kwargs.get("max_iterations"),
-            seed=kwargs.get("seed", 1) + idx,
-        )
-    elif solver == "lkh":
-        # Each worker process gets its own subfolder inside work_dir based on pid
-        worker_work_dir = Path(kwargs["work_dir"]) / f"proc_{os.getpid()}"
-        res = solve_lkh(
-            instance=instance,
-            lkh_executable=kwargs.get("lkh_executable"),
-            work_dir=worker_work_dir,
-            time_limit=kwargs.get("time_limit", 30.0),
-            runs=kwargs.get("runs", 1),
-            max_trials=kwargs.get("max_trials", 10000),
-            seed=kwargs.get("seed", 1) + idx,
-            keep_files=kwargs.get("keep_files", False),
-        )
-    else:
-        raise ValueError(f"Unknown solver: {solver}")
+    try:
+        if solver == "hgs":
+            res = solve_hgs(
+                instance=instance,
+                time_limit=kwargs.get("time_limit", 10.0),
+                max_iterations=kwargs.get("max_iterations"),
+                seed=kwargs.get("seed", 1) + idx,
+            )
+        elif solver == "lkh":
+            # Each worker process gets its own subfolder inside work_dir based on pid
+            worker_work_dir = Path(kwargs["work_dir"]) / f"proc_{os.getpid()}"
+            res = solve_lkh(
+                instance=instance,
+                lkh_executable=kwargs.get("lkh_executable"),
+                work_dir=worker_work_dir,
+                time_limit=kwargs.get("time_limit", 30.0),
+                runs=kwargs.get("runs", 1),
+                max_trials=kwargs.get("max_trials", 10000),
+                seed=kwargs.get("seed", 1) + idx,
+                keep_files=kwargs.get("keep_files", False),
+            )
+        else:
+            raise ValueError(f"Unknown solver: {solver}")
 
-    res["instance_idx"] = idx
-    return res
+        res["instance_idx"] = idx
+        return res
+    except Exception as exc:
+        print(f"\n[WARN] Solver {solver.upper()} failed on instance {idx}: {exc}")
+        return {
+            "instance_idx": idx,
+            "routes": [],
+            "cost": float("nan"),
+            "elapsed_seconds": 0.0,
+            "feasible": False,
+            "error": str(exc),
+        }
 
 
 def parse_time_limits(time_limits_str: list[str] | None, default_tl: float) -> dict[int, float]:
@@ -193,9 +204,12 @@ def run_benchmark(
             # Sort results by instance_idx
             results.sort(key=lambda r: r["instance_idx"])
 
-            costs = [r["cost"] for r in results]
-            mean_cost = float(np.mean(costs))
-            std_cost = float(np.std(costs))
+            feasible_results = [
+                r for r in results if r.get("feasible", False) and not np.isnan(r.get("cost", float("nan")))
+            ]
+            costs = [r["cost"] for r in feasible_results]
+            mean_cost = float(np.mean(costs)) if costs else float("nan")
+            std_cost = float(np.std(costs)) if costs else float("nan")
             time_per_instance = float(total_elapsed / n_inst) if n_inst > 0 else 0.0
 
             output_data: dict[str, Any] = {
@@ -203,6 +217,8 @@ def run_benchmark(
                 "num_loc": size,
                 "dist": dist,
                 "n_inst": n_inst,
+                "n_feasible": len(feasible_results),
+                "n_failed": n_inst - len(feasible_results),
                 "mean_tour_length": mean_cost,
                 "std_tour_length": std_cost,
                 "elapsed_seconds": total_elapsed,
@@ -215,8 +231,9 @@ def run_benchmark(
                 output_data["routes"] = [r["routes"] for r in results]
 
             out_file.write_text(json.dumps(output_data, indent=2), encoding="utf-8")
+            status_str = f"({len(feasible_results)}/{n_inst} feasible)" if len(feasible_results) < n_inst else ""
             print(
-                f"[OK] Completed N={size} {dist}: "
+                f"[OK] Completed N={size} {dist} {status_str}: "
                 f"mean_tour = {mean_cost:.4f} (std = {std_cost:.4f}) | "
                 f"total time = {total_elapsed:.2f}s ({time_per_instance:.3f}s/inst) -> Saved to {out_file}"
             )

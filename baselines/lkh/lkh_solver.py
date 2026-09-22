@@ -8,6 +8,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from baselines.utils import (
     CVRPInstance,
     parse_lkh_tour_file,
@@ -118,38 +120,61 @@ def solve_lkh(
     tour_file = work_path / f"{problem_name}.tour"
     par_file = work_path / f"{problem_name}.par"
 
+    min_vehicles = int(np.ceil(np.sum(instance.demand_int) / max(1, instance.capacity_int)))
+    vehicles = min(instance.num_loc, min_vehicles + 5)
+
+    def _generate_par_content(tl: float | None, veh: int, r: int, s: int) -> str:
+        lines = [
+            f"PROBLEM_FILE = {problem_file}",
+            f"OUTPUT_TOUR_FILE = {tour_file}",
+            f"RUNS = {r}",
+            f"MAX_TRIALS = {max_trials}",
+            f"SEED = {s}",
+            "TRACE_LEVEL = 1",
+            "SPECIAL",
+            "MOVE_TYPE = 5 SPECIAL",
+            "SUBSEQUENT_MOVE_TYPE = 5 SPECIAL",
+            f"VEHICLES = {veh}",
+            "MTSP_MIN_SIZE = 0",
+        ]
+        if tl is not None and tl > 0:
+            lines.append(f"TIME_LIMIT = {tl:.2f}")
+        return "\n".join(lines) + "\n"
+
     # 1. Write VRPLIB problem file
     vrp_content = to_vrplib_string(instance, name=problem_name)
     problem_file.write_text(vrp_content, encoding="utf-8")
 
     # 2. Write parameter file
-    par_lines = [
-        f"PROBLEM_FILE = {problem_file}",
-        f"OUTPUT_TOUR_FILE = {tour_file}",
-        f"RUNS = {runs}",
-        f"MAX_TRIALS = {max_trials}",
-        f"SEED = {seed}",
-        "TRACE_LEVEL = 1",
-    ]
-    if time_limit is not None and time_limit > 0:
-        par_lines.append(f"TIME_LIMIT = {int(round(time_limit))}")
-
-    par_file.write_text("\n".join(par_lines) + "\n", encoding="utf-8")
+    par_content = _generate_par_content(time_limit, vehicles, runs, seed)
+    par_file.write_text(par_content, encoding="utf-8")
 
     # 3. Execute LKH binary
     start_time = time.perf_counter()
-    try:
+    timeout_budget = (time_limit * 3 + 15) if time_limit else None
+
+    proc = subprocess.run(
+        [str(exe_path), str(par_file)],
+        cwd=str(work_path),
+        capture_output=True,
+        text=True,
+        timeout=timeout_budget,
+    )
+
+    # If tour was not produced (e.g. penalty remaining due to tight time limit or bin packing), retry once
+    if (proc.returncode != 0 or not tour_file.exists()) and time_limit is not None:
+        retry_time_limit = max(time_limit * 2.0, time_limit + 5.0)
+        retry_vehicles = min(instance.num_loc, vehicles + 5)
+        retry_par = _generate_par_content(retry_time_limit, retry_vehicles, runs=2, s=seed + 999)
+        par_file.write_text(retry_par, encoding="utf-8")
         proc = subprocess.run(
             [str(exe_path), str(par_file)],
             cwd=str(work_path),
             capture_output=True,
             text=True,
-            timeout=(time_limit * 2 + 10) if time_limit else None,
+            timeout=int(retry_time_limit * 3 + 15),
         )
-    except subprocess.TimeoutExpired as exc:
-        raise TimeoutError(
-            f"LKH process timed out after {exc.timeout} seconds."
-        ) from exc
+
     elapsed = time.perf_counter() - start_time
 
     if proc.returncode != 0 or not tour_file.exists():

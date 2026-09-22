@@ -23,4 +23,4 @@ cd "$SCRIPT_DIR"
 rm -rf LKH-3.0.14 LKH-3.0.14.tgz
 
 echo "[OK] LKH compiled successfully at: $SCRIPT_DIR/LKH"
-"$SCRIPT_DIR/LKH" || true
+echo "You can now run benchmarks with: python run_classical_baselines.py --solver lkh"
