@@ -20,7 +20,7 @@ def get_pytorch_optimizers():
 
 
 def create_optimizer(parameters, optimizer_name: str, **optimizer_kwargs) -> Optimizer:
-    """Create optimizer for model. If `optimizer_name` is not found, raise ValueError."""
+
     if optimizer_name in get_pytorch_optimizers():
         optimizer_cls = getattr(torch.optim, optimizer_name)
         return optimizer_cls(parameters, **optimizer_kwargs)

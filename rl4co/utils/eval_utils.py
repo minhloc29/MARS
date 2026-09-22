@@ -111,6 +111,15 @@ def decode_invit(model, batch, args, env):
     return out["reward"].reshape(-1), 1
 
 
+def decode_radar(model, batch, args, env):
+    from rl4co.models.zoo.baseline_cvrp import rollout as radar_rollout
+
+    width = model.hparams.pomo_size
+    out = radar_rollout(
+        model.policy, batch, width, greedy_name(args.decode), False)
+    return out["reward"].max(dim=1).values, out["reward"].shape[1]
+
+
 REGISTRY = {
     "am": decode_am,
     "pomo": decode_pomo,
@@ -120,6 +129,7 @@ REGISTRY = {
     "l2r": decode_l2r,
     "elg": decode_elg,
     "invit": decode_invit,
+    "radar": decode_radar,
 }
 
 
