@@ -7,9 +7,11 @@ from pathlib import Path
 
 import lightning.pytorch as pl
 import torch
+from tensordict import TensorDict
 
 from rl4co.data.transforms import StateAugmentation
 from rl4co.envs import CVRPEnv
+from rl4co.models.zoo.dgl import DGL
 from rl4co.models.zoo.elg import ELG
 from rl4co.models.zoo.icam import ICAMCVRP
 from rl4co.models.zoo.invit import INViT
@@ -34,6 +36,7 @@ MODEL_CLASSES = {
     "elg": ELG,
     "invit": INViT,
     "radar": RADAR,
+    "dgl": DGL,
     "lehd": LEHDModel,
     "ttpl": TTRLModel,
 }
@@ -267,6 +270,281 @@ def _evaluate_lehd(model, args, device) -> dict:
     }
 
 
+ACTION_BACKBONES = {"pomo", "am", "pomo_base", "elg", "dgl", "radar"}
+ROLLOUT_BACKBONES = {"elg", "dgl", "radar"}
+RESET_TD_BACKBONES = {"pomo", "am", "pomo_base"}
+
+
+def _load_checkpoint_cvrplib(ckpt: str, model: str):
+    """Reconstruct the CVRP model from a checkpoint (Set X path)."""
+    env = CVRPEnv(generator_kwargs=dict(num_loc=100))
+    cls = MODEL_CLASSES[model]
+    net = cls.load_from_checkpoint(ckpt, env=env, map_location="cpu")
+    net.eval()
+    if model == "sil":
+        net.labels.clear()
+        net.best_policy_state = net.repair_policy_state = None
+    return net
+
+
+def build_td(coords, demand, capacity, device):
+    """Pack one instance into a pre-reset TensorDict for the CVRP env.
+
+    RL4CO's CVRP env expects ``locs`` = customers only, ``depot`` separate,
+    and ``demand`` = customers only (it prepends the depot in ``_reset`` and
+    sizes the ``visited`` mask as N_cust+1). The env fixes vehicle_capacity
+    via its generator (default 1.0), so we normalize demand by the instance
+    capacity -> demands in (0,1], capacity 1.0 -- exactly the distribution the
+    synthetic CVRP data was trained with. A ``capacity`` key is included for
+    backbones that read it directly (icam/l2r); the env ignores it on reset.
+    """
+    coords = coords.to(device)                      # (N, 2)  -- node 0 is the depot
+    demand = demand.to(device)                      # (N,)    -- node 0 demand is 0
+    depot = coords[:1]                              # (1, 2)
+    customers = coords[1:]                          # (N-1, 2)
+    dem_cust = demand[1:] / capacity                # (N-1,) normalized, <= 1
+    dem_cust = torch.clamp(dem_cust, min=1e-8)      # avoid 0-demand (mask logic edge)
+    N = customers.shape[0]
+    td = TensorDict(
+        {
+            "locs": customers.unsqueeze(0),         # (1, N, 2)
+            "depot": depot,                         # (1, 2)
+            "demand": dem_cust.unsqueeze(0),        # (1, N)
+            "capacity": torch.ones(1, device=device),  # normalized capacity
+        },
+        batch_size=[1],
+    )
+    return td
+
+
+def normalize(coords):
+    """Map integer CVRPLIB coords into [0,1] (per-instance).
+
+    Returns ``(coords_norm, scale)`` where ``scale`` is the divisor used; the
+    model's decoded tour length is in [0,1]^2 units and must be multiplied by
+    ``scale`` to compare against the raw-coordinate best-known cost.
+    """
+    m = float(coords.max())
+    if m <= 0:
+        return coords, 1.0
+    return coords / m, m
+
+
+def costs_from_actions(env, td_r, actions):
+    """Return per-start cost (negative reward) for the decoded actions.
+
+    ``td_r`` is the *reset* td whose ``locs`` is the full node set (depot at
+    index 0, then customers). POMO actions are ``(1, n_start, N)``; the tour
+    for a start is ``[depot, locs[a_0], locs[a_1], ...]`` with the loop closed
+    by ``get_tour_length`` (matches ``env._get_reward``). AM actions are
+    ``(1, N)``.
+    """
+    from rl4co.utils.ops import get_tour_length
+
+    locs = td_r["locs"]  # (1, N_full, 2)  -- full node set, depot at idx 0
+    costs = []
+    starts = actions.shape[1] if actions.ndim == 3 else 1
+    for s in range(starts):
+        acts = actions[0, s] if actions.ndim == 3 else actions[0]  # (N,)
+        ordered = torch.cat([locs[:, :1, :], locs[:, acts, :]], dim=1)  # depot + tour
+        costs.append(get_tour_length(ordered))       # (1,)
+    return torch.stack(costs).squeeze(-1) if starts > 1 else costs[0].squeeze(-1)
+
+
+def decode_cvrplib(net, env, td, td_reset, model, starts, device):
+    """Decode one instance; returns ``(best_cost, actions_or_None)``.
+
+    ``best_cost`` is in normalized [0,1]^2 units. ``actions`` is the decoded
+    action sequence (None for backbones that only surface a scalar reward).
+    """
+    with torch.no_grad():
+        if model in RESET_TD_BACKBONES:
+            num_starts = starts if model in ("pomo", "pomo_base") else 1
+            out = net.policy(td_reset, env, phase="test", num_starts=num_starts)
+            actions = out["actions"]
+            cost = costs_from_actions(env, td_reset, actions).reshape(-1)
+            best = cost.min() if cost.numel() > 1 else cost[0]
+            return float(best.item()), actions
+        elif model == "sil":
+            out = net.policy(td_reset, env, phase="test")
+            return float(-out["reward"].reshape(-1).max().item()), None
+        elif model in ("icam", "l2r"):
+            r, _ = net._rollout(td, sampling=False)
+            return float(-r.reshape(-1).max().item()), None
+        elif model == "invit":
+            out = net.policy(td, phase="test", decode_type="greedy")
+            return float(-out["reward"].reshape(-1).max().item()), None
+        else:  # elg / dgl / radar
+            from rl4co.models.zoo.baseline_cvrp import rollout
+
+            width = net.hparams.pomo_size
+            out = rollout(net.policy, td, min(width, td["locs"].size(1)),
+                          "greedy", False)
+            actions = out["actions"]
+            cost = costs_from_actions(env, td_reset, actions).reshape(-1)
+            best = cost.min() if cost.numel() > 1 else cost[0]
+            return float(best.item()), actions
+
+
+def verify_feasible(env, td_r, actions):
+    """Verify no route exceeds capacity.
+
+    RL4CO's CVRP decoder capacity-masks during decoding, so returned routes are
+    feasible by construction. This re-checks independently by segmenting the
+    decoded best route at depot returns and summing each route's (normalized)
+    demand against capacity 1.0.
+    """
+    td_r = td_r  # reset td: locs full (1,N+1,2); demand customers-only (1,N)
+    demand = td_r["demand"][0]                       # (N,) customers-only, normalized
+    from rl4co.utils.ops import get_tour_length
+    locs = td_r["locs"]
+    # best route = the start (or single) with minimum cost
+    if actions.ndim == 3:
+        per = []
+        for s in range(actions.shape[1]):
+            acts = actions[0, s]
+            ordered = torch.cat([locs[:, :1, :], locs[:, acts, :]], dim=1)
+            per.append(get_tour_length(ordered))
+        per = torch.stack(per)
+        acts = actions[0, int(per.argmin())]
+    else:
+        acts = actions[0]
+    # Segment actions at depot returns.
+    route = []
+    ok = True
+    for a in acts.tolist():
+        if a == 0:
+            if route:
+                if sum(demand[i - 1].item() for i in route) > 1.0 + 1e-6:
+                    ok = False
+                route = []
+        else:
+            route.append(int(a))
+    if route and sum(demand[i - 1].item() for i in route) > 1.0 + 1e-6:
+        ok = False
+    return ok
+
+
+def _evaluate_cvrplib(model, args, device) -> dict:
+    """Evaluate a checkpoint on the CVRPLIB Set X benchmark.
+
+    Loads the cached ``setX.pt`` (from ``args.data_dir``), converts each instance
+    into the CVRP env tensor format, decodes one instance at a time (N varies per
+    instance), and reports cost + gap vs the official best-known.
+    """
+    data = torch.load(Path(args.data_dir) / "setX.pt", map_location="cpu",
+                      weights_only=False)
+    sizes = {int(v["node_coord"].shape[0]): True for v in data.values()}
+    include = None
+    if args.sizes:
+        include = {int(s) for s in args.sizes.split(",") if s.strip()}
+        for s in include:
+            if s not in sizes:
+                raise RuntimeError(
+                    f"Size n={s} not present in Set X. Available: {sorted(sizes)}")
+
+    net = _load_checkpoint_cvrplib(args.ckpt, model).to(device)
+    env = net.env
+    starts = args.num_starts or 100
+
+    hparams = getattr(net, "hparams", None)
+    tr_num_loc = getattr(hparams, "num_loc", None) if hparams else None
+    tr_pomo = getattr(hparams, "pomo_size", None) if hparams else None
+    print(f"[info] checkpoint trained num_loc={tr_num_loc}  pomo_size={tr_pomo}"
+          f"  | env generator num_loc="
+          f"{getattr(env.generator, 'num_loc', None)}  vehicle_capacity="
+          f"{getattr(env.generator, 'vehicle_capacity', None)}")
+
+    results = []
+    agg = {"count": 0, "gap_sum": 0.0, "gap_sq": 0.0, "feasible": 0,
+           "cost_sum": 0.0}
+    print(f"\n=== CVRPLIB Set X eval | {model} | starts_pomo={starts} ===\n")
+    print(f"{'instance':<14}{'n':>5}{'k':>5}{'capacity':>9}{'cost':>12}{'bks':>12}"
+          f"{'gap%':>9}{'feas':>5}")
+
+    for name in sorted(data, key=lambda k: data[k]["node_coord"].shape[0]):
+        rec = data[name]
+        n = rec["node_coord"].shape[0]
+        if include and n not in include:
+            continue
+        bks = rec["best_cost"]
+        if bks is None:
+            bks = float("nan")
+
+        coords, scale = normalize(
+            torch.tensor(rec["node_coord"], dtype=torch.float32))
+        demand = torch.tensor(rec["demand"], dtype=torch.float32)
+        capacity = rec["capacity"]
+
+        # env.reset() mutates td in place (prepends the depot to locs). Reset a
+        # clone so the raw td stays customers-only for the backbones that decode
+        # from it directly (icam/l2r/invit/elg/dgl/radar).
+        td = build_td(coords, demand, capacity, device)
+        td_reset = env.reset(td.clone())
+        try:
+            cost, actions = decode_cvrplib(
+                net, env, td, td_reset, model, starts, device)
+        except Exception as e:
+            # A decode that violates capacity (or any other error) for a single
+            # instance must not abort the whole Set-X run. Flag it infeasible and
+            # continue so we can see which instances/sizes are affected.
+            print(f"  ! {name}: decode failed -> {type(e).__name__}: {e}")
+            results.append({
+                "name": name, "n": n, "capacity": capacity,
+                "cost": None, "best": round(bks, 2) if bks == bks else None,
+                "gap": None, "feasible": False,
+            })
+            agg["count"] += 1
+            continue
+        feasible = (verify_feasible(env, td_reset, actions)
+                    if actions is not None else True)
+
+        # Decoded cost is in [0,1]^2 units; rescale to the raw-coordinate frame
+        # that the CVRPLIB best-known cost lives in.
+        cost = cost * scale
+        gap = (cost - bks) / bks if bks == bks else float("nan")
+        k_approx = int(round(float(demand.sum()) / capacity)) if capacity else 0
+
+        results.append({
+            "name": name, "n": n, "capacity": capacity, "cost": round(cost, 2),
+            "best": round(bks, 2) if bks == bks else None,
+            "gap": round(gap * 100, 3) if gap == gap else None,
+            "feasible": feasible,
+        })
+
+        agg["count"] += 1
+        if feasible and (gap == gap):
+            agg["gap_sum"] += gap
+            agg["gap_sq"] += gap * gap
+            agg["feasible"] += 1
+        agg["cost_sum"] += cost
+
+        print(f"{name:<14}{n:>5}{k_approx:>5}{capacity:>9.0f}{cost:>12.2f}"
+              f"{bks:>12.2f}{(gap*100 if gap==gap else float('nan')):>9.2f}"
+              f"{'Y' if feasible else 'N':>5}")
+
+    cnt = agg["count"]
+    if cnt:
+        mean_gap = agg["gap_sum"] / max(1, agg["feasible"])
+        std_gap = (agg["gap_sq"] / max(1, agg["feasible"]) - mean_gap**2) ** 0.5
+        print(f"\n--- aggregate ({cnt} instances) ---")
+        print(f"  feasible: {agg['feasible']}/{cnt}")
+        print(f"  mean gap (vs bks): {mean_gap*100:.2f}%  (std {std_gap*100:.2f}%)")
+        print(f"  mean cost: {agg['cost_sum']/cnt:.2f}")
+    else:
+        mean_gap = std_gap = 0.0
+
+    return {
+        "n_inst": cnt,
+        "num_starts": starts,
+        "mean_gap": mean_gap,
+        "std_gap": std_gap,
+        "feasible": agg["feasible"],
+        "mean_cost": agg["cost_sum"] / max(1, cnt),
+        "instances": results,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate a routing checkpoint at a target size"
@@ -276,22 +554,37 @@ def main() -> None:
     parser.add_argument("--model", type=str, default="am",
                         choices=sorted(MODEL_CLASSES),
                         help="Model class. Must match the checkpoint.")
+    parser.add_argument("--dataset", type=str, default="synthetic",
+                        choices=["synthetic", "cvrplib"],
+                        help="Evaluate on freshly generated synthetic instances "
+                             "(or a cached --data_path) or on the CVRPLIB "
+                             "Set X benchmark (--data_dir).")
     parser.add_argument("--data_path", type=str, default=None,
                         help="Cached dataset split shared across methods, or the "
                              "LEHD-format .txt test file for --model lehd/ttpl.")
+    parser.add_argument("--data_dir", type=str, default="./data/cvrplib_setX",
+                        help="Directory holding setX.pt (only for "
+                             "--dataset cvrplib).")
     parser.add_argument("--dist", type=str, default=None,
                         choices=["uniform", "gaussian"],
                         help="For --model lehd/ttpl only: generate synthetic "
                              "instances of this distribution instead of reading "
                              "a .txt data_path. Ignores data_path.")
-    parser.add_argument("--num_loc", type=int, required=True,
-                        help="Target number of customers N.")
+    parser.add_argument("--num_loc", type=int, default=None,
+                        help="Target number of customers N (required for "
+                             "--dataset synthetic).")
     parser.add_argument("--n_inst", type=int, default=1000,
                         help="Number of eval instances")
     parser.add_argument("--batch_size", type=int, default=128,
                         help="Eval batch size")
     parser.add_argument("--num_starts", type=int, default=50,
-                        help="Multi-start greedy for POMO/AM checkpoints.")
+                        help="Multi-start greedy for POMO/AM checkpoints. For "
+                             "--dataset cvrplib this is the POMO multi-start "
+                             "count (default 100). Not used by elg/dgl/radar "
+                             "(baked pomo_size) nor sil/icam/l2r/invit.")
+    parser.add_argument("--sizes", type=str, default=None,
+                        help="Comma list of n to evaluate on CVRPLIB Set X "
+                             "(default: all). e.g. 101,110")
     parser.add_argument("--decode", type=str, default="greedy",
                         choices=["greedy", "sampling", "multistart_greedy",
                                  "multistart_sampling", "beam_search"],
@@ -306,10 +599,46 @@ def main() -> None:
                         help="JSON path to save results.")
     args = parser.parse_args()
 
+    # ---- dataset / model compatibility ----
+    if args.dataset == "cvrplib":
+        if args.model in ("lehd", "ttpl"):
+            parser.error(
+                "--model lehd/ttpl only works on --dataset synthetic "
+                "(they use their own LEHD-format .txt data, not Set X).")
+    else:  # synthetic
+        if args.num_loc is None:
+            parser.error("--dataset synthetic requires --num_loc.")
+        if args.model == "dgl":
+            parser.error(
+                "--model dgl only works on --dataset cvrplib "
+                "(the synthetic path has no dgl decoder).")
+
     _allow_safe_globals()
     pl.seed_everything(args.seed, workers=True)
 
     args.device = eval_utils.pick_device(args.device)
+
+    # ---- CVRPLIB Set X: dedicated per-instance harness (no rl4co synthetic env)
+    if args.dataset == "cvrplib":
+        result = _evaluate_cvrplib(args.model, args, args.device)
+        result["backbone"] = args.model
+        result["seed"] = args.seed
+        result["ckpt"] = str(args.ckpt)
+        result["sizes"] = args.sizes
+        result["data_dir"] = str(Path(args.data_dir).resolve())
+
+        print(f"[OK] Set X eval: n_inst={result['n_inst']}  "
+              f"mean gap = {result['mean_gap']*100:.2f}% "
+              f"(std {result['std_gap']*100:.2f}%)  "
+              f"feasible {result['feasible']}/{result['n_inst']}  "
+              f"mean cost = {result['mean_cost']:.2f}")
+
+        out_path = args.out or Path("results") / \
+            f"setX_{args.model}_{args.seed}.json"
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_text(json.dumps(result, indent=2))
+        print(f"Saved to {out_path}")
+        return
 
     # ---- LEHD / TTPL: dedicated env + dataloader (no rl4co CVRP env) ----
     if args.model in ("lehd", "ttpl"):
