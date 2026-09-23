@@ -146,11 +146,14 @@ REGISTRY = {
 }
 
 
-def evaluate(model, args, env, ds):
+def evaluate(model, args, env, ds, return_instances: int | None = None):
     model.eval()
     dec = REGISTRY[args.model]
     rewards = []
     num_starts = 1
+    # When plotting is requested, keep the first ``return_instances`` decoded
+    # solutions (post-reset td with depot + actions) so routes can be drawn.
+    plot_instances = [] if return_instances else None
     import time
     t0 = time.perf_counter()
     with torch.no_grad():
@@ -158,12 +161,26 @@ def evaluate(model, args, env, ds):
             if isinstance(batch, dict):
                 batch = TensorDict(batch, batch_size=[batch["demand"].size(0)])
             batch = batch.to(args.device)
-            reward_batch, num_starts, _ = dec(model, batch, args, env)
+            reward_batch, num_starts, actions = dec(model, batch, args, env)
             rewards.append(reward_batch.cpu())
+            if plot_instances is not None and actions is not None:
+                B = batch.batch_size[0]
+                # Reconstruct the reset td (depot-first locs) for the batch so
+                # per-start tour lengths can be recomputed for the best route.
+                td_reset = env.reset(batch)
+                for i in range(B):
+                    if len(plot_instances) >= return_instances:
+                        break
+                    plot_instances.append({
+                        "td": td_reset[i:i + 1].cpu(),
+                        "actions": actions[i].cpu(),
+                    })
+                if len(plot_instances) >= return_instances:
+                    break
     elapsed = time.perf_counter() - t0
     reward = torch.cat(rewards)
     tour_len = -reward
-    return {
+    result = {
         "n_inst": len(reward),
         "mean_reward": float(reward.mean()),
         "mean_tour_length": float(tour_len.mean()),
@@ -172,3 +189,6 @@ def evaluate(model, args, env, ds):
         "elapsed_seconds": elapsed,
         "throughput_per_sec": len(reward) / elapsed if elapsed > 0 else 0.0,
     }
+    if return_instances is not None:
+        return result, plot_instances
+    return result

@@ -43,10 +43,7 @@ def main() -> None:
                         choices=sorted(MODEL_CLASSES),
                         help="Model class. Must match the checkpoint.")
     parser.add_argument("--dataset", type=str, default="synthetic",
-                        choices=["synthetic", "cvrplib"],
-                        help="Evaluate on freshly generated synthetic instances "
-                             "(or a cached --data_path) or on the CVRPLIB "
-                             "Set X benchmark (--data_dir).")
+                        choices=["synthetic", "cvrplib"])
     parser.add_argument("--data_path", type=str, default=None,
                         help="Cached dataset split shared across methods.")
     parser.add_argument("--data_dir", type=str, default="./data/cvrplib_setX",
@@ -71,6 +68,14 @@ def main() -> None:
                         choices=["greedy", "sampling", "multistart_greedy",
                                  "multistart_sampling", "beam_search"],
                         help="Decoding strategy wired to every model.")
+    parser.add_argument("--plot", type=int, default=None,
+                        help="Render the first N solved instances as "
+                             "publication-quality PDF/PNG in results/plots/ "
+                             "(synthetic dataset; action backbones "
+                             "am/pomo/pomo_base/elg/radar).")
+    parser.add_argument("--plot_dir", type=str, default=None,
+                        help="Output directory for --plot figures "
+                             "(default: results/plots).")
     parser.add_argument("--augment", action="store_true",
                         help="Evaluate eight geometric augmentations (AM/POMO).")
     parser.add_argument("--device", type=str, default=None,
@@ -130,7 +135,11 @@ def main() -> None:
     else:
         ds = env.dataset(batch_size=[args.n_inst])
 
-    result = eval_utils.evaluate(model, args, env, ds)
+    if args.plot:
+        result, plot_instances = eval_utils.evaluate(
+            model, args, env, ds, return_instances=args.plot)
+    else:
+        result = eval_utils.evaluate(model, args, env, ds)
     result["backbone"] = args.model
     result["num_loc"] = args.num_loc
     result["seed"] = args.seed
@@ -144,6 +153,30 @@ def main() -> None:
           f"(mean reward = {result['mean_reward']:.4f})  "
           f"inference = {result['elapsed_seconds']:.2f}s "
           f"({result['throughput_per_sec']:.0f} inst/s)")
+
+    # ---- optional publication-quality route plots ----
+    if args.plot:
+        from rl4co.utils.cvrp_plot import render_cvrp_solution
+
+        plot_dir = Path(args.plot_dir) if args.plot_dir \
+            else Path("results") / "plots"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+
+        if not plot_instances:
+            print(f"[warn] --plot requested but no per-instance actions were "
+                  f"collected (backbone {args.model} or --augment) — skipping.")
+        rendered = 0
+        for i, inst in enumerate(plot_instances):
+            if rendered >= args.plot:
+                break
+            render_cvrp_solution(
+                inst["td"], inst["actions"],
+                plot_dir / f"{args.model}_inst{i}")
+            rendered += 1
+        if rendered < args.plot:
+            print(f"[warn] --plot {args.plot} but only {rendered} instance(s) "
+                  f"had actions to render.")
+        print(f"[OK] rendered {rendered} route plot(s) -> {plot_dir}")
 
     out_path = args.out or Path("results") / \
         f"eval_{args.model}_{args.num_loc}_{args.seed}.json"
