@@ -57,10 +57,7 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=128,
                         help="Eval batch size")
     parser.add_argument("--num_starts", type=int, default=50,
-                        help="Multi-start greedy for POMO/AM checkpoints. For "
-                             "--dataset cvrplib this is the POMO multi-start "
-                             "count (default 100). Not used by elg/dgl/radar "
-                             "(baked pomo_size) nor sil/icam/l2r/invit.")
+                        help="Multi-start greedy for POMO/AM checkpoints.")
     parser.add_argument("--sizes", type=str, default=None,
                         help="Comma list of n to evaluate on CVRPLIB Set X "
                              "(default: all). e.g. 101,110")
@@ -68,11 +65,7 @@ def main() -> None:
                         choices=["greedy", "sampling", "multistart_greedy",
                                  "multistart_sampling", "beam_search"],
                         help="Decoding strategy wired to every model.")
-    parser.add_argument("--plot", type=int, default=None,
-                        help="Render the first N solved instances as "
-                             "publication-quality PDF/PNG in results/plots/ "
-                             "(synthetic dataset; action backbones "
-                             "am/pomo/pomo_base/elg/radar).")
+    parser.add_argument("--plot", type=int, default=4)
     parser.add_argument("--plot_dir", type=str, default=None,
                         help="Output directory for --plot figures "
                              "(default: results/plots).")
@@ -154,7 +147,6 @@ def main() -> None:
           f"inference = {result['elapsed_seconds']:.2f}s "
           f"({result['throughput_per_sec']:.0f} inst/s)")
 
-    # ---- optional publication-quality route plots ----
     if args.plot:
         from rl4co.utils.cvrp_plot import render_cvrp_solution
 

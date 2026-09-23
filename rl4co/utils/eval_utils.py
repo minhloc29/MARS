@@ -161,13 +161,22 @@ def evaluate(model, args, env, ds, return_instances: int | None = None):
             if isinstance(batch, dict):
                 batch = TensorDict(batch, batch_size=[batch["demand"].size(0)])
             batch = batch.to(args.device)
+            # env.reset(batch) in the decoders writes reset state back onto the
+            # input td's keys in place (torchrl _update_during_reset), which
+            # prepends the depot into ``locs`` (100->101). Keep a pristine copy
+            # of the pre-decode batch so the plot reset below sees clean shapes.
+            pristine = batch.clone() if plot_instances is not None else None
             reward_batch, num_starts, actions = dec(model, batch, args, env)
             rewards.append(reward_batch.cpu())
             if plot_instances is not None and actions is not None:
                 B = batch.batch_size[0]
                 # Reconstruct the reset td (depot-first locs) for the batch so
                 # per-start tour lengths can be recomputed for the best route.
-                td_reset = env.reset(batch)
+                # ``env.reset`` rebinds ``locs`` in place (the RL framework
+                # writes reset state back onto the input td), so the decode
+                # above already prepended the depot into ``batch["locs"]``.
+                # Reset the pristine pre-decode copy instead of the mutated batch.
+                td_reset = env.reset(pristine)
                 for i in range(B):
                     if len(plot_instances) >= return_instances:
                         break

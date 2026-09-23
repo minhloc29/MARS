@@ -1,23 +1,3 @@
-"""Reader for the cached slot-NCO datasets produced by generate_slot_dataset.py.
-
-The generator writes a dict to disk per split with keys:
-
-    locs (B, N, 2), depot (B, 2), demand (B, N)  [demand pre-normalized by capacity]
-    capacity (B, 1), d_ins_idx (B, N, k) int16, d_ins_val (B, N, k) float32
-    format_version ("sparse_v2"), method
-
-:class:`SlotDataset` loads one such file and wraps it as a
-:class:`torch.utils.data.Dataset`, and :func:`make_dataloader` builds the
-training/validation :class:`DataLoader` that POMOSlot/AMSlot consume.
-
-Keeping this beside the generator (rather than inlined in train.py) gives every
-consumer — train.py, test.py, eval scripts — a single shared reader, so the
-on-disk schema only has to be defined once.
-
-The ``variant`` argument mirrors the POMOSlot/AMSlot ablation switch. d_ins is
-needed only for Variant D, so it is loaded conditionally to save memory on the
-other variants (which still re-read the file's format header).
-"""
 from __future__ import annotations
 
 import hashlib
