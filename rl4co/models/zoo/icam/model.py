@@ -108,6 +108,8 @@ class ICAMCVRP(pl.LightningModule):
         demand = batch["demand"].to(dtype=torch.float32)
         if demand.max() > 1:
             demand = demand / capacity
+        print(f"[debug] demand after _batch: min={demand.min().item():.4f} "
+            f"max={demand.max().item():.4f} mean={demand.mean().item():.4f}")  # ADD THIS
         depot = batch["depot"].to(dtype=torch.float32).unsqueeze(1)
         nodes = batch["locs"].to(dtype=torch.float32)
         return depot, nodes, demand

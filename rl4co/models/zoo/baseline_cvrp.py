@@ -13,7 +13,6 @@ import torch
 
 
 def normalize_batch(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Return the common depot-first representation used by DGL and ELG."""
     locs = batch["locs"].float()
     depot = batch["depot"].float()
     if depot.ndim == 2:
@@ -22,9 +21,11 @@ def normalize_batch(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     capacity = batch.get("capacity")
     if capacity is not None:
         capacity = capacity.float().reshape(-1, 1)
-        # Current generated data is normalized already (capacity == 1).  This
-        # also makes the adapter safe for a cache containing raw demands.
-        if bool((capacity > 1 + 1e-6).any()):
+        # Only divide if demand itself still looks raw (i.e. values plausibly
+        # exceed 1, meaning it hasn't been pre-normalized by capacity yet).
+        # A capacity field alone is not sufficient evidence — some caches
+        # store normalized demand alongside the original raw capacity value.
+        if bool((demand.amax(dim=tuple(range(1, demand.dim()))) > 1 + 1e-6).any()):
             demand = demand / capacity
     return {
         "xy": torch.cat((depot, locs), 1),

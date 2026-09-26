@@ -47,12 +47,14 @@ def main() -> None:
                            help="gaussian: std of the location Normal distribution.")
     dist_args.add_argument("--loc_rate", type=float, default=None,
                            help="exponential/poisson: rate parameter.")
+    parser.add_argument("--alpha", type=float, default=1.0,
+                        help="Spatial stress shift of customers around the depot, "
+                             "x' = d + alpha*(x - d). alpha<1 implodes, >1 explodes "
+                             "(clipped to [0,1]^2). alpha=1 = no shift.")
     args = parser.parse_args()
 
     pl.seed_everything(args.seed, workers=True)
 
-    # Build generator_params: base + the chosen distribution. Only pass the args that
-    # the distribution actually needs, so the unused ones don't leak into the sampler.
     generator_params = dict(num_loc=args.num_loc, loc_distribution=args.loc_dist)
     for key in ("num_modes", "cdist", "n_cluster", "n_cluster_mix",
                 "loc_mean", "loc_std", "loc_rate"):
@@ -60,20 +62,23 @@ def main() -> None:
         if value is not None:
             generator_params[key] = value
 
-    # Mirrors test.py: CVRPEnv with the same generator_params at the same target size.
-    # NOTE: use env.generator() directly (not env.dataset()) so we get the raw
-    # TensorDict, which is what save_tensordict_to_npz() expects (env.dataset()
-    # returns a TensorDictDataset wrapper object).
     env = CVRPEnv(generator_params=generator_params)
     td = env.generator([args.n_inst])
 
+    if args.alpha != 1.0:
+        d = td["locs"][:, :1, :]          # depot row, kept fixed
+        td["locs"] = (d + args.alpha * (td["locs"] - d)).clamp(0.0, 1.0)
+
     if args.out is None:
-            if args.loc_dist == "uniform":
-                out = Path(f"data/test/cvrp_{args.num_loc}_uniform_seed{args.seed}.npz")
-            elif args.loc_dist == "gaussian":
-                out = Path(f"data/test/cvrp_{args.num_loc}_gaussian_mean{args.loc_mean}_std{args.loc_std}_seed{args.seed}.npz")
-            elif args.loc_dist == "cluster":
-                out = Path(f"data/test/cvrp_{args.num_loc}_cluster_n{args.n_cluster}_seed{args.seed}.npz")
+        if args.alpha != 1.0:
+            out = Path(f"data/test/cvrp_{args.num_loc}_{args.loc_dist}"
+                       f"_alpha{args.alpha}_seed{args.seed}.npz")
+        elif args.loc_dist == "uniform":
+            out = Path(f"data/test/cvrp_{args.num_loc}_uniform_seed{args.seed}.npz")
+        elif args.loc_dist == "gaussian":
+            out = Path(f"data/test/cvrp_{args.num_loc}_gaussian_mean{args.loc_mean}_std{args.loc_std}_seed{args.seed}.npz")
+        elif args.loc_dist == "cluster":
+            out = Path(f"data/test/cvrp_{args.num_loc}_cluster_n{args.n_cluster}_seed{args.seed}.npz")
     else:
         out = Path(args.out)
     

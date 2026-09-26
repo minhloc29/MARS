@@ -122,7 +122,7 @@ def decode_icam(model, batch, args, env):
     # scalar-reward backbone: mark feasible by construction (no actions needed)
     return r.max(dim=1).values, 1, None
 
-
+    
 def decode_l2r(model, batch, args, env):
     r, _ = model._rollout(batch, sampling=is_sampling(args.decode))
     return r, 1, None
@@ -142,11 +142,12 @@ def decode_invit(model, batch, args, env):
 
 
 def decode_radar(model, batch, args, env):
-    from rl4co.models.zoo.baseline_cvrp import rollout as radar_rollout
+    from rl4co.models.zoo.baseline_cvrp import rollout as radar_rollout, normalize_batch
 
     width = model.hparams.pomo_size
     out = radar_rollout(
         model.policy, batch, width, greedy_name(args.decode), False)
+    
     return out["reward"].max(dim=1).values, out["reward"].shape[1], out.get("actions", None)
 
 
