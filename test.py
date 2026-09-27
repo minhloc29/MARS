@@ -78,6 +78,10 @@ def main() -> None:
                              "(default: results/plots).")
     parser.add_argument("--augment", action="store_true",
                         help="Evaluate eight geometric augmentations (AM/POMO).")
+    parser.add_argument("--local_search", action="store_true",
+                        help="Also run HGS SWAP* local search (env.local_search) "
+                             "on the decoded routes and report the improved tour "
+                             "length separately. Requires the HGS-CVRP build.")
     parser.add_argument("--device", type=str, default=None,
                         help="Device such as cuda, mps, or cpu")
     parser.add_argument("--seed", type=int, default=1234,
@@ -153,6 +157,10 @@ def main() -> None:
           f"(mean reward = {result['mean_reward']:.4f})  "
           f"inference = {result['elapsed_seconds']:.2f}s "
           f"({result['throughput_per_sec']:.0f} inst/s)")
+    if "mean_tour_length_local_search" in result:
+        print(f"[LS] local-search refined mean tour = "
+              f"{result['mean_tour_length_local_search']:.4f} "
+              f"(std {result['std_tour_length_local_search']:.4f})")
 
     # ---- optional publication-quality route plots ----
     if args.plot:

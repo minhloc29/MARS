@@ -6,6 +6,10 @@ from tensordict import TensorDict
 from rl4co.models.zoo.pomo_slot.model_am import SingleSharedBaseline
 from rl4co.data.utils import load_npz_to_tensordict
 from rl4co.utils.decoding import get_decoding_strategy
+from rl4co.utils.ops import batchify, gather_by_index, get_tour_length
+from rl4co.utils.pylogger import get_pylogger
+
+log = get_pylogger(__name__)
 
 
 def pick_device(value: str | None) -> torch.device:
@@ -62,6 +66,59 @@ def _allow_safe_globals() -> None:
 
 def is_sampling(decode_type: str) -> bool:
     return decode_type in ("sampling", "multistart_sampling")
+
+
+def apply_local_search(
+    env, td_reset, actions, num_starts
+):
+    """Run env.local_search (HGS SWAP*) over a decoded batch and return improved
+    tour lengths per instance, reduced the same way the reward is.
+
+    ``actions`` comes back from the autogressive decoder interleaved by start
+    (the ``batchify`` layout: [inst0_s0, inst1_s0, ..., inst0_s1, ...]), with
+    num_starts copies of each base instance. env.local_search expects a flat
+    (B, seq) batch padded with depot(0) at the head/tail and returns the same.
+
+    To keep the comparison with the neural-only number exact, we run the
+    improvement on the full (batchified) batch and reduce via the same
+    reshape(B, num_starts).max(dim=1) used for the reward.
+
+    Args:
+        env: CVRPEnv (must have a working local_search implementation)
+        td_reset: TensorDict post env.reset(batch), depot-first locs, matching
+            the batch the decoder ran on ([B, ...]).
+        actions: torch.Tensor actions from the decoder, [B*num_starts, seq],
+            interleaved by start.
+        num_starts: number of starts per instance (reward width).
+    Returns:
+        torch.Tensor [batch_size,] improved tour length per instance (or None
+        if local search is unavailable).
+    """
+    try:
+        ls = getattr(env, "local_search", None)
+        if ls is None:
+            return None
+        B = td_reset.batch_size[0]
+        # Expand the td to the interleaved [B*ns, ...] layout the decoder used,
+        # so its locs/demand align with the action rows.
+        td_ls = batchify(td_reset, num_starts)
+        improved = ls(td_ls, actions)
+        if improved is None:
+            return None
+        improved = improved.view(B, num_starts, -1)
+        locs = td_reset["locs"]  # [B, N+1, 2], depot-first
+        ordered = torch.cat(
+            [
+                locs[:, :1][:, None].expand(B, num_starts, 1, 2),
+                gather_by_index(locs, improved, dim=1),
+            ],
+            dim=1,
+        )
+        lens = get_tour_length(ordered)  # [B, num_starts]
+        return lens.max(dim=1).values
+    except Exception as e:
+        log.warning(f"local_search unavailable, skipping: {e}")
+        return None
 
 
 def greedy_name(decode_type: str) -> str:
@@ -150,6 +207,7 @@ def evaluate(model, args, env, ds, return_instances: int | None = None):
     model.eval()
     dec = REGISTRY[args.model]
     rewards = []
+    local_search_lens = []
     num_starts = 1
     # When plotting is requested, keep the first ``return_instances`` decoded
     # solutions (post-reset td with depot + actions) so routes can be drawn.
@@ -163,6 +221,13 @@ def evaluate(model, args, env, ds, return_instances: int | None = None):
             batch = batch.to(args.device)
             reward_batch, num_starts, actions = dec(model, batch, args, env)
             rewards.append(reward_batch.cpu())
+            if getattr(args, "local_search", False) and actions is not None:
+                # Reset the (depot-first) td for the full batch, then improve and
+                # reduce per-instance identically to the reward path.
+                td_reset = env.reset(batch)
+                ls_len = apply_local_search(env, td_reset, actions, num_starts)
+                if ls_len is not None:
+                    local_search_lens.append(ls_len.cpu())
             if plot_instances is not None and actions is not None:
                 B = batch.batch_size[0]
                 # Reconstruct the reset td (depot-first locs) for the batch so
@@ -189,6 +254,12 @@ def evaluate(model, args, env, ds, return_instances: int | None = None):
         "elapsed_seconds": elapsed,
         "throughput_per_sec": len(reward) / elapsed if elapsed > 0 else 0.0,
     }
+    if local_search_lens:
+        ls_all = torch.cat(local_search_lens)
+        result["mean_tour_length_local_search"] = float(ls_all.mean())
+        result["std_tour_length_local_search"] = (
+            float(ls_all.std()) if len(ls_all) > 1 else 0.0
+        )
     if return_instances is not None:
         return result, plot_instances
     return result
