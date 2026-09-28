@@ -27,7 +27,7 @@ try:
     from rl4co.models.zoo.icam import ICAMCVRP
     from rl4co.models.zoo.invit import INViT
     from rl4co.models.zoo.l2r import L2RModel
-    from rl4co.models.zoo.lehd import LEHDModel, TTRLModel
+    from rl4co.models.zoo.lehd import LEHDModel, TTRLModel, LEHDSlotModel
     from rl4co.models.zoo.lehd.model import make_lehd_dataloaders
     from rl4co.models.zoo.pomo_slot import AMSlot, POMOSlot
     from rl4co.models.zoo.radar import RADAR
@@ -58,6 +58,7 @@ MODEL_CLASSES = {
     "sil": SIL,
     "lehd": LEHDModel,
     "ttpl": TTRLModel,
+    "lehd_slot": LEHDSlotModel,
 }
 
 
@@ -205,9 +206,11 @@ def train(
     )
 
     # ----------------------------------------------------------------
-    # LEHD / TTPL branch — separate training loop using LEHD's own data
+    # LEHD / TTPL / LEHD-SLOT branch — separate training loop using LEHD's
+    # own data.  `lehd_slot` is the POMOSlot-core integration on top of
+    # LEHD's supervised teacher-forcing loop.
     # ----------------------------------------------------------------
-    if backbone in ("lehd", "ttpl"):
+    if backbone in ("lehd", "ttpl", "lehd_slot"):
         return _train_lehd(
             backbone=backbone,
             num_loc=num_loc,
@@ -226,6 +229,18 @@ def train(
             lehd_data_path=lehd_data_path,
             lehd_val_data_path=lehd_val_data_path,
             lehd_decoder_layers=lehd_decoder_layers,
+            num_slots=num_slots,
+            metric_variant=metric_variant,
+            alpha_metric=alpha_metric,
+            beta_entropy=beta_entropy,
+            slot_iters=slot_iters,
+            proj_dim=proj_dim,
+            lambda_init=lambda_init,
+            lr_dual=lr_dual,
+            ins_method=ins_method,
+            normalize_target=normalize_target,
+            symmetrize_target=symmetrize_target,
+            disable_slots=disable_slots,
         )
 
     pl.seed_everything(seed)
@@ -613,8 +628,26 @@ def _train_lehd(
     lehd_data_path: str | None,
     lehd_val_data_path: str | None,
     lehd_decoder_layers: int,
+    # ---- LEHD-SLOT (POMOSlot-core) arguments ----
+    num_slots: int = 8,
+    metric_variant: str = "D",
+    alpha_metric: float = 0.1,
+    beta_entropy: float = 0.01,
+    slot_iters: int = 3,
+    proj_dim: int = 64,
+    lambda_init: float = 1.0,
+    lr_dual: float = 1e-3,
+    ins_method: str = "construction",
+    normalize_target: bool = True,
+    symmetrize_target: bool = True,
+    disable_slots: bool = False,
 ) -> dict:
-    """Train LEHD or TTPL backbone under the same Lightning Trainer as MARS."""
+    """Train LEHD, TTPL, or LEHD-SLOT under the same Lightning Trainer as MARS.
+
+    `lehd_slot` constructs :class:`LEHDSlotModel`, which keeps LEHD's supervised
+    teacher-forcing loop and heavy decoder but grafts in POMOSlot's metric-aware
+    SlotAttention core (slot injection + entropy/metric aux losses).
+    """
     import json
 
     if lehd_data_path is None:
@@ -630,17 +663,41 @@ def _train_lehd(
         n_train = min(n_train, max_instances)
         n_val = min(n_val, max(1, max_instances // 10))
 
-    model_cls = MODEL_CLASSES[backbone]  # LEHDModel or TTRLModel
-    model = model_cls(
-        data_path=lehd_data_path,
-        val_data_path=lehd_val_data_path,
-        num_loc=num_loc,
-        embed_dim=embed_dim,
-        decoder_layer_num=lehd_decoder_layers,
-        n_train_episodes=n_train,
-        n_val_episodes=n_val,
-        optimizer_kwargs={"lr": lr},
-    )
+    model_cls = MODEL_CLASSES[backbone]  # LEHDModel, TTRLModel, or LEHDSlotModel
+    if backbone == "lehd_slot":
+        model = model_cls(
+            data_path=lehd_data_path,
+            val_data_path=lehd_val_data_path,
+            num_loc=num_loc,
+            embed_dim=embed_dim,
+            decoder_layer_num=lehd_decoder_layers,
+            n_train_episodes=n_train,
+            n_val_episodes=n_val,
+            optimizer_kwargs={"lr": lr},
+            num_slots=num_slots,
+            metric_variant=metric_variant,
+            alpha_metric=alpha_metric,
+            beta_entropy=beta_entropy,
+            slot_iters=slot_iters,
+            proj_dim=proj_dim,
+            lambda_init=lambda_init,
+            lr_dual=lr_dual,
+            ins_method=ins_method,
+            normalize_target=normalize_target,
+            symmetrize_target=symmetrize_target,
+            disable_slots=disable_slots,
+        )
+    else:
+        model = model_cls(
+            data_path=lehd_data_path,
+            val_data_path=lehd_val_data_path,
+            num_loc=num_loc,
+            embed_dim=embed_dim,
+            decoder_layer_num=lehd_decoder_layers,
+            n_train_episodes=n_train,
+            n_val_episodes=n_val,
+            optimizer_kwargs={"lr": lr},
+        )
 
     train_loader, val_loader = make_lehd_dataloaders(
         n_train=n_train,
@@ -650,10 +707,19 @@ def _train_lehd(
         num_workers=0,  # data lives inside the model; no worker overhead needed
     )
 
-    run_name = (
-        f"{backbone}_N{num_loc}_seed{seed}_d{embed_dim}"
-        f"_dec{lehd_decoder_layers}"
-    )
+    if backbone == "lehd_slot":
+        run_name = (
+            f"{backbone}_N{num_loc}_seed{seed}_d{embed_dim}"
+            f"_dec{lehd_decoder_layers}_K{num_slots}_{metric_variant}"
+            f"_a{alpha_metric:g}_b{beta_entropy:g}_it{slot_iters}"
+            f"_p{proj_dim}_lam{lambda_init:g}_ld{lr_dual:g}_{ins_method}"
+            f"_n{int(normalize_target)}s{int(symmetrize_target)}"
+        )
+    else:
+        run_name = (
+            f"{backbone}_N{num_loc}_seed{seed}_d{embed_dim}"
+            f"_dec{lehd_decoder_layers}"
+        )
     log_path = Path(output) / run_name
 
     trainer, checkpoint_cb, _ = _make_trainer(
@@ -662,7 +728,14 @@ def _train_lehd(
     print(f"\n{'='*60}")
     print(f"Training {model_cls.__name__} | N={num_loc}")
     print(f"  Epochs: {epochs}  Batch: {batch_size}  LR: {lr}")
-    print(f"  embed_dim: {embed_dim}  decoder_layers: {lehd_decoder_layers}")
+    if backbone == "lehd_slot":
+        print(f"  embed_dim: {embed_dim}  decoder_layers: {lehd_decoder_layers}")
+        print(f"  Slots: K={num_slots}  variant={metric_variant}  "
+              f"alpha={alpha_metric:g}  beta={beta_entropy:g}  iters={slot_iters}")
+        print(f"  proj_dim={proj_dim}  lambda_init={lambda_init:g}  "
+              f"lr_dual={lr_dual:g}  ins_method={ins_method}")
+    else:
+        print(f"  embed_dim: {embed_dim}  decoder_layers: {lehd_decoder_layers}")
     print(f"  n_train: {n_train}  n_val: {n_val}")
     print(f"  data: {lehd_data_path}")
     print(f"  Output: {log_path}")
@@ -690,6 +763,16 @@ def _train_lehd(
         "lehd_data_path": lehd_data_path,
         "lehd_val_data_path": lehd_val_data_path,
     }
+    if backbone == "lehd_slot":
+        result.update(
+            num_slots=num_slots, metric_variant=metric_variant,
+            alpha_metric=alpha_metric, beta_entropy=beta_entropy,
+            slot_iters=slot_iters, proj_dim=proj_dim,
+            lambda_init=lambda_init, lr_dual=lr_dual,
+            ins_method=ins_method, disable_slots=disable_slots,
+            normalize_target=normalize_target,
+            symmetrize_target=symmetrize_target,
+        )
 
     result_dir = Path(output)
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -698,6 +781,12 @@ def _train_lehd(
                          ) if result_file.exists() else []
     dedup_key = {k: result[k]
                  for k in ("backbone", "num_loc", "seed", "embed_dim")}
+    if backbone == "lehd_slot":
+        dedup_key.update({k: result[k] for k in (
+            "num_slots", "metric_variant", "alpha_metric", "beta_entropy",
+            "slot_iters", "proj_dim", "lambda_init", "lr_dual",
+            "ins_method", "disable_slots", "normalize_target",
+            "symmetrize_target")})
     results = [r for r in results if not all(
         r.get(k) == v for k, v in dedup_key.items())]
     results.append(result)
@@ -726,7 +815,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max_instances", type=int, default=None)
     parser.add_argument("--backbone", default="pomo",
-                        choices=["pomo", "am", "l2r", "icam", "sil", "invit", "dgl", "elg", "radar", "lehd", "ttpl"])
+                        choices=["pomo", "am", "l2r", "icam", "sil", "invit", "dgl", "elg", "radar", "lehd", "ttpl", "lehd_slot"])
     parser.add_argument("--embed_dim", type=int, default=128)
     parser.add_argument("--num_slots", type=int, default=8)
     parser.add_argument("--proj_dim", type=int, default=64)
@@ -842,6 +931,18 @@ def main():
         lehd_data_path=args.lehd_data_path,
         lehd_val_data_path=args.lehd_val_data_path,
         lehd_decoder_layers=args.lehd_decoder_layers,
+        num_slots=args.num_slots,
+        metric_variant=args.metric_variant,
+        alpha_metric=args.alpha_metric,
+        beta_entropy=args.beta_entropy,
+        slot_iters=args.slot_iters,
+        proj_dim=args.proj_dim,
+        lambda_init=args.lambda_init,
+        lr_dual=args.lr_dual,
+        ins_method=args.ins_method,
+        normalize_target=args.normalize_target,
+        symmetrize_target=args.symmetrize_target,
+        disable_slots=args.disable_slots,
         invit_action_size=args.invit_action_size,
         invit_state_sizes=tuple(args.invit_state_sizes),
         invit_num_heads=args.invit_num_heads,

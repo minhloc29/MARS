@@ -71,29 +71,7 @@ def is_sampling(decode_type: str) -> bool:
 def apply_local_search(
     env, td_reset, actions, num_starts
 ):
-    """Run env.local_search (HGS SWAP*) over a decoded batch and return improved
-    tour lengths per instance, reduced the same way the reward is.
-
-    ``actions`` comes back from the autogressive decoder interleaved by start
-    (the ``batchify`` layout: [inst0_s0, inst1_s0, ..., inst0_s1, ...]), with
-    num_starts copies of each base instance. env.local_search expects a flat
-    (B, seq) batch padded with depot(0) at the head/tail and returns the same.
-
-    To keep the comparison with the neural-only number exact, we run the
-    improvement on the full (batchified) batch and reduce via the same
-    reshape(B, num_starts).max(dim=1) used for the reward.
-
-    Args:
-        env: CVRPEnv (must have a working local_search implementation)
-        td_reset: TensorDict post env.reset(batch), depot-first locs, matching
-            the batch the decoder ran on ([B, ...]).
-        actions: torch.Tensor actions from the decoder, [B*num_starts, seq],
-            interleaved by start.
-        num_starts: number of starts per instance (reward width).
-    Returns:
-        torch.Tensor [batch_size,] improved tour length per instance (or None
-        if local search is unavailable).
-    """
+   
     try:
         ls = getattr(env, "local_search", None)
         if ls is None:
