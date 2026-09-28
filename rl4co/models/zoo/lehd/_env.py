@@ -20,6 +20,7 @@ Coordinate / tensor conventions (matching original):
 from __future__ import annotations
 
 import os
+from itertools import islice
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -84,19 +85,21 @@ class LEHDVRPEnv:
     # Data loading
     # ------------------------------------------------------------------
 
-    def load_raw_data(self, n_episodes: int = 1_000_000) -> None:
-        """Parse LEHD-format .txt dataset.  Loads up to n_episodes lines."""
+    def load_raw_data(self, n_episodes: int = 1_000_000, offset: int = 0) -> None:
+        """Parse a bounded slice of an LEHD-format ``.txt`` dataset."""
         nodes_list, demand_list, cap_list, cost_list, flag_list = [], [], [], [], []
 
         def _two_col(node_flag):
             V = len(node_flag) // 2
             return [[node_flag[i], node_flag[V + i]] for i in range(V)]
 
+        # Stream only the requested prefix.  The N=100 training file is several
+        # gigabytes, so readlines() would load the entire million-instance file
+        # even for a small n_train smoke run.
         with open(self.data_path, "r") as f:
-            lines = f.readlines()
+            lines = list(islice(f, offset, offset + n_episodes))
 
-        # For training LEHD reads 2×0.5M in two chunks; we simplify to one pass.
-        for line in lines[:n_episodes]:
+        for line in lines:
             tok = line.split(",")
             di = tok.index("depot")
             ci = tok.index("customer")
@@ -127,12 +130,18 @@ class LEHDVRPEnv:
             cost_list.append(cost)
             flag_list.append(node_flag)
 
+        if not nodes_list:
+            raise ValueError(f"No LEHD instances were loaded from {self.data_path}")
+
         self.raw_data_nodes = torch.tensor(nodes_list, dtype=torch.float32)
         self.raw_data_demand = torch.tensor(demand_list, dtype=torch.float32)
         self.raw_data_capacity = torch.tensor(cap_list, dtype=torch.float32)
         self.raw_data_cost = torch.tensor(cost_list, dtype=torch.float32)
         self.raw_data_node_flag = torch.tensor(flag_list, dtype=torch.long)
-        print(f"[LEHDVRPEnv] Loaded {len(self.raw_data_nodes)} instances from {self.data_path}")
+        print(
+            f"[LEHDVRPEnv] Loaded {len(self.raw_data_nodes)} instances "
+            f"from {self.data_path} (offset={offset})"
+        )
 
     def shuffle_data(self) -> None:
         idx = torch.randperm(len(self.raw_data_nodes))
@@ -391,37 +400,27 @@ class LEHDVRPEnv:
     ) -> torch.Tensor:
         """Tour length for a batch of solutions."""
         V = order_node.shape[1]
-        flag = order_flag.clone()
-        flag_next = flag.clone()
-        flag_next[:, 0] = 0
-
-        # For each step: distance to next node if continuing, or depot+customer if flag=1
-        node_idx = order_node
-        roll_idx = order_node.roll(1, dims=1)
+        flag = order_flag.bool()
+        node_idx = order_node.long()
+        previous_idx = node_idx.roll(1, dims=1)
 
         def _gather(locs, idx):
             return locs.gather(1, idx.unsqueeze(2).expand(-1, V, 2))
 
         depot_loc = xy[:, [0], :].expand(-1, V, -1)
-        # Positions in problems: node i is at index i in xy (0=depot, 1..V=customers)
-        order_loc = _gather(xy, node_idx)
-        roll_loc = _gather(xy, roll_idx)
-        flag_loc = flag.unsqueeze(2).expand(-1, V, 2)
-        # When flag=1, previous leg ends at depot rather than previous node
-        leg_to_depot = torch.where(
-            flag.bool().unsqueeze(2).expand(-1, V, 2),
-            depot_loc, order_loc
+        current_loc = _gather(xy, node_idx)
+        previous_loc = _gather(xy, previous_idx)
+
+        # The representation is cyclic.  flag[t] means customer t starts a
+        # new vehicle route, so replace previous->current by
+        # previous->depot->current.  In particular flag[0]=1 closes the final
+        # route to the depot and starts the first route from it.
+        direct = (current_loc - previous_loc).norm(dim=2)
+        via_depot = (
+            (previous_loc - depot_loc).norm(dim=2)
+            + (current_loc - depot_loc).norm(dim=2)
         )
-        flag_loc2 = flag_next.unsqueeze(2).expand(-1, V, 2)
-        leg_from_depot = torch.where(
-            flag_next.bool().unsqueeze(2).expand(-1, V, 2),
-            depot_loc, roll_loc
-        )
-        lengths = (
-            (order_loc - leg_to_depot).pow(2).sum(2).sqrt()
-            + (roll_loc - leg_from_depot).pow(2).sum(2).sqrt()
-        ).sum(1)
-        return lengths
+        return torch.where(flag, via_depot, direct).sum(dim=1)
 
     def _get_travel_distance(self) -> Tuple[torch.Tensor, torch.Tensor]:
         xy = self.problems[:, :, :2]

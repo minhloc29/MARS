@@ -253,8 +253,9 @@ class LEHDSlotModel(LEHDModel):
             {"params": dual_params, "lr": lr_dual},  # dual ascent, unscheduled
         ]
         optimizer = torch.optim.Adam(param_groups)
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=1, gamma=0.97
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=[lambda epoch: 0.97**epoch, lambda epoch: 1.0],
         )
         return {
             "optimizer": optimizer,
@@ -336,11 +337,10 @@ class LEHDSlotModel(LEHDModel):
         optimizer = self.optimizers()
         hp = self.hparams
         episode_start = batch["episode_start"].item()
+        batch_size = batch["batch_size"].item()
 
         env = self._train_env
-        env.load_problems(
-            episode_start, hp.n_train_episodes // max(1, self.trainer.num_training_batches)
-        )
+        env.load_problems(episode_start, batch_size)
 
         dev = self.device
         env.problems = env.problems.to(dev)
@@ -352,12 +352,23 @@ class LEHDSlotModel(LEHDModel):
 
         # ---- Encode once (through slots) and cache the side-channel ----
         if not self.disable_slots:
-            self.model._encoded = self.model.encoder(env.problems, capacity)
+            encoded_graph = self.model.encoder(env.problems, capacity)
             slots = self.model.encoder.last_slots      # (B, K, d)
             A_ik = self.model.encoder.last_A_ik        # (B, V, K)
         else:
-            self.model._encoded = self.model.encoder(env.problems, capacity)
+            encoded_graph = self.model.encoder(env.problems, capacity)
             slots = A_ik = None
+
+        # Backpropagate each heavy-decoder step immediately so its attention
+        # activations can be released.  Decoder gradients accumulate normally
+        # while the leaf gradient is bridged through the encoder once below.
+        # This is mathematically equivalent to backpropagating the averaged CE
+        # loss at the end, but avoids retaining an entire route of decoder
+        # graphs (which is prohibitive for the intended batch_size=64).
+        encoded_decoder = encoded_graph.detach().requires_grad_(True)
+        self.model._encoded = encoded_decoder
+        num_loss_steps = max(env.solution.shape[1] - 1, 1)
+        optimizer.zero_grad()
 
         loss_sum = torch.tensor(0.0, device=dev)
         step = 0
@@ -394,6 +405,7 @@ class LEHDSlotModel(LEHDModel):
 
             prob_teacher = probs.gather(1, target[:, None]).clamp_min(1e-9)
             loss = -prob_teacher.log().mean()
+            self.manual_backward(loss / num_loss_steps)
             loss_sum = loss_sum + loss.detach()
 
             # Greedy student (for the env step; unused in loss).
@@ -411,18 +423,22 @@ class LEHDSlotModel(LEHDModel):
                 target_flag.long(), flag_student,
             )
 
-        # ---- Assemble the total loss (CE + aux) and one backward ----
-        ce_loss = loss_sum / max(step - 1, 1)
+        # ---- Backpropagate accumulated CE into the encoder plus aux losses ----
+        ce_loss = loss_sum / num_loss_steps
         aux_loss, log_dict = self._aux_losses(
             slotted=not self.disable_slots,
             slots=slots, A_ik=A_ik,
             problems=env.problems, device=dev,
         )
-        total = ce_loss + aux_loss
+        if encoded_decoder.grad is None:
+            raise RuntimeError("LEHD decoder produced no gradient for its encoding")
+        encoder_bridge = (
+            encoded_graph * encoded_decoder.grad.detach()
+        ).sum()
+        self.manual_backward(encoder_bridge + aux_loss)
 
-        optimizer.zero_grad()
-        self.manual_backward(total)
         optimizer.step()
+        total = ce_loss + aux_loss.detach()
 
         self.log("train/loss", ce_loss.item(), on_step=False, on_epoch=True,
                  prog_bar=True, sync_dist=True)
@@ -432,6 +448,66 @@ class LEHDSlotModel(LEHDModel):
             self.log(f"train/{k}", v, on_step=False, on_epoch=True, sync_dist=True)
 
         return total
+
+    def validation_step(self, batch, batch_idx):
+        """Greedy validation with one stable slot encoding per instance.
+
+        The base LEHD validation path calls ``decode_step``, which re-encodes
+        the instance at every decoding step.  SlotAttention samples its initial
+        slots on each forward, so that path would use a different slot context
+        at every step and would not match this model's cached-encoding training
+        semantics.
+        """
+        episode_start = batch["episode_start"].item()
+        requested_batch_size = batch["batch_size"].item()
+
+        env = self._val_env
+        env.load_problems(episode_start, requested_batch_size)
+        batch_size = env.problems.shape[0]
+        dev = self.device
+        env.problems = env.problems.to(dev)
+        env.solution = env.solution.to(dev)
+
+        env.reset("test")
+        state, _, _, done = env.pre_step()
+        capacity = float(env.raw_data_capacity[0].item())
+        self.model._encoded = self.model.encoder(env.problems, capacity)
+
+        step = 0
+        r_stud = None
+        with torch.no_grad():
+            while not done:
+                if step == 0:
+                    selected = env.solution[:, 0, 0].long()
+                    sel_flag = env.solution[:, 0, 1].long()
+                    step += 1
+                    state, _, _, done = env.step(
+                        selected, selected, sel_flag, sel_flag
+                    )
+                    continue
+
+                remaining_cap = state.problems[:, 0, 3]
+                probs = self.model.decoder(
+                    self.model._encoded,
+                    env.selected_node_list,
+                    capacity,
+                    remaining_cap,
+                )
+                V = state.problems.shape[1] - 1
+                student_flat = probs.argmax(dim=1)
+                is_via = student_flat >= V
+                sel_node = torch.where(
+                    is_via, student_flat - V + 1, student_flat + 1
+                ).long()
+                sel_flag = is_via.long()
+                step += 1
+                state, _, r_stud, done = env.step(
+                    sel_node, sel_node, sel_flag, sel_flag
+                )
+
+        if r_stud is not None:
+            self._val_reward_sum += r_stud.mean().item() * batch_size
+            self._val_count += batch_size
 
 
 # ---------------------------------------------------------------------------

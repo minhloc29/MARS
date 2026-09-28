@@ -56,7 +56,7 @@ class LEHDModel(pl.LightningModule):
     Args:
         data_path (str): Path to LEHD-format .txt training file.
         val_data_path (str): Path to LEHD-format .txt validation file.
-            If None, a random subset of training episodes is used.
+            If None, the slice immediately after the training prefix is used.
         num_loc (int): Number of customers (50/100/200/500/1000).
         embed_dim (int): Encoder / decoder embedding dimension.
         decoder_layer_num (int): Number of heavy-decoder Transformer layers.
@@ -115,8 +115,10 @@ class LEHDModel(pl.LightningModule):
             data_path=val_path, mode="test", sub_path=False
         )
         n_val = hp.n_val_episodes
-        # For validation we don't use subpath sampling; load a small slice
-        self._val_env.load_raw_data(n_val)
+        # With no explicit validation file, reserve the slice immediately
+        # following the training prefix instead of validating on training rows.
+        val_offset = hp.n_train_episodes if hp.val_data_path is None else 0
+        self._val_env.load_raw_data(n_val, offset=val_offset)
 
     def on_train_epoch_start(self) -> None:
         if self._train_env is not None:
@@ -136,9 +138,10 @@ class LEHDModel(pl.LightningModule):
         optimizer = self.optimizers()
         hp = self.hparams
         episode_start = batch["episode_start"].item()
+        batch_size = batch["batch_size"].item()
 
         env = self._train_env
-        env.load_problems(episode_start, hp.n_train_episodes // max(1, self.trainer.num_training_batches))
+        env.load_problems(episode_start, batch_size)
 
         # Move problems / solution to current device
         dev = self.device
@@ -225,10 +228,11 @@ class LEHDModel(pl.LightningModule):
         """Greedy decoding on validation instances (no subpath sampling)."""
         hp = self.hparams
         episode_start = batch["episode_start"].item()
-        batch_size = batch["batch_size"].item()
+        requested_batch_size = batch["batch_size"].item()
 
         env = self._val_env
-        env.load_problems(episode_start, batch_size)
+        env.load_problems(episode_start, requested_batch_size)
+        batch_size = env.problems.shape[0]
         dev = self.device
         env.problems = env.problems.to(dev)
         env.solution = env.solution.to(dev)
