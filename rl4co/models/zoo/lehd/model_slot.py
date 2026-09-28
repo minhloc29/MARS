@@ -18,19 +18,11 @@ LEHD's encoder and consuming LEHD's raw `(B, V+1, 4)` problem tensor rather than
 an RL4CO `TensorDict`).  The metric/entropy aux terms are added to the per-step
 cross-entropy loss, computed once per instance on the slots / assignment matrix.
 
-Key differences from a naive copy of `LEHDModel.training_step`:
-
-  * We **encode once per instance** (not once per decode step).  The original
-    LEHD re-encodes at every step to enable per-step backprop through the one-
-    layer encoder; that is unnecessary here and — critically — SlotAttention is
-    iterative and expensive, so re-running it at every step is wasteful and
-    numerically noisy.  We hold a single slot-injected encoding for the whole
-    trajectory and reuse it across decode steps.
-
-  * The CE policy loss and the slot aux losses are accumulated over the batch,
-    and optimised jointly (single backward).  The metric AUX loss is metadata-
-    aware but does not depend on WHICH node is chosen at which step, so it is
-    naturally per-instance.
+The LEHD policy keeps the original per-decoding-step optimizer cadence.  This
+is important: replacing it by one averaged update per batch reduces the number
+of policy updates by roughly the sampled subpath length and prevents the heavy
+decoder from converging.  Slot auxiliary losses are instance-level, so they are
+computed in one additional update after the teacher-forced route.
 
 Because LEHD's data files carry no explicit slot target, `metric_variant` is
 computed **on-the-fly** from the instance coordinates exactly as POMOSlot does
@@ -86,7 +78,17 @@ class SlotInjectingLEHDEncoder(nn.Module):
 
         # Slot Attention on customer nodes only (exclude depot at index 0).
         node_embs = hidden[:, 1:, :]                      # (B, V, d)
-        slots, A_ik = self.slot_attn(node_embs)           # (B, K, d), (B, V, K)
+        # SlotAttention normally samples its initial slots.  Keep that useful
+        # stochasticity in training, but make validation/checkpoint selection
+        # deterministic instead of evaluating a different random slot sample
+        # at every epoch.
+        previous_deterministic = self.slot_attn.deterministic_init
+        if not self.training:
+            self.slot_attn.deterministic_init = True
+        try:
+            slots, A_ik = self.slot_attn(node_embs)       # (B, K, d), (B, V, K)
+        finally:
+            self.slot_attn.deterministic_init = previous_deterministic
 
         # Additive slot-context injection; depot embedding unchanged.
         slot_ctx = torch.bmm(A_ik, slots)                 # (B, V, d)
@@ -103,10 +105,8 @@ class SlotInjectingLEHDEncoder(nn.Module):
 class LEHDSlotModel(LEHDModel):
     """LEHD supervised (imitation) training with POMOSlot's slot core.
 
-    Subclasses :class:`LEHDModel` so validation and the optimizer/RL-free
-    training loop are inherited unchanged; we override :meth:`training_step`
-    to (a) encode once per instance through the slot-injecting encoder and
-    (b) add the metric-aware auxiliary losses to the CE policy loss.
+    Subclasses :class:`LEHDModel` and preserves its per-step supervised policy
+    updates.  The metric-aware auxiliary objective is optimized once per batch.
 
     The supervised CE loss is exactly LEHD's:
         L = -E[ log p_teacher(step) ]
@@ -201,6 +201,7 @@ class LEHDSlotModel(LEHDModel):
         self.disable_slots = disable_slots
         self.k_neighbors = k_neighbors
         self.ins_method = ins_method
+        self.lambda_max = 50.0
 
         # ---- Swap the light encoder for a slot-injecting one ----
         if not disable_slots:
@@ -330,9 +331,9 @@ class LEHDSlotModel(LEHDModel):
         """One supervised epoch-batch.
 
         Batch is LEHD's index metadata (see `make_lehd_dataloaders`); the real
-        data lives in `self._train_env`.  Encodes the instance through the slot-
-        injecting encoder ONCE, then teacher-forces the heavy decoder over every
-        step, accumulating CE loss; the slot aux losses are added once per batch.
+        data lives in `self._train_env`.  As in original LEHD, every decoded
+        teacher-forced token gets its own optimizer update.  The instance-level
+        slot auxiliary objective gets one additional update after the route.
         """
         optimizer = self.optimizers()
         hp = self.hparams
@@ -349,26 +350,6 @@ class LEHDSlotModel(LEHDModel):
         env.reset("train")
         state, _, _, done = env.pre_step()
         capacity = float(env.raw_data_capacity[0].item())
-
-        # ---- Encode once (through slots) and cache the side-channel ----
-        if not self.disable_slots:
-            encoded_graph = self.model.encoder(env.problems, capacity)
-            slots = self.model.encoder.last_slots      # (B, K, d)
-            A_ik = self.model.encoder.last_A_ik        # (B, V, K)
-        else:
-            encoded_graph = self.model.encoder(env.problems, capacity)
-            slots = A_ik = None
-
-        # Backpropagate each heavy-decoder step immediately so its attention
-        # activations can be released.  Decoder gradients accumulate normally
-        # while the leaf gradient is bridged through the encoder once below.
-        # This is mathematically equivalent to backpropagating the averaged CE
-        # loss at the end, but avoids retaining an entire route of decoder
-        # graphs (which is prohibitive for the intended batch_size=64).
-        encoded_decoder = encoded_graph.detach().requires_grad_(True)
-        self.model._encoded = encoded_decoder
-        num_loss_steps = max(env.solution.shape[1] - 1, 1)
-        optimizer.zero_grad()
 
         loss_sum = torch.tensor(0.0, device=dev)
         step = 0
@@ -387,10 +368,14 @@ class LEHDSlotModel(LEHDModel):
 
             remaining_cap = state.problems[:, 0, 3]
 
-            # Decode using the cached slot-injected encoding.
-            probs = self.model.decoder(
-                self.model._encoded, env.selected_node_list,
-                capacity, remaining_cap,
+            # In training mode decode_step re-encodes before each token.  This
+            # deliberately matches LEHD's original optimizer/update semantics.
+            probs = self.model.decode_step(
+                state.problems,
+                env.selected_node_list,
+                capacity,
+                remaining_cap,
+                step,
             )  # (B, 2*V)
 
             # Teacher target: (node_1indexed, flag) -> (direct_idx, via_idx).
@@ -405,7 +390,10 @@ class LEHDSlotModel(LEHDModel):
 
             prob_teacher = probs.gather(1, target[:, None]).clamp_min(1e-9)
             loss = -prob_teacher.log().mean()
-            self.manual_backward(loss / num_loss_steps)
+
+            optimizer.zero_grad()
+            self.manual_backward(loss)
+            optimizer.step()
             loss_sum = loss_sum + loss.detach()
 
             # Greedy student (for the env step; unused in loss).
@@ -423,21 +411,31 @@ class LEHDSlotModel(LEHDModel):
                 target_flag.long(), flag_student,
             )
 
-        # ---- Backpropagate accumulated CE into the encoder plus aux losses ----
-        ce_loss = loss_sum / num_loss_steps
+        ce_loss = loss_sum / max(step - 1, 1)
+
+        # Auxiliary geometry is independent of the decoding position.  Use a
+        # fresh post-policy encoding and optimize it once per instance batch.
+        if not self.disable_slots:
+            self.model._encoded = self.model.encoder(env.problems, capacity)
+            slots = self.model.encoder.last_slots
+            A_ik = self.model.encoder.last_A_ik
+        else:
+            slots = A_ik = None
+
         aux_loss, log_dict = self._aux_losses(
             slotted=not self.disable_slots,
             slots=slots, A_ik=A_ik,
             problems=env.problems, device=dev,
         )
-        if encoded_decoder.grad is None:
-            raise RuntimeError("LEHD decoder produced no gradient for its encoding")
-        encoder_bridge = (
-            encoded_graph * encoded_decoder.grad.detach()
-        ).sum()
-        self.manual_backward(encoder_bridge + aux_loss)
-
-        optimizer.step()
+        if aux_loss.requires_grad:
+            optimizer.zero_grad()
+            self.manual_backward(aux_loss)
+            optimizer.step()
+            if self.metric_loss_fn is not None:
+                with torch.no_grad():
+                    self.metric_loss_fn.log_lambda.clamp_(
+                        max=torch.tensor(self.lambda_max, device=dev).log()
+                    )
         total = ce_loss + aux_loss.detach()
 
         self.log("train/loss", ce_loss.item(), on_step=False, on_epoch=True,
@@ -452,11 +450,9 @@ class LEHDSlotModel(LEHDModel):
     def validation_step(self, batch, batch_idx):
         """Greedy validation with one stable slot encoding per instance.
 
-        The base LEHD validation path calls ``decode_step``, which re-encodes
-        the instance at every decoding step.  SlotAttention samples its initial
-        slots on each forward, so that path would use a different slot context
-        at every step and would not match this model's cached-encoding training
-        semantics.
+        Validation uses deterministic slot initialization and caches that
+        encoding for the route.  This removes slot-sampling noise from the
+        checkpoint-selection metric while training remains stochastic.
         """
         episode_start = batch["episode_start"].item()
         requested_batch_size = batch["batch_size"].item()

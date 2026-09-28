@@ -4,8 +4,9 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python_bin="${PYTHON_BIN:-python}"
 train_data="${LEHD_TRAIN_DATA:-${repo_dir}/../MARS/data/lehd/data/CVRP/training dataset/vrp100_hgs_train_100w.txt}"
-output_dir="${LEHD_OUTPUT:-${repo_dir}/output}"
+output_dir="${LEHD_OUTPUT:-${repo_dir}/output_lehd_slot_parity_fixed}"
 logger="${LEHD_LOGGER:-csv}"
+seed="${LEHD_SEED:-42}"
 val_args=()
 
 if [[ ! -f "${train_data}" ]]; then
@@ -45,7 +46,7 @@ exec "${python_bin}" train.py \
     --n_train 50000 \
     --n_val 500 \
     --device 0 \
-    --seed 42 \
+    --seed "${seed}" \
     --output "${output_dir}" \
     --logger "${logger}" \
     --no_symmetrize_target \
