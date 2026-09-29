@@ -39,17 +39,37 @@ def _make_model(data_path: Path) -> LEHDSlotModel:
     )
 
 
-def test_eval_slot_encoding_is_deterministic(tmp_path: Path) -> None:
+def test_slot_encoding_is_stable_and_noncollapsed(tmp_path: Path) -> None:
     data_path = tmp_path / "tiny_lehd.txt"
     _write_tiny_lehd_dataset(data_path)
     model = _make_model(data_path)
     problems = torch.rand(2, 5, 4)
 
-    model.eval()
+    model.train()
     first = model.model.encoder(problems, 50.0)
     second = model.model.encoder(problems, 50.0)
 
     torch.testing.assert_close(first, second)
+    assignments = model.model.encoder.last_A_ik
+    assert assignments.std(dim=-1).max() > 1e-6
+
+    model.eval()
+    third = model.model.encoder(problems, 50.0)
+    torch.testing.assert_close(first, third)
+
+
+def test_slot_residual_starts_near_lehd(tmp_path: Path) -> None:
+    data_path = tmp_path / "tiny_lehd.txt"
+    _write_tiny_lehd_dataset(data_path)
+    model = _make_model(data_path)
+    problems = torch.rand(2, 5, 4)
+    encoder = model.model.encoder
+
+    base = encoder.base_encoder(problems, 50.0)
+    slotted = encoder(problems, 50.0)
+
+    assert encoder.slot_gate.item() < 0.02
+    assert (slotted - base).square().mean().sqrt() < base.square().mean().sqrt()
 
 
 def test_policy_optimizer_steps_once_per_decoded_token(tmp_path: Path) -> None:
@@ -73,7 +93,9 @@ def test_policy_optimizer_steps_once_per_decoded_token(tmp_path: Path) -> None:
 
     optimizer = trainer.optimizers[0]
     decoder_param = next(model.model.decoder.parameters())
-    encoder_param = next(model.model.encoder.parameters())
+    encoder_param = next(model.model.encoder.base_encoder.parameters())
+    slot_param = next(model.model.encoder.slot_attn.parameters())
+    gate_param = model.model.encoder.slot_gate_logit
     dual_param = model.metric_loss_fn.log_lambda
 
     # Four customers produce three teacher-forced CE updates.  The encoder
@@ -81,5 +103,7 @@ def test_policy_optimizer_steps_once_per_decoded_token(tmp_path: Path) -> None:
     # the dual parameter is updated only by that auxiliary objective.
     assert int(optimizer.state[decoder_param]["step"].item()) == 3
     assert int(optimizer.state[encoder_param]["step"].item()) == 4
+    assert int(optimizer.state[slot_param]["step"].item()) == 4
+    assert int(optimizer.state[gate_param]["step"].item()) == 3
     assert int(optimizer.state[dual_param]["step"].item()) == 1
     assert trainer.global_step == 4

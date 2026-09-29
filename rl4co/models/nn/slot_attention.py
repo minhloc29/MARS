@@ -122,11 +122,16 @@ class SlotAttention(nn.Module):
         self,
         inputs: torch.Tensor,
         num_slots: int | None = None,
+        init_noise: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             inputs:    (B, N, dim)
             num_slots: Override self.num_slots at runtime (optional).
+            init_noise: Optional standard-normal noise used to initialise the
+                slots. It may have shape ``(1, K, dim)`` or ``(B, K, dim)``.
+                Supplying it lets sequential decoders reuse the same distinct
+                slot identities across repeated encoder calls.
 
         Returns:
             slots:   (B, K, dim)
@@ -138,7 +143,20 @@ class SlotAttention(nn.Module):
 
         # ── Slot initialisation ──────────────────────────────────────────
         mu = self.slots_mu.expand(B, K, -1)
-        if self.deterministic_init:
+        if init_noise is not None:
+            if init_noise.ndim != 3 or init_noise.shape[1:] != (K, self.dim):
+                raise ValueError(
+                    "init_noise must have shape (1 or B, K, dim); "
+                    f"got {tuple(init_noise.shape)} for B={B}, K={K}, dim={self.dim}"
+                )
+            if init_noise.shape[0] not in (1, B):
+                raise ValueError(
+                    f"init_noise batch dimension must be 1 or {B}, got {init_noise.shape[0]}"
+                )
+            noise = init_noise.to(device=device, dtype=dtype).expand(B, -1, -1)
+            sigma = self.slots_logsigma.exp().expand(B, K, -1)
+            slots = mu + sigma * noise
+        elif self.deterministic_init:
             slots = mu
         else:
             sigma = self.slots_logsigma.exp().expand(B, K, -1)

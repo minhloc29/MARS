@@ -68,6 +68,26 @@ class SlotInjectingLEHDEncoder(nn.Module):
         self.base_encoder = base_encoder
         self.slot_attn = slot_attn
 
+        # LEHD re-encodes after every teacher-forced token. Sampling fresh
+        # slots on every call makes the injected representation noisier than
+        # the base embedding itself. Use a fixed, distinct set of standard
+        # normal initialisers so slot identities are stable in both training
+        # and inference without collapsing all K slots to the shared mean.
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(0)
+        init_noise = torch.randn(
+            1, slot_attn.num_slots, slot_attn.dim, generator=generator
+        )
+        init_noise = (init_noise - init_noise.mean(dim=-1, keepdim=True)) / (
+            init_noise.std(dim=-1, keepdim=True).clamp_min(1e-6)
+        )
+        self.register_buffer("slot_init_noise", init_noise, persistent=False)
+
+        # Begin close to plain LEHD and let training decide how much slot
+        # context to inject. sigmoid(-4) ~= 0.018, rather than an unscaled
+        # residual that can be several times larger than the LEHD embedding.
+        self.slot_gate_logit = nn.Parameter(torch.tensor(-4.0))
+
         # Side-channel: populated after every forward, read by the training step.
         self.last_slots: Optional[torch.Tensor] = None
         self.last_A_ik: Optional[torch.Tensor] = None
@@ -78,20 +98,12 @@ class SlotInjectingLEHDEncoder(nn.Module):
 
         # Slot Attention on customer nodes only (exclude depot at index 0).
         node_embs = hidden[:, 1:, :]                      # (B, V, d)
-        # SlotAttention normally samples its initial slots.  Keep that useful
-        # stochasticity in training, but make validation/checkpoint selection
-        # deterministic instead of evaluating a different random slot sample
-        # at every epoch.
-        previous_deterministic = self.slot_attn.deterministic_init
-        if not self.training:
-            self.slot_attn.deterministic_init = True
-        try:
-            slots, A_ik = self.slot_attn(node_embs)       # (B, K, d), (B, V, K)
-        finally:
-            self.slot_attn.deterministic_init = previous_deterministic
+        slots, A_ik = self.slot_attn(
+            node_embs, init_noise=self.slot_init_noise
+        )                                                # (B, K, d), (B, V, K)
 
         # Additive slot-context injection; depot embedding unchanged.
-        slot_ctx = torch.bmm(A_ik, slots)                 # (B, V, d)
+        slot_ctx = torch.sigmoid(self.slot_gate_logit) * torch.bmm(A_ik, slots)
         pad_depot = torch.zeros_like(hidden[:, :1, :])    # (B, 1, d)
         hidden = hidden + torch.cat([pad_depot, slot_ctx], dim=1)  # (B, V+1, d)
 
@@ -100,6 +112,10 @@ class SlotInjectingLEHDEncoder(nn.Module):
         self.last_A_ik = A_ik
 
         return hidden
+
+    @property
+    def slot_gate(self) -> torch.Tensor:
+        return torch.sigmoid(self.slot_gate_logit)
 
 
 class LEHDSlotModel(LEHDModel):
@@ -427,6 +443,8 @@ class LEHDSlotModel(LEHDModel):
             slots=slots, A_ik=A_ik,
             problems=env.problems, device=dev,
         )
+        if not self.disable_slots:
+            log_dict["slot_gate"] = self.model.encoder.slot_gate.detach()
         if aux_loss.requires_grad:
             optimizer.zero_grad()
             self.manual_backward(aux_loss)
