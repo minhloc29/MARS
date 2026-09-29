@@ -248,13 +248,18 @@ def main() -> None:
             D_latent = torch.norm(diff, p=2, dim=-1)     # (B, K, K)
 
             # Target geometry: A^T D_ins A (sparse), same as training aggregator.
-            D_slot = _aggregate_d_ins_sparse(
+            # _aggregate_d_ins_sparse now returns (D, M): the dissimilarity and
+            # the (asymmetric) observed-support matrix. We mirror the training
+            # objective by masking the violation on pairs with M_kl > eps.
+            D_slot, M_slot = _aggregate_d_ins_sparse(
                 d_idx[sl].to(dev), d_val[sl].to(dev), A_ik, normalize=False, symmetrize=True
-            )                                            # (B, K, K)
+            )                                            # (B, K, K), (B, K, K)
 
-            # Off-diagonal pairs; ordered per-entry so correlation is meaningful.
+            # Off-diagonal (upper-triangular, k<l) entries; ordered per-entry so
+            # the correlation is meaningful.
             lat = off_diagonal(D_latent)                 # (B, M)
             tgt = off_diagonal(D_slot)                   # (B, M)
+            msk = off_diagonal(M_slot) > 1e-8            # (B, M) observed support
             lat_all.append(lat)
             tgt_all.append(tgt)
 
@@ -262,8 +267,9 @@ def main() -> None:
             rho = spearman(lat, tgt)                     # (B,)
             corr_all.append(rho)
 
-            # One-sided violation E[(D_latent - D_slot)_+] over off-diagonal.
-            viol = torch.clamp(lat - tgt, min=0.0).mean(dim=-1)  # (B,)
+            # One-sided violation E[(D_latent - D_slot)_+] over observed pairs.
+            viol = torch.clamp(lat - tgt, min=0.0)
+            viol = (viol * msk).sum(dim=-1) / msk.sum(dim=-1).clamp(min=1)  # (B,)
             viol_all.append(viol)
 
     corr = torch.cat(corr_all)

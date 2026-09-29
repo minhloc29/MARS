@@ -95,6 +95,40 @@ class ProjectionHead(nn.Module):
 
 #NEW: normalization, let's see
 def _aggregate_d_ins_sparse(d_ins_idx, d_ins_val, A_ik, normalize=True, symmetrize=True, eps=1e-8):
+    """
+    Aggregate sparse node-level insertion cost into region-level D_ins(k, l).
+
+    Computes the S/M decomposition (observed-support-conditioned average):
+
+        S_kl = sum_i A_ik sum_{j in NN(i)} A_jl d_ins(i,j)   -- weighted numerator
+        M_kl = sum_i A_ik sum_{j in NN(i)} A_jl              -- observed support
+
+    For normalize=True the target is the support-conditioned average
+        D_kl = S_kl / (M_kl + eps),
+    i.e. the mean construction-induced routing distance *conditioned on there
+    being an observed routing relation between slots k and l*. For
+    normalize=False the raw (support-scaled) S_kl is returned.
+
+    The support matrix M_kl is always returned alongside D so that the caller
+    can mask the objective on genuinely observed pairs (M_kl > eps). M is
+    deliberately left asymmetric (directional) to mirror the directed kNN
+    graph; only the *dissimilarity* S (and hence D) is symmetrized when
+    symmetrize=True.
+
+    Args:
+        d_ins_idx: (B, N, k) int16 on disk, must be cast to long.
+        d_ins_val: (B, N, k) float32 insertion costs to k neighbors.
+        A_ik:      (B, N, K) float32 soft slot-assignment matrix.
+        normalize: If True, divide by the observed support M_kl (the S/M
+                   decomposition). Otherwise return raw S_kl.
+        symmetrize: If True, symmetrize the dissimilarity S (0.5*(S+S^T)).
+                    The support matrix M is NEVER symmetrized.
+        eps:       Numerator/denominator floor for numerical stability.
+
+    Returns:
+        (D_ins, M_ins): D_ins (B, K, K) target dissimilarity; M_ins (B, K, K)
+                        observed-support matrix (asymmetric).
+    """
     B, N, k = d_ins_val.shape
     K = A_ik.shape[2]
     idx = d_ins_idx.long()
@@ -102,18 +136,28 @@ def _aggregate_d_ins_sparse(d_ins_idx, d_ins_val, A_ik, normalize=True, symmetri
     A_neighbors = torch.gather(
         A_ik.unsqueeze(2).expand(B, N, k, K), dim=1, index=idx_expanded,
     )
+
+    # Weighted numerator S: cost-weighted support.
     w = d_ins_val.unsqueeze(-1) * A_neighbors
     node_weighted = w.sum(dim=2)
-    D_ins = torch.bmm(A_ik.transpose(1, 2), node_weighted)  # (B, K, K) -- raw, asymmetric
+    S = torch.bmm(A_ik.transpose(1, 2), node_weighted)  # (B, K, K) -- raw, asymmetric
+
+    # Support M: same gather, cost replaced by ones (observed-relation count).
+    ones = torch.ones_like(d_ins_val)
+    w_m = ones.unsqueeze(-1) * A_neighbors
+    node_support = w_m.sum(dim=2)
+    M = torch.bmm(A_ik.transpose(1, 2), node_support)  # (B, K, K) -- asymmetric, NEVER symm'd
 
     if symmetrize:
-        D_ins = 0.5 * (D_ins + D_ins.transpose(-1, -2))      # now a well-defined dissimilarity
+        S = 0.5 * (S + S.transpose(-1, -2))              # dissimilarity made symmetric
+        # NB: M is intentionally left asymmetric (directional kNN support).
 
     if normalize:
-        mass = A_ik.sum(dim=1)                                # (B, K)
-        D_ins = D_ins / (mass.unsqueeze(-1) * mass.unsqueeze(-2) + eps)
+        D = S / (M + eps)
+    else:
+        D = S
 
-    return D_ins
+    return D, M
 
 
 def _euclidean_target(
@@ -165,6 +209,10 @@ class MetricPreservationLoss(nn.Module):
             in POMOSlot.configure_optimizers.
         sample_pairs (int | None): If set, subsample this many (k, l) pairs
             per batch to reduce memory for large K. None = all K^2 pairs.
+        support_eps (float): Support threshold. Only slot pairs with observed
+            routing support M_kl > support_eps (from the S/M decomposition) are
+            supervised, so unobserved, spuriously-zero targets never pull slots
+            together. Default 1e-8 matches the aggregator's denominator floor.
     """
 
     # E excluded: future-regret target not yet implemented
@@ -179,6 +227,7 @@ class MetricPreservationLoss(nn.Module):
         sample_pairs: int | None = None,
         normalize_target: bool = True,
         symmetrize_target: bool = True,
+        support_eps: float = 1e-8,
     ) -> None:
         super().__init__()
 
@@ -192,6 +241,7 @@ class MetricPreservationLoss(nn.Module):
         self.sample_pairs = sample_pairs
         self.normalize_target = normalize_target
         self.symmetrize_target = symmetrize_target
+        self.support_eps = support_eps
 
         # Lagrange multiplier — stored as log for positivity constraint
         self.log_lambda = nn.Parameter(
@@ -204,7 +254,7 @@ class MetricPreservationLoss(nn.Module):
         immediately rather than after several eval runs."""
         return (
             f"variant={self.variant}, normalize_target={self.normalize_target}, "
-            f"symmetrize_target={self.symmetrize_target}"
+            f"symmetrize_target={self.symmetrize_target}, support_eps={self.support_eps}"
         )
 
     @property
@@ -226,13 +276,14 @@ class MetricPreservationLoss(nn.Module):
         elif self.variant == "D":
             assert d_ins_idx is not None and d_ins_val is not None, \
                 "d_ins_idx and d_ins_val required for Variant D"
-            return _aggregate_d_ins_sparse(
+            D_target, M_support = _aggregate_d_ins_sparse(
                 d_ins_idx,
                 d_ins_val,
                 A_ik,
                 normalize=self.normalize_target,
                 symmetrize=self.symmetrize_target,
-            )  # (B, K, K)
+            )  # (B, K, K), (B, K, K)
+            return D_target, M_support
         else:
             raise ValueError(f"Unknown variant: {self.variant}")
 
@@ -266,15 +317,42 @@ class MetricPreservationLoss(nn.Module):
         diff = z_proj.unsqueeze(2) - z_proj.unsqueeze(1)
         latent_dist = torch.norm(diff, p=2, dim=-1)      # (B, K, K)
 
-        # Compute target distances (detached — target should not backprop)
-        D_target = self._get_target(A_ik, locs, d_ins_idx, d_ins_val).detach()
+        # Compute target distances and observed support (detached — neither
+        # should backprop through the aggregator).
+        if self.variant == "D":
+            D_target, M_support = self._get_target(A_ik, locs, d_ins_idx, d_ins_val)
+            D_target = D_target.detach()
+            M_support = M_support.detach()
+        else:
+            D_target = self._get_target(A_ik, locs, d_ins_idx, d_ins_val).detach()
+            M_support = None
 
-        # Off-diagonal mask (exclude self-pairs k==l)
+        # Evaluate the objective only on genuinely observed slot pairs: the
+        # off-diagonal mask (k != l) intersected with the support mask
+        # (M_kl > eps) from the S/M decomposition. Unobserved pairs have no
+        # routing relation to supervise, so excluding them prevents the penalty
+        # from spuriously collapsing slots that share no observed node/neighbor.
         off_diag = ~torch.eye(K, dtype=torch.bool, device=slots.device)
         off_diag = off_diag.unsqueeze(0).expand(B, -1, -1)
+        pair_mask = off_diag
+        if M_support is not None:
+            pair_mask = pair_mask & (M_support > self.support_eps)
 
-        latent_off = latent_dist[off_diag]               # (B * K*(K-1),)
-        target_off = D_target[off_diag]
+        latent_off = latent_dist[pair_mask]              # (n_pairs,)
+        target_off = D_target[pair_mask]
+
+        n_obs = int(latent_off.numel())
+        if n_obs == 0:
+            # Degenerate: no observed slot pairs at all — nothing to supervise.
+            zero = torch.tensor(0.0, device=slots.device, dtype=slots.dtype)
+            info = {
+                "metric_spread":         zero,
+                "metric_penalty":        zero,
+                "metric_lambda":         self.lmbda.detach(),
+                "metric_violation_mean": zero,
+                "metric_n_observed_pairs": zero,
+            }
+            return zero, info
 
         # Optional pair subsampling for large K
         if self.sample_pairs is not None and latent_off.numel() > self.sample_pairs:
@@ -302,7 +380,13 @@ class MetricPreservationLoss(nn.Module):
             "metric_penalty":        penalty.detach(),
             "metric_lambda":         self.lmbda.detach(),
             "metric_violation_mean": violation.mean().detach(),
+            "metric_n_observed_pairs": float(n_obs),
         }
+
+        if M_support is not None:
+            # Fraction of off-diagonal slot pairs that carry observed routing
+            # support — a diagnostic for how sparse the supervised geometry is.
+            info["metric_support_frac"] = float(pair_mask.sum() / off_diag.sum())
 
         return loss + dual_loss, info
 

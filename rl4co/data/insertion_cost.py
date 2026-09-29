@@ -1,15 +1,3 @@
-"""
-Insertion-cost utilities. Sparse (B, N, k) format for dataset storage.
-
-Methods:
-  savings      d_ins(i,j) = dist(D,i) + dist(i,j) - dist(D,j)  [CW proxy]
-  construction along-tour arc distance on a greedy NN tour
-  insertion    RCIC: D_RCIC(i,j) = 0.5*[Δ(i|j)+Δ(j|i)] — recommended for Variant D
-               (see _compute_route_adjacent_insertion_cost)
-
-Sparsify AFTER symmetrization so d_ins(i,j)==d_ins(j,i) before top-k selection.
-"""
-
 from __future__ import annotations
 
 from typing import Optional, Tuple
@@ -345,22 +333,7 @@ def _compute_route_adjacent_insertion_cost(
     locs: torch.Tensor,          # (B, N, 2) customers
     depot_loc: torch.Tensor,     # (B, 1, 2) depot
 ) -> torch.Tensor:
-    """
-    Compute a symmetric, route-conditioned insertion-cost matrix (RCIC).
-
-    Builds a deterministic nearest-neighbour reference route, then for every
-    pair (i, j) evaluates the cheapest genuine marginal cost of inserting i
-    into an edge adjacent to j (and vice versa), symmetrized:
-
-        D_RCIC(i, j) = 0.5 * [ Δ(i|j) + Δ(j|i) ]
-
-    Args:
-        locs:      (B, N, 2) customer coordinates (batch must already be 3D).
-        depot_loc: (B, 1, 2) depot coordinates.
-
-    Returns:
-        D_ins: (B, N, N) float32 — symmetric route-conditioned insertion cost.
-    """
+   
     B, N, _ = locs.shape
     device = locs.device
 
