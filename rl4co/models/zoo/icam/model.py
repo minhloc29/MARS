@@ -134,7 +134,8 @@ class ICAMCVRP(pl.LightningModule):
         finished = torch.zeros(batch_size, pomo_size,
                                dtype=torch.bool, device=device)
 
-        for step in range(problem_size + 1):
+        max_steps = 2 * problem_size + 1    
+        for step in range(max_steps):
             if step == 1 and pomo_size > 1:
                 current = torch.arange(
                     1, pomo_size + 1, device=device).clamp_max(problem_size)[None].expand(batch_size, -1)
@@ -181,10 +182,10 @@ class ICAMCVRP(pl.LightningModule):
             2, route[..., None].expand(-1, -1, -1, 2))
         reward = -((route_xy - route_xy.roll(-1, dims=2))
                    ** 2).sum(-1).sqrt().sum(-1)
-        return reward, torch.stack(log_probs, dim=-1).sum(-1)
+        return reward, torch.stack(log_probs, dim=-1).sum(-1), route
 
     def training_step(self, batch, batch_idx):
-        reward, log_prob = self._rollout(batch, sampling=True)
+        reward, log_prob, _ = self._rollout(batch, sampling=True)
         baseline = reward.mean(dim=1, keepdim=True).detach()
         loss = -((reward.detach() - baseline) * log_prob).mean()
         self.log("train/reward", reward.max(dim=1).values.mean(), prog_bar=True)
@@ -193,10 +194,7 @@ class ICAMCVRP(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         with torch.no_grad():
-            reward, _ = self._rollout(batch, sampling=False)
-        # Match POMO's logged val metric: MEAN over all multi-start rollouts,
-        # not the best start. (POMO logs out["reward"].mean() because its
-        # val_metrics only contains "reward", never "max_reward".)
+            reward, _, _ = self._rollout(batch, sampling=False)
         score = reward.mean(dim=1).mean()
         self.log("val/reward", score, prog_bar=True)
         return -score

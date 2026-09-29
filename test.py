@@ -57,7 +57,10 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=128,
                         help="Eval batch size")
     parser.add_argument("--num_starts", type=int, default=50,
-                        help="Multi-start greedy for POMO/AM checkpoints.")
+                        help="Multi-start greedy for POMO/AM checkpoints. For "
+                             "--dataset cvrplib this is the POMO multi-start "
+                             "count (default 100). Not used by elg/dgl/radar "
+                             "(baked pomo_size) nor sil/icam/l2r/invit.")
     parser.add_argument("--sizes", type=str, default=None,
                         help="Comma list of n to evaluate on CVRPLIB Set X "
                              "(default: all). e.g. 101,110")
@@ -65,18 +68,31 @@ def main() -> None:
                         choices=["greedy", "sampling", "multistart_greedy",
                                  "multistart_sampling", "beam_search"],
                         help="Decoding strategy wired to every model.")
-    parser.add_argument("--plot", type=int, default=4)
+    parser.add_argument("--plot", type=int, default=None,
+                        help="Render the first N solved instances as "
+                             "publication-quality PDF/PNG in results/plots/ "
+                             "(synthetic dataset; action backbones "
+                             "am/pomo/pomo_base/elg/radar).")
     parser.add_argument("--plot_dir", type=str, default=None,
                         help="Output directory for --plot figures "
                              "(default: results/plots).")
     parser.add_argument("--augment", action="store_true",
                         help="Evaluate eight geometric augmentations (AM/POMO).")
+    parser.add_argument("--local_search", action="store_true",
+                        help="Also run HGS SWAP* local search (env.local_search) "
+                             "on the decoded routes and report the improved tour "
+                             "length separately. Requires the HGS-CVRP build.")
     parser.add_argument("--device", type=str, default=None,
                         help="Device such as cuda, mps, or cpu")
     parser.add_argument("--seed", type=int, default=1234,
                         help="Seed so every run uses the same test set.")
     parser.add_argument("--out", type=str, default=None,
                         help="JSON path to save results.")
+    parser.add_argument("--num_slots", type=int, default=None,
+                    help="Override SlotAttention K at inference (pomo/am only).")
+    parser.add_argument("--slot_iters", type=int, default=None,
+                    help="Override SlotAttention iterations at inference.")
+    parser.add_argument("--k_neighbors", type=int, default=None)
     args = parser.parse_args()
 
     # ---- dataset / model compatibility ----
@@ -119,6 +135,19 @@ def main() -> None:
     model = model_cls.load_from_checkpoint(
         args.ckpt, env=env, map_location=args.device)
     model.to(args.device)
+    
+    sa = getattr(getattr(model, "policy", None), "encoder", None)
+    sa = getattr(sa, "slot_attn", None)
+    if sa is not None:
+        if args.num_slots is not None:
+            sa.num_slots = args.num_slots
+        if args.slot_iters is not None:
+            sa.iters = args.slot_iters
+        if args.k_neighbors is not None:
+            sa.k_neighbors = args.k_neighbors
+        print(f"[info] slot_attn: K={sa.num_slots}, iters={sa.iters}")
+    else:
+        print("[info] no slot_attn on this model (disabled or non-slot backbone)")
     if args.model == "sil":
         model.labels.clear()
         model.best_policy_state = model.repair_policy_state = None
@@ -146,7 +175,12 @@ def main() -> None:
           f"(mean reward = {result['mean_reward']:.4f})  "
           f"inference = {result['elapsed_seconds']:.2f}s "
           f"({result['throughput_per_sec']:.0f} inst/s)")
+    if "mean_tour_length_local_search" in result:
+        print(f"[LS] local-search refined mean tour = "
+              f"{result['mean_tour_length_local_search']:.4f} "
+              f"(std {result['std_tour_length_local_search']:.4f})")
 
+    # ---- optional publication-quality route plots ----
     if args.plot:
         from rl4co.utils.cvrp_plot import render_cvrp_solution
 

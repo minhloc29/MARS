@@ -7,7 +7,8 @@ from rl4co.models.zoo.pomo_slot.model_am import SingleSharedBaseline
 from rl4co.data.utils import load_npz_to_tensordict
 from rl4co.utils.decoding import get_decoding_strategy
 from rl4co.utils.ops import unbatchify, get_tour_length
-
+from rl4co.utils.ops import batchify, gather_by_index, get_tour_length
+from rl4co.utils.pylogger import get_pylogger
 
 def pick_device(value: str | None) -> torch.device:
     if value:
@@ -118,8 +119,7 @@ def decode_sil(model, batch, args, env):
 
 
 def decode_icam(model, batch, args, env):
-    r, _ = model._rollout(batch, sampling=is_sampling(args.decode))
-    # scalar-reward backbone: mark feasible by construction (no actions needed)
+    r, _, route = model._rollout(batch, sampling=is_sampling(args.decode))
     return r.max(dim=1).values, 1, None
 
     
@@ -163,6 +163,35 @@ REGISTRY = {
     "radar": decode_radar,
 }
 
+def apply_local_search(
+    env, td_reset, actions, num_starts
+):
+   
+    try:
+        ls = getattr(env, "local_search", None)
+        if ls is None:
+            return None
+        B = td_reset.batch_size[0]
+        # Expand the td to the interleaved [B*ns, ...] layout the decoder used,
+        # so its locs/demand align with the action rows.
+        td_ls = batchify(td_reset, num_starts)
+        improved = ls(td_ls, actions)
+        if improved is None:
+            return None
+        improved = improved.view(B, num_starts, -1)
+        locs = td_reset["locs"]  # [B, N+1, 2], depot-first
+        ordered = torch.cat(
+            [
+                locs[:, :1][:, None].expand(B, num_starts, 1, 2),
+                gather_by_index(locs, improved, dim=1),
+            ],
+            dim=1,
+        )
+        lens = get_tour_length(ordered)  # [B, num_starts]
+        return lens.max(dim=1).values
+    except Exception as e:
+        log.warning(f"local_search unavailable, skipping: {e}")
+        return None
 
 def evaluate(model, args, env, ds, return_instances: int | None = None):
     model.eval()

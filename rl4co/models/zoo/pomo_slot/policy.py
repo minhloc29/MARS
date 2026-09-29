@@ -29,6 +29,7 @@ class SlotInjectingEncoder(nn.Module):
     def forward(self, td) -> tuple[torch.Tensor, torch.Tensor]:
         # Run base encoder
         # td is
+        self.slot_scale = 1.0
         hidden, init_embeds = self.base_encoder(td)  # (B, N+1, d)
 
         # Slot Attention on customer nodes only
@@ -38,7 +39,7 @@ class SlotInjectingEncoder(nn.Module):
         # Per-node slot context, injected additively; depot unchanged
         slot_ctx = torch.bmm(A_ik, slots)             # (B, N, d)
         pad_depot = torch.zeros_like(hidden[:, :1, :])  # (B, 1, d)
-        hidden = hidden + torch.cat([pad_depot, slot_ctx], dim=1)  # (B, N+1, d)
+        hidden = hidden + self.slot_scale * torch.cat([pad_depot, slot_ctx], dim=1)  # (B, N+1, d)
 
         # Expose via side-channel for aux loss
         self.last_slots = slots   # (B, K, d)
