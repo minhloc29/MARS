@@ -243,41 +243,64 @@ class LEHDSlotModel(LEHDModel):
             )
 
     # ------------------------------------------------------------------
-    # Optimizer: separate dual-param group for log_lambda (dual ascent)
+    # Optimizer and dual ascent
     # ------------------------------------------------------------------
 
     def configure_optimizers(self):
-        """Like POMOSlot: dual ascent on log_lambda with its own lr_dual.
+        """Use LEHD's Adam schedule for primal parameters only.
 
-        Base LEHDModel puts everything in one Adam(+StepLR).  When a metric
-        loss is present we instead split `log_lambda` into its own group with
-        lr=lr_dual and no scheduler, mirroring `POMOSlot.configure_optimizers`.
-        The main group keeps LEHD's StepLR schedule.
+        ``log_lambda`` must not share Adam with the policy. With one dual
+        update per batch, Adam on log-lambda increases it by approximately
+        ``lr_dual`` regardless of violation magnitude and drove lambda to its
+        clamp in a few epochs. Lambda is updated explicitly by projected dual
+        ascent in :meth:`_update_dual` instead.
+
+        Lightning does not advance schedulers automatically under manual
+        optimization, so :meth:`on_train_epoch_end` steps this scheduler.
         """
         from rl4co.models.zoo.lehd.model import LEHDModel as _Base
 
         if self.metric_loss_fn is None:
             return _Base.configure_optimizers(self)
 
-        lr_dual = self.hparams.get("lr_dual", 1e-3)
         log_lambda_id = id(self.metric_loss_fn.log_lambda)
         main_params = [p for p in self.parameters() if id(p) != log_lambda_id]
-        dual_params = [self.metric_loss_fn.log_lambda]
 
         opt_kw = self.hparams.optimizer_kwargs or {"lr": 5e-5}
-        param_groups = [
-            {"params": main_params, **opt_kw},       # LEHD lr + StepLR schedule
-            {"params": dual_params, "lr": lr_dual},  # dual ascent, unscheduled
-        ]
-        optimizer = torch.optim.Adam(param_groups)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer,
-            lr_lambda=[lambda epoch: 0.97**epoch, lambda epoch: 1.0],
+        optimizer = torch.optim.Adam(main_params, **opt_kw)
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=1, gamma=0.9
         )
         return {
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
         }
+
+    def on_train_epoch_end(self) -> None:
+        """Advance the policy LR schedule under manual optimization."""
+        scheduler = self.lr_schedulers()
+        if scheduler is not None:
+            scheduler.step()
+            self.log(
+                "train/lr",
+                scheduler.get_last_lr()[0],
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
+    def _update_dual(self, penalty: torch.Tensor) -> None:
+        """Projected ascent: lambda <- lambda + lr_dual * violation²."""
+        if self.metric_loss_fn is None:
+            return
+        with torch.no_grad():
+            lr_dual = float(self.hparams.get("lr_dual", 1e-3))
+            new_lambda = self.metric_loss_fn.lmbda + lr_dual * penalty.detach()
+            new_lambda.clamp_(min=1e-8, max=self.lambda_max)
+            self.metric_loss_fn.log_lambda.copy_(new_lambda.log())
+            # This parameter is intentionally outside Adam; do not retain the
+            # zero/cancelled autograd gradient produced by the primal pass.
+            self.metric_loss_fn.log_lambda.grad = None
 
     # ------------------------------------------------------------------
     # Aux-loss machinery (mirrors POMOSlot.shared_step's tail)
@@ -334,7 +357,15 @@ class LEHDSlotModel(LEHDModel):
                 d_ins_idx=d_ins_idx,
                 d_ins_val=d_ins_val,
             )
-            aux_loss = aux_loss + self.alpha_metric * metric_loss
+            # MetricPreservationLoss also returns a differentiable dual-loss
+            # term for POMO's optimizer. Remove that term here: LEHD performs
+            # stable, magnitude-aware projected ascent explicitly once/batch.
+            dual_loss = (
+                -self.metric_loss_fn.lmbda
+                * metric_info["metric_penalty"].detach()
+            )
+            primal_metric_loss = metric_loss - dual_loss
+            aux_loss = aux_loss + self.alpha_metric * primal_metric_loss
             log_dict.update(metric_info)
 
         return aux_loss, log_dict
@@ -450,10 +481,7 @@ class LEHDSlotModel(LEHDModel):
             self.manual_backward(aux_loss)
             optimizer.step()
             if self.metric_loss_fn is not None:
-                with torch.no_grad():
-                    self.metric_loss_fn.log_lambda.clamp_(
-                        max=torch.tensor(self.lambda_max, device=dev).log()
-                    )
+                self._update_dual(log_dict["metric_penalty"])
         total = ce_loss + aux_loss.detach()
 
         self.log("train/loss", ce_loss.item(), on_step=False, on_epoch=True,

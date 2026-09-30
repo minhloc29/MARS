@@ -714,6 +714,7 @@ def _train_lehd(
             f"_a{alpha_metric:g}_b{beta_entropy:g}_it{slot_iters}"
             f"_p{proj_dim}_lam{lambda_init:g}_ld{lr_dual:g}_{ins_method}"
             f"_n{int(normalize_target)}s{int(symmetrize_target)}"
+            "_stable_sched09"
         )
     else:
         run_name = (

@@ -3,10 +3,24 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python_bin="${PYTHON_BIN:-python}"
-train_data="${LEHD_TRAIN_DATA:-${repo_dir}/../MARS/data/lehd/data/CVRP/training dataset/vrp100_hgs_train_100w.txt}"
-output_dir="${LEHD_OUTPUT:-${repo_dir}/output_lehd_slot_stable}"
+local_train="${repo_dir}/data/lehd/data/CVRP/training dataset/vrp100_hgs_train_100w.txt"
+sibling_train="${repo_dir}/../MARS/data/lehd/data/CVRP/training dataset/vrp100_hgs_train_100w.txt"
+local_val="${repo_dir}/data/lehd/validation/vrp100_hgs_val_100001_101000.txt"
+sibling_val="${repo_dir}/../MARS/data/lehd/validation/vrp100_hgs_val_100001_101000.txt"
+if [[ -f "${local_train}" ]]; then
+    default_train="${local_train}"
+else
+    default_train="${sibling_train}"
+fi
+train_data="${LEHD_TRAIN_DATA:-${default_train}}"
+output_dir="${LEHD_OUTPUT:-${repo_dir}/output_lehd_slot_optim_fixed}"
 logger="${LEHD_LOGGER:-csv}"
 seed="${LEHD_SEED:-42}"
+epochs="${LEHD_EPOCHS:-40}"
+batch_size="${LEHD_BATCH_SIZE:-256}"
+learning_rate="${LEHD_LR:-1e-4}"
+n_train="${LEHD_N_TRAIN:-100000}"
+n_val="${LEHD_N_VAL:-1000}"
 val_args=()
 
 if [[ ! -f "${train_data}" ]]; then
@@ -15,12 +29,20 @@ if [[ ! -f "${train_data}" ]]; then
     exit 1
 fi
 
-if [[ -n "${LEHD_VAL_DATA:-}" ]]; then
-    if [[ ! -f "${LEHD_VAL_DATA}" ]]; then
-        echo "LEHD validation data not found: ${LEHD_VAL_DATA}" >&2
+val_data="${LEHD_VAL_DATA:-}"
+if [[ -z "${val_data}" ]]; then
+    if [[ -f "${local_val}" ]]; then
+        val_data="${local_val}"
+    elif [[ -f "${sibling_val}" ]]; then
+        val_data="${sibling_val}"
+    fi
+fi
+if [[ -n "${val_data}" ]]; then
+    if [[ ! -f "${val_data}" ]]; then
+        echo "LEHD validation data not found: ${val_data}" >&2
         exit 1
     fi
-    val_args=(--lehd_val_data_path "${LEHD_VAL_DATA}")
+    val_args=(--lehd_val_data_path "${val_data}")
 fi
 
 cd "${repo_dir}"
@@ -40,11 +62,11 @@ exec "${python_bin}" train.py \
     --ins_method construction \
     --embed_dim 64 \
     --lehd_decoder_layers 6 \
-    --epochs 200 \
-    --batch_size 64 \
-    --lr 5e-5 \
-    --n_train 50000 \
-    --n_val 500 \
+    --epochs "${epochs}" \
+    --batch_size "${batch_size}" \
+    --lr "${learning_rate}" \
+    --n_train "${n_train}" \
+    --n_val "${n_val}" \
     --device 0 \
     --seed "${seed}" \
     --output "${output_dir}" \

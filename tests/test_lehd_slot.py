@@ -99,11 +99,30 @@ def test_policy_optimizer_steps_once_per_decoded_token(tmp_path: Path) -> None:
     dual_param = model.metric_loss_fn.log_lambda
 
     # Four customers produce three teacher-forced CE updates.  The encoder
-    # receives those three plus the one per-batch slot auxiliary update, while
-    # the dual parameter is updated only by that auxiliary objective.
+    # receives those three plus the one per-batch slot auxiliary update.
+    # Lambda uses an explicit projected-ascent update and is not in Adam.
     assert int(optimizer.state[decoder_param]["step"].item()) == 3
     assert int(optimizer.state[encoder_param]["step"].item()) == 4
     assert int(optimizer.state[slot_param]["step"].item()) == 4
     assert int(optimizer.state[gate_param]["step"].item()) == 3
-    assert int(optimizer.state[dual_param]["step"].item()) == 1
+    assert dual_param not in optimizer.state
     assert trainer.global_step == 4
+    assert trainer.lr_scheduler_configs[0].scheduler.last_epoch == 1
+    assert optimizer.param_groups[0]["lr"] == 4.5e-5
+
+
+def test_dual_update_is_violation_scaled_and_projected(tmp_path: Path) -> None:
+    data_path = tmp_path / "tiny_lehd.txt"
+    _write_tiny_lehd_dataset(data_path)
+    model = _make_model(data_path)
+
+    before = model.metric_loss_fn.lmbda.detach().clone()
+    model._update_dual(torch.tensor(2.0))
+    expected = before + model.hparams.lr_dual * 2.0
+    torch.testing.assert_close(model.metric_loss_fn.lmbda, expected)
+
+    model._update_dual(torch.tensor(1e9))
+    torch.testing.assert_close(
+        model.metric_loss_fn.lmbda,
+        torch.tensor(model.lambda_max),
+    )
