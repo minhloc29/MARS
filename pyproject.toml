@@ -73,6 +73,7 @@ dependencies = [
     "torchrl>=0.6.0",
     "wandb",
     "pandas>=2.3.3",
+    "scikit-learn>=1.7.2",
 ]
 
 [project.optional-dependencies]

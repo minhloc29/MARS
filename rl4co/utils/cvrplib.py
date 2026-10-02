@@ -10,7 +10,41 @@ from rl4co.utils.eval_utils import _allow_safe_globals
 from rl4co.utils.ops import get_tour_length
 
 ACTION_BACKBONES = {"pomo", "am", "pomo_base", "elg", "dgl", "radar"}
+GROUPS = [(100, 200), (200, 300), (300, 500), (500, None)]  # [lo, hi), hi=None -> inf
 
+
+def _group_label(lo, hi):
+    return f"[{lo}, {hi})" if hi is not None else f"[{lo}, inf)"
+
+
+def _group_of(n):
+    for lo, hi in GROUPS:
+        if n >= lo and (hi is None or n < hi):
+            return (lo, hi)
+    return None  # n < 100: not in any group
+
+
+def _print_group_summary(results):
+    print("\n--- per-group summary ---")
+    print(f"{'group':<14}{'#inst':>6}{'#feas':>7}{'mean_gap%':>11}"
+          f"{'std_gap%':>10}{'mean_cost':>12}")
+    summary = {}
+    for lo, hi in GROUPS:
+        rs = [r for r in results if _group_of(r["n"]) == (lo, hi)]
+        if not rs:
+            continue
+        ok = [r for r in rs if r["feasible"] and r["gap"] is not None]
+        gaps = torch.tensor([r["gap"] for r in ok], dtype=torch.float64)
+        costs = [r["cost"] for r in rs if r["cost"] is not None]
+        mg = float(gaps.mean()) if len(ok) else float("nan")
+        sg = float(gaps.std(unbiased=False)) if len(ok) else float("nan")
+        mc = sum(costs) / len(costs) if costs else float("nan")
+        label = _group_label(lo, hi)
+        print(f"{label:<14}{len(rs):>6}{len(ok):>7}{mg:>11.2f}{sg:>10.2f}{mc:>12.2f}")
+        summary[label] = {"n_inst": len(rs), "feasible": len(ok),
+                          "mean_gap": mg / 100, "std_gap": sg / 100,
+                          "mean_cost": mc}
+    return summary
 
 def _load_checkpoint_model(ckpt: str, model: str):
     """Reconstruct the CVRP model from a checkpoint (Set X path)."""
@@ -241,9 +275,6 @@ def evaluate_cvrplib(model, ckpt, data_dir="./data/cvrplib_setX", sizes=None,
         demand = torch.tensor(rec["demand"], dtype=torch.float32)
         capacity = rec["capacity"]
 
-        # env.reset() mutates td in place (prepends the depot to locs). Reset a
-        # clone so the raw td stays customers-only for the backbones that decode
-        # from it directly (icam/l2r/invit/elg/dgl/radar).
         td = build_td(coords, demand, capacity, device)
         td_reset = env.reset(td.clone())
         try:
@@ -299,6 +330,7 @@ def evaluate_cvrplib(model, ckpt, data_dir="./data/cvrplib_setX", sizes=None,
     else:
         mean_gap = std_gap = 0.0
 
+    group_summary = _print_group_summary(results)
     return {
         "n_inst": cnt,
         "num_starts": starts,
@@ -306,5 +338,6 @@ def evaluate_cvrplib(model, ckpt, data_dir="./data/cvrplib_setX", sizes=None,
         "std_gap": std_gap,
         "feasible": agg["feasible"],
         "mean_cost": agg["cost_sum"] / max(1, cnt),
+        "groups": group_summary,                    # <-- new
         "instances": results,
     }

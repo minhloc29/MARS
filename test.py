@@ -45,7 +45,7 @@ def main() -> None:
     parser.add_argument("--dataset", type=str, default="synthetic",
                         choices=["synthetic", "cvrplib"])
     parser.add_argument("--data_path", type=str, default=None,
-                        help="Cached dataset split shared across methods.")
+                        help="s dataset split shared across methods.")
     parser.add_argument("--data_dir", type=str, default="./data/cvrplib_setX",
                         help="Directory holding setX.pt (only for "
                              "--dataset cvrplib).")
