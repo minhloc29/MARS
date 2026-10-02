@@ -51,11 +51,17 @@ def main() -> None:
                         help="Spatial stress shift of customers around the depot, "
                              "x' = d + alpha*(x - d). alpha<1 implodes, >1 explodes "
                              "(clipped to [0,1]^2). alpha=1 = no shift.")
+    parser.add_argument("--capacity", type=float, default=None,
+                        help="Vehicle capacity. Defaults to the rl4co capacity table "
+                             "for --num_loc (Kool et al. 2019). Demand is normalized by "
+                             "this capacity, so the effective vehicle_capacity is 1.0.")
     args = parser.parse_args()
 
     pl.seed_everything(args.seed, workers=True)
 
     generator_params = dict(num_loc=args.num_loc, loc_distribution=args.loc_dist)
+    if args.capacity is not None:
+        generator_params["capacity"] = args.capacity
     for key in ("num_modes", "cdist", "n_cluster", "n_cluster_mix",
                 "loc_mean", "loc_std", "loc_rate"):
         value = getattr(args, key, None)
@@ -70,15 +76,16 @@ def main() -> None:
         td["locs"] = (d + args.alpha * (td["locs"] - d)).clamp(0.0, 1.0)
 
     if args.out is None:
+        cap = f"_cap{args.capacity:g}" if args.capacity is not None else ""
         if args.alpha != 1.0:
             out = Path(f"data/test/cvrp_{args.num_loc}_{args.loc_dist}"
-                       f"_alpha{args.alpha}_seed{args.seed}.npz")
+                       f"_alpha{args.alpha}{cap}_seed{args.seed}.npz")
         elif args.loc_dist == "uniform":
-            out = Path(f"data/test/cvrp_{args.num_loc}_uniform_seed{args.seed}.npz")
+            out = Path(f"data/test/cvrp_{args.num_loc}_uniform{cap}_seed{args.seed}.npz")
         elif args.loc_dist == "gaussian":
-            out = Path(f"data/test/cvrp_{args.num_loc}_gaussian_mean{args.loc_mean}_std{args.loc_std}_seed{args.seed}.npz")
+            out = Path(f"data/test/cvrp_{args.num_loc}_gaussian_mean{args.loc_mean}_std{args.loc_std}{cap}_seed{args.seed}.npz")
         elif args.loc_dist == "cluster":
-            out = Path(f"data/test/cvrp_{args.num_loc}_cluster_n{args.n_cluster}_seed{args.seed}.npz")
+            out = Path(f"data/test/cvrp_{args.num_loc}_cluster_n{args.n_cluster}{cap}_seed{args.seed}.npz")
     else:
         out = Path(args.out)
     
