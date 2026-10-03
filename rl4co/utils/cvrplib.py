@@ -10,7 +10,8 @@ from rl4co.utils.eval_utils import _allow_safe_globals
 from rl4co.utils.ops import get_tour_length
 
 ACTION_BACKBONES = {"pomo", "am", "pomo_base", "elg", "dgl", "radar"}
-GROUPS = [(100, 200), (200, 300), (300, 500), (500, None)]  # [lo, hi), hi=None -> inf
+GROUPS = [(100, 200), (200, 300), (300, 500),
+          (500, None)]  # [lo, hi), hi=None -> inf
 
 
 def _group_label(lo, hi):
@@ -46,6 +47,7 @@ def _print_group_summary(results):
                           "mean_cost": mc}
     return summary
 
+
 def _load_checkpoint_model(ckpt: str, model: str):
     """Reconstruct the CVRP model from a checkpoint (Set X path)."""
     from rl4co.models.zoo.pomo_slot import AMSlot, POMOSlot
@@ -70,7 +72,7 @@ def _load_checkpoint_model(ckpt: str, model: str):
         "radar": RADAR,
         "dgl": DGL,
     }
-    env = CVRPEnv(generator_kwargs=dict(num_loc=100))
+    env = CVRPEnv(generator_params=dict(num_loc=100))
     net = MODEL_CLASSES[model].load_from_checkpoint(ckpt, env=env,
                                                     map_location="cpu")
     net.eval()
@@ -94,7 +96,8 @@ def costs_from_actions(env, td_r, actions):
     starts = actions.shape[1] if actions.ndim == 3 else 1
     for s in range(starts):
         acts = actions[0, s] if actions.ndim == 3 else actions[0]  # (N,)
-        ordered = torch.cat([locs[:, :1, :], locs[:, acts, :]], dim=1)  # depot + tour
+        ordered = torch.cat(
+            [locs[:, :1, :], locs[:, acts, :]], dim=1)  # depot + tour
         costs.append(get_tour_length(ordered))       # (1,)
     return torch.stack(costs).squeeze(-1) if starts > 1 else costs[0].squeeze(-1)
 
@@ -108,7 +111,8 @@ def decode_cvrplib(net, env, td, td_reset, model, starts, device):
     with torch.no_grad():
         if model in ("pomo", "pomo_base", "am"):
             num_starts = starts if model in ("pomo", "pomo_base") else 1
-            out = net.policy(td_reset, env, phase="test", num_starts=num_starts)
+            out = net.policy(td_reset, env, phase="test",
+                             num_starts=num_starts)
             actions = out["actions"]
             cost = costs_from_actions(env, td_reset, actions).reshape(-1)
             best = cost.min() if cost.numel() > 1 else cost[0]
@@ -144,12 +148,15 @@ def build_td(coords, demand, capacity, device):
     the distribution the synthetic CVRP data was trained with. A ``capacity``
     key is included for backbones that read it directly (icam/l2r).
     """
-    coords = coords.to(device)                      # (N, 2)  -- node 0 is the depot
-    demand = demand.to(device)                      # (N,)    -- node 0 demand is 0
+    coords = coords.to(
+        device)                      # (N, 2)  -- node 0 is the depot
+    # (N,)    -- node 0 demand is 0
+    demand = demand.to(device)
     depot = coords[:1]                              # (1, 2)
     customers = coords[1:]                          # (N-1, 2)
     dem_cust = demand[1:] / capacity                # (N-1,) normalized, <= 1
-    dem_cust = torch.clamp(dem_cust, min=1e-8)      # avoid 0-demand (mask logic edge)
+    # avoid 0-demand (mask logic edge)
+    dem_cust = torch.clamp(dem_cust, min=1e-8)
     td = TensorDict(
         {
             "locs": customers.unsqueeze(0),         # (1, N, 2)
@@ -243,7 +250,9 @@ def evaluate_cvrplib(model, ckpt, data_dir="./data/cvrplib_setX", sizes=None,
     _allow_safe_globals()
 
     net = _load_checkpoint_model(ckpt, model).to(device)
-    env = net.env
+    # L2R creates its candidate-reduction environment inside `_rollout` and
+    # therefore does not expose the standard RL4CO `net.env` attribute.
+    env = getattr(net, "env", None)
     starts = num_starts or 100
 
     hparams = getattr(net, "hparams", None)
@@ -251,8 +260,8 @@ def evaluate_cvrplib(model, ckpt, data_dir="./data/cvrplib_setX", sizes=None,
     tr_pomo = getattr(hparams, "pomo_size", None) if hparams else None
     print(f"[info] checkpoint trained num_loc={tr_num_loc}  pomo_size={tr_pomo}"
           f"  | env generator num_loc="
-          f"{getattr(env.generator, 'num_loc', None)}  vehicle_capacity="
-          f"{getattr(env.generator, 'vehicle_capacity', None)}")
+          f"{getattr(getattr(env, 'generator', None), 'num_loc', None)}  vehicle_capacity="
+          f"{getattr(getattr(env, 'generator', None), 'vehicle_capacity', None)}")
 
     results = []
     agg = {"count": 0, "gap_sum": 0.0, "gap_sq": 0.0, "feasible": 0,
@@ -276,7 +285,9 @@ def evaluate_cvrplib(model, ckpt, data_dir="./data/cvrplib_setX", sizes=None,
         capacity = rec["capacity"]
 
         td = build_td(coords, demand, capacity, device)
-        td_reset = env.reset(td.clone())
+        # L2R consumes the pre-reset benchmark TensorDict directly; the other
+        # policies use the regular CVRPEnv reset representation.
+        td_reset = td if model == "l2r" else env.reset(td.clone())
         try:
             cost, actions = decode_cvrplib(
                 net, env, td, td_reset, model, starts, device)
@@ -299,7 +310,8 @@ def evaluate_cvrplib(model, ckpt, data_dir="./data/cvrplib_setX", sizes=None,
         # that the CVRPLIB best-known cost lives in.
         cost = cost * scale
         gap = (cost - bks) / bks if bks == bks else float("nan")
-        k_approx = int(round(float(demand.sum()) / capacity)) if capacity else 0
+        k_approx = int(round(float(demand.sum()) / capacity)
+                       ) if capacity else 0
 
         results.append({
             "name": name, "n": n, "capacity": capacity, "cost": round(cost, 2),
@@ -316,16 +328,18 @@ def evaluate_cvrplib(model, ckpt, data_dir="./data/cvrplib_setX", sizes=None,
         agg["cost_sum"] += cost
 
         print(f"{name:<14}{n:>5}{k_approx:>5}{capacity:>9.0f}{cost:>12.2f}"
-              f"{bks:>12.2f}{(gap*100 if gap==gap else float('nan')):>9.2f}"
+              f"{bks:>12.2f}{(gap*100 if gap == gap else float('nan')):>9.2f}"
               f"{'Y' if feasible else 'N':>5}")
 
     cnt = agg["count"]
     if cnt:
         mean_gap = agg["gap_sum"] / max(1, agg["feasible"])
-        std_gap = (agg["gap_sq"] / max(1, agg["feasible"]) - mean_gap**2) ** 0.5
+        std_gap = (agg["gap_sq"] / max(1, agg["feasible"]) -
+                   mean_gap**2) ** 0.5
         print(f"\n--- aggregate ({cnt} instances) ---")
         print(f"  feasible: {agg['feasible']}/{cnt}")
-        print(f"  mean gap (vs bks): {mean_gap*100:.2f}%  (std {std_gap*100:.2f}%)")
+        print(
+            f"  mean gap (vs bks): {mean_gap*100:.2f}%  (std {std_gap*100:.2f}%)")
         print(f"  mean cost: {agg['cost_sum']/cnt:.2f}")
     else:
         mean_gap = std_gap = 0.0
