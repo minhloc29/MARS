@@ -14,11 +14,15 @@ from rl4co.models.zoo.am.encoder import AttentionModelEncoder
 from rl4co.models.nn.slot_attention import SlotAttention
 from rl4co.data.insertion_cost import compute_sparse_insertion_cost
 from rl4co.models.nn.metric_loss import (
+    EuclideanGeometryLoss,
     MetricPreservationLoss,
     ProjectionHead,
     SlotEntropyLoss,
 )
-from rl4co.models.zoo.pomo_slot.policy import SlotInjectingEncoder
+from rl4co.models.zoo.pomo_slot.policy import (
+    GeometryRecordingEncoder,
+    SlotInjectingEncoder,
+)
 from rl4co.utils.pylogger import get_pylogger
 
 log = get_pylogger(__name__)
@@ -70,10 +74,14 @@ class POMOSlot(POMO):
         k_neighbors: int = 100,
         ins_method: str = "construction",
         disable_slots: bool = False,
+        geometry_aware_no_slots: bool = False,
         normalize_target: bool = False,
         symmetrize_target: bool = False,
         **pomo_kwargs,
     ) -> None:
+        if geometry_aware_no_slots and not disable_slots:
+            raise ValueError(
+                "geometry_aware_no_slots requires disable_slots=True")
         assert metric_variant in self.METRIC_VARIANTS, (
             f"metric_variant must be one of {self.METRIC_VARIANTS}, got '{metric_variant}'"
         )
@@ -97,6 +105,8 @@ class POMOSlot(POMO):
                 use_graph_context=pomo_kwargs.pop("use_graph_context", False),
             )
             slot_attn = None
+            if geometry_aware_no_slots:
+                policy.encoder = GeometryRecordingEncoder(base_encoder)
         else:
             # Build SlotAttention, wrap encoder with slot injection
             slot_attn = SlotAttention(
@@ -124,6 +134,7 @@ class POMOSlot(POMO):
         self.k_neighbors = k_neighbors
         self.ins_method = ins_method
         self.disable_slots = disable_slots
+        self.geometry_aware_no_slots = geometry_aware_no_slots
         self.normalize_target = normalize_target
         self.symmetrize_target = symmetrize_target
 
@@ -133,6 +144,10 @@ class POMOSlot(POMO):
 
         # Auxiliary losses (skipped when slots are disabled)
         self.slot_entropy_loss = None if disable_slots else SlotEntropyLoss()
+        self.geometry_loss_fn = (
+            EuclideanGeometryLoss(embed_dim, proj_dim)
+            if geometry_aware_no_slots else None
+        )
 
         self.metric_loss_fn: MetricPreservationLoss | None = None
         if not disable_slots and metric_variant not in ("none", "B", "A"):
@@ -170,8 +185,10 @@ class POMOSlot(POMO):
         dual_params = [self.metric_loss_fn.log_lambda]
 
         param_groups = [
-            {"params": main_params},                      # uses base lr + scheduler
-            {"params": dual_params, "lr": lr_dual},       # dual ascent, no scheduler
+            # uses base lr + scheduler
+            {"params": main_params},
+            # dual ascent, no scheduler
+            {"params": dual_params, "lr": lr_dual},
         ]
         # super(parameters=) builds optimizer+scheduler via RL4COLitModule machinery.
         return super().configure_optimizers(parameters=param_groups)
@@ -184,7 +201,8 @@ class POMOSlot(POMO):
             return
         lambda_max = getattr(self, "lambda_max", 50.0)
         with torch.no_grad():
-            self.metric_loss_fn.log_lambda.data.clamp_(max=math.log(lambda_max))
+            self.metric_loss_fn.log_lambda.data.clamp_(
+                max=math.log(lambda_max))
 
     # shared_step: extract d_ins, run POMO, read slot side-channel, add aux loss
     def shared_step(
@@ -211,14 +229,17 @@ class POMOSlot(POMO):
         device = self.device
         batch = batch.to(device)
         if d_ins_idx is not None:
-            d_ins_idx = d_ins_idx.to(device)  # keep as int16 for transfer, cast in loss fn
+            # keep as int16 for transfer, cast in loss fn
+            d_ins_idx = d_ins_idx.to(device)
         if d_ins_val is not None:
             d_ins_val = d_ins_val.to(device)
         # Read locs BEFORE super() mutates the batch (it adds 'visited' etc.).
         locs_customers: torch.Tensor | None = None
-        if self.metric_variant not in ("none", "B"):
-            raw_locs = batch.get("locs") if hasattr(batch, "get") else batch["locs"]
-            locs_customers = raw_locs.to(device)  # (B, N, 2) — customers only, no depot
+        if self.metric_variant not in ("none", "B") or self.geometry_aware_no_slots:
+            raw_locs = batch.get("locs") if hasattr(
+                batch, "get") else batch["locs"]
+            # (B, N, 2) — customers only, no depot
+            locs_customers = raw_locs.to(device)
 
         # On-the-fly d_ins fallback for Variant D when the dataset didn't cache it.
         # Node indexing: A_ik covers hidden[:, 1:, :] so node 0 is a pseudo-depot;
@@ -230,8 +251,10 @@ class POMOSlot(POMO):
             and locs_customers is not None
             and locs_customers.shape[1] > 1
         ):
-            customers = locs_customers[:, 1:, :]   # (B, N_cust, 2) — matches A_ik
-            depot = locs_customers[:, :1, :]        # (B, 1, 2) — node 0 as pseudo-depot
+            # (B, N_cust, 2) — matches A_ik
+            customers = locs_customers[:, 1:, :]
+            # (B, 1, 2) — node 0 as pseudo-depot
+            depot = locs_customers[:, :1, :]
             d_ins_idx, d_ins_val = compute_sparse_insertion_cost(
                 customers, k_neighbors=self.k_neighbors, depot_loc=depot,
                 method=self.ins_method,
@@ -241,15 +264,35 @@ class POMOSlot(POMO):
         out = super().shared_step(batch, batch_idx, phase, dataloader_idx)
 
         # Skip aux losses during val/test, or when slots are disabled.
-        if phase != "train" or self.metric_variant in ("none", "B") or self.disable_slots:
+        if phase != "train":
+            return out
+
+        if self.geometry_aware_no_slots:
+            hidden = self.policy.encoder.last_hidden
+            if hidden is None or locs_customers is None:
+                return out
+            geometry_loss = self.geometry_loss_fn(
+                hidden[:, 1:], locs_customers,
+                d_ins_idx=d_ins_idx if self.metric_variant == "D" else None,
+                d_ins_val=d_ins_val if self.metric_variant == "D" else None,
+            )
+            policy_loss = out.get("loss", None)
+            if policy_loss is not None:
+                out["loss"] = policy_loss + self.alpha_metric * geometry_loss
+                self.log("train/geometry_loss", geometry_loss.detach(),
+                         on_step=True, on_epoch=True)
+            return out
+
+        if self.metric_variant in ("none", "B") or self.disable_slots:
             return out
 
         # Read slot side-channel (policy.encoder is SlotInjectingEncoder)
         slots = self.policy.encoder.last_slots  # (B, K, d)
-        A_ik  = self.policy.encoder.last_A_ik   # (B, N, K)
+        A_ik = self.policy.encoder.last_A_ik   # (B, N, K)
 
         if slots is None or A_ik is None:
-            log.warning("SlotInjectingEncoder side-channel is None — skipping aux loss.")
+            log.warning(
+                "SlotInjectingEncoder side-channel is None — skipping aux loss.")
             return out
 
         # Compute auxiliary losses
@@ -263,7 +306,8 @@ class POMOSlot(POMO):
 
         # Variant A: reconstruction loss (slot centroids vs node coords)
         if self.metric_variant == "A":
-            locs = locs_customers  # (B, N, 2) customers only, read before super() above
+            # (B, N, 2) customers only, read before super() above
+            locs = locs_customers
             A_norm = A_ik / (A_ik.sum(dim=1, keepdim=True) + 1e-8)
             centroids = torch.einsum("bnk,bnc->bkc", A_norm, locs)
             recon = torch.einsum("bnk,bkc->bnc", A_ik, centroids)
@@ -273,7 +317,8 @@ class POMOSlot(POMO):
 
         # Variants C / D: metric preservation loss
         elif self.metric_loss_fn is not None:
-            locs = locs_customers  # (B, N, 2) customers only, read before super() above
+            # (B, N, 2) customers only, read before super() above
+            locs = locs_customers
             metric_loss, metric_info = self.metric_loss_fn(
                 slots=slots,
                 A_ik=A_ik,
@@ -288,11 +333,12 @@ class POMOSlot(POMO):
         policy_loss = out.get("loss", None)
         if policy_loss is not None and aux_loss.requires_grad:
             out["loss"] = policy_loss + aux_loss
-            log_dict["aux_loss"]    = aux_loss.detach()
+            log_dict["aux_loss"] = aux_loss.detach()
             log_dict["policy_loss"] = policy_loss.detach()
 
         # Log to Lightning
         for k, v in log_dict.items():
-            self.log(f"train/{k}", v, prog_bar=False, on_step=True, on_epoch=True)
+            self.log(f"train/{k}", v, prog_bar=False,
+                     on_step=True, on_epoch=True)
 
         return out

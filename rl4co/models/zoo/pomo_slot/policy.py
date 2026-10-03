@@ -33,16 +33,32 @@ class SlotInjectingEncoder(nn.Module):
         hidden, init_embeds = self.base_encoder(td)  # (B, N+1, d)
 
         # Slot Attention on customer nodes only
-        node_embs = hidden[:, 1:, :]                  # (B, N, d) — exclude depot
+        # (B, N, d) — exclude depot
+        node_embs = hidden[:, 1:, :]
         slots, A_ik = self.slot_attn(node_embs)       # (B, K, d), (B, N, K)
 
         # Per-node slot context, injected additively; depot unchanged
         slot_ctx = torch.bmm(A_ik, slots)             # (B, N, d)
         pad_depot = torch.zeros_like(hidden[:, :1, :])  # (B, 1, d)
-        hidden = hidden + self.slot_scale * torch.cat([pad_depot, slot_ctx], dim=1)  # (B, N+1, d)
+        hidden = hidden + self.slot_scale * \
+            torch.cat([pad_depot, slot_ctx], dim=1)  # (B, N+1, d)
 
         # Expose via side-channel for aux loss
         self.last_slots = slots   # (B, K, d)
-        self.last_A_ik  = A_ik   # (B, N, K)
+        self.last_A_ik = A_ik   # (B, N, K)
 
+        return hidden, init_embeds
+
+
+class GeometryRecordingEncoder(nn.Module):
+    """Record plain encoder embeddings for the no-slot geometry objective."""
+
+    def __init__(self, encoder: nn.Module) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.last_hidden: torch.Tensor | None = None
+
+    def forward(self, td):
+        hidden, init_embeds = self.encoder(td)
+        self.last_hidden = hidden
         return hidden, init_embeds

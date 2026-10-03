@@ -42,6 +42,52 @@ class ProjectionHead(nn.Module):
         return self.net(z)
 
 
+class EuclideanGeometryLoss(nn.Module):
+    """Match projected node-embedding distances to spatial distances."""
+
+    def __init__(self, input_dim: int, proj_dim: int = 64,
+                 sample_pairs: int = 1024) -> None:
+        super().__init__()
+        self.proj_head = ProjectionHead(input_dim, proj_dim)
+        self.sample_pairs = sample_pairs
+
+    def forward(self, node_embeddings: torch.Tensor,
+                locs: torch.Tensor,
+                d_ins_idx: torch.Tensor | None = None,
+                d_ins_val: torch.Tensor | None = None) -> torch.Tensor:
+        _, num_nodes, _ = node_embeddings.shape
+        if d_ins_idx is not None and d_ins_val is not None:
+            pair_count = min(self.sample_pairs,
+                             d_ins_idx.shape[1] * d_ins_idx.shape[2])
+            first = torch.randint(num_nodes, (pair_count,), device=locs.device)
+            edge = torch.randint(
+                d_ins_idx.shape[2], (pair_count,), device=locs.device)
+            second = d_ins_idx[:, first, edge].long()
+            target_dist = d_ins_val[:, first, edge].to(locs.dtype)
+            projected_second = None
+        else:
+            pair_count = min(self.sample_pairs, num_nodes * num_nodes)
+            first = torch.randint(num_nodes, (pair_count,), device=locs.device)
+            second = torch.randint(
+                num_nodes, (pair_count,), device=locs.device)
+            target_dist = (locs[:, first] - locs[:, second]).norm(dim=-1)
+            projected_second = second
+
+        projected = self.proj_head(node_embeddings)
+        if projected_second is not None:
+            second_embeddings = projected[:, projected_second]
+        else:
+            second_embeddings = projected.gather(
+                1, second.unsqueeze(-1).expand(-1, -1, projected.shape[-1])
+            )
+        latent_dist = (projected[:, first] - second_embeddings).norm(dim=-1)
+        latent_dist = latent_dist / latent_dist.detach().amax(dim=1,
+                                                              keepdim=True).clamp_min(1e-6)
+        target_dist = target_dist / \
+            target_dist.amax(dim=1, keepdim=True).clamp_min(1e-6)
+        return F.mse_loss(latent_dist, target_dist)
+
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Target distance aggregators
 # ────────────────────────────────────────────────────────────────────────────────
@@ -93,7 +139,7 @@ class ProjectionHead(nn.Module):
 #     D_ins = torch.bmm(A_ik.transpose(1, 2), node_weighted)  # (B, K, K)
 #     return D_ins
 
-#NEW: normalization, let's see
+# NEW: normalization, let's see
 def _aggregate_d_ins_sparse(d_ins_idx, d_ins_val, A_ik, normalize=True, symmetrize=True, eps=1e-8):
     B, N, k = d_ins_val.shape
     K = A_ik.shape[2]
@@ -104,10 +150,12 @@ def _aggregate_d_ins_sparse(d_ins_idx, d_ins_val, A_ik, normalize=True, symmetri
     )
     w = d_ins_val.unsqueeze(-1) * A_neighbors
     node_weighted = w.sum(dim=2)
-    D_ins = torch.bmm(A_ik.transpose(1, 2), node_weighted)  # (B, K, K) -- raw, asymmetric
+    # (B, K, K) -- raw, asymmetric
+    D_ins = torch.bmm(A_ik.transpose(1, 2), node_weighted)
 
     if symmetrize:
-        D_ins = 0.5 * (D_ins + D_ins.transpose(-1, -2))      # now a well-defined dissimilarity
+        # now a well-defined dissimilarity
+        D_ins = 0.5 * (D_ins + D_ins.transpose(-1, -2))
 
     if normalize:
         mass = A_ik.sum(dim=1)                                # (B, K)
@@ -337,7 +385,8 @@ class MetricPreservationLoss(nn.Module):
 
         # Optional pair subsampling for large K
         if self.sample_pairs is not None and latent_off.numel() > self.sample_pairs:
-            idx = torch.randperm(latent_off.numel(), device=slots.device)[: self.sample_pairs]
+            idx = torch.randperm(latent_off.numel(), device=slots.device)[
+                : self.sample_pairs]
             latent_off = latent_off[idx]
             target_off = target_off[idx]
 

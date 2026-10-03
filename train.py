@@ -140,6 +140,7 @@ def train(
     backbone: str = "pomo",
     baseline: str | None = None,
     disable_slots: bool = False,
+    geometry_aware_no_slots: bool = False,
     ins_method: str = "construction",
     lower_neighbors_num: int = 50,
     reduction_percentage: float = 0.1,
@@ -203,6 +204,8 @@ def train(
         "Full rl4co import failed. Ensure torchrl DLL is installed correctly "
         "or run on a compatible machine."
     )
+    if geometry_aware_no_slots and not disable_slots:
+        raise ValueError("geometry_aware_no_slots requires --disable_slots")
 
     # ----------------------------------------------------------------
     # LEHD / TTPL branch — separate training loop using LEHD's own data
@@ -406,6 +409,8 @@ def train(
     # disable_slots: run backbone as a true no-slot baseline (no slot/aux).
     if disable_slots and backbone not in BASELINE_BACKBONES:
         model_kwargs["disable_slots"] = True
+    if geometry_aware_no_slots:
+        model_kwargs["geometry_aware_no_slots"] = True
     model = model_cls(**model_kwargs)
     if backbone == "sil":
         model.dataset_signature = train_loader.dataset.signature()
@@ -445,6 +450,9 @@ def train(
                     f"_p{radar_pomo_size}_k{radar_svd_rank}"
                     f"_ms{radar_ms_hidden_dim}_c{radar_logit_clipping:g}"
                     f"_si{radar_sinkhorn_iters}_sn{int(radar_scale_norm)}")
+    elif geometry_aware_no_slots:
+        run_name = (f"{backbone}_geometry_{metric_variant}_noslot_N{num_loc}_"
+                    f"{dist}_{ins_method}_seed{seed}")
     elif disable_slots:
         run_name = f"{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
     else:
@@ -502,6 +510,7 @@ def train(
         "ins_method": ins_method,
         "normalize_target": normalize_target,
         "symmetrize_target": symmetrize_target,
+        "geometry_aware_no_slots": geometry_aware_no_slots,
         "best_val_reward": best_reward,
         "elapsed_min": round(elapsed / 60, 1),
         "checkpoint": str(checkpoint_cb.best_model_path),
@@ -570,6 +579,7 @@ def train(
     dedup_key = {k: result[k] for k in (
         "backbone", "metric_variant", "num_slots", "num_loc", "dist", "seed",
         "ins_method", "normalize_target", "symmetrize_target",
+        "geometry_aware_no_slots",
     )}
     if backbone == "sil":
         dedup_key.update(
@@ -580,12 +590,15 @@ def train(
         dedup_key.update({k: v for k, v in result.items()
                          if k.startswith("invit_")})
     elif backbone == "dgl":
-        dedup_key.update({k: v for k, v in result.items() if k.startswith("dgl_")})
+        dedup_key.update(
+            {k: v for k, v in result.items() if k.startswith("dgl_")})
         dedup_key.update({"dataset_signature": result["dataset_signature"]})
     elif backbone == "elg":
-        dedup_key.update({k: v for k, v in result.items() if k.startswith("elg_")})
+        dedup_key.update(
+            {k: v for k, v in result.items() if k.startswith("elg_")})
     elif backbone == "radar":
-        dedup_key.update({k: v for k, v in result.items() if k.startswith("radar_")})
+        dedup_key.update({k: v for k, v in result.items()
+                         if k.startswith("radar_")})
     results = [r for r in results if not all(
         r.get(k) == v for k, v in dedup_key.items())]
     results.append(result)
@@ -754,6 +767,8 @@ def main():
         "--sil_no_prc", dest="sil_parallel_reconstruction", action="store_false")
     parser.add_argument("--baseline", default=None)
     parser.add_argument("--disable_slots", action="store_true")
+    parser.add_argument("--geometry_aware_no_slots", action="store_true",
+                        help="Use Euclidean geometry loss on plain encoder embeddings.")
     parser.add_argument("--normalize_target",
                         action="store_true", default=True)
     parser.add_argument("--no_normalize_target",
@@ -792,9 +807,11 @@ def main():
     parser.add_argument("--elg_local_size", type=int, default=40)
     parser.add_argument("--elg_local_dim", type=int, default=32)
     parser.add_argument("--elg_local_heads", type=int, default=4)
-    parser.add_argument("--elg_mode", choices=["joint", "only_global", "only_local"], default="joint")
+    parser.add_argument(
+        "--elg_mode", choices=["joint", "only_global", "only_local"], default="joint")
     parser.add_argument("--elg_warmup_epochs", type=int, default=0)
-    parser.add_argument("--elg_no_scale_norm", dest="elg_scale_norm", action="store_false")
+    parser.add_argument("--elg_no_scale_norm",
+                        dest="elg_scale_norm", action="store_false")
     # ---- RADAR baseline arguments ----
     parser.add_argument("--radar_embed_dim", type=int, default=64)
     parser.add_argument("--radar_encoder_layers", type=int, default=6)
@@ -828,6 +845,7 @@ def main():
         beta_entropy=args.beta_entropy, normalize_target=args.normalize_target,
         symmetrize_target=args.symmetrize_target, baseline=args.baseline,
         disable_slots=args.disable_slots, ins_method=args.ins_method,
+        geometry_aware_no_slots=args.geometry_aware_no_slots,
         lower_neighbors_num=args.lower_neighbors_num,
         reduction_percentage=args.reduction_percentage, logger=args.logger,
         resume=args.resume, num_workers=args.num_workers,
