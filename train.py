@@ -734,7 +734,7 @@ def main():
     parser.add_argument("--lambda_init", type=float, default=1.0)
     parser.add_argument("--lr_dual", type=float, default=1e-4)
     parser.add_argument("--metric_variant", "--variant", default="D",
-                        choices=["none", "A", "B", "C", "D"])
+                        choices=["none", "A", "B", "C", "D", "E"])
     parser.add_argument("--alpha_metric", type=float, default=0.1)
     parser.add_argument("--beta_entropy", type=float, default=0.01)
     parser.add_argument("--ins_method", default="construction",

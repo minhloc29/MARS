@@ -116,6 +116,53 @@ def _aggregate_d_ins_sparse(d_ins_idx, d_ins_val, A_ik, normalize=True, symmetri
     return D_ins
 
 
+def _euclidean_aggregate(
+    locs: torch.Tensor,
+    A_ik: torch.Tensor,
+    normalize: bool = True,
+    symmetrize: bool = True,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Bilinear aggregation of spatial Euclidean distance (LEGO-Euclidean variant).
+
+        D_euc(k, l) = sum_i sum_j A_ik * A_jl * ||x_i - x_j||_2   =  A^T d_euc A
+
+    This is the direct analog of Variant D's construction-aggregation, but with
+    the ordinary spatial distance d_euc(i,j) = ||x_i - x_j||_2 in place of the
+    route-induced d_cons. Everything else (K, A, phi, spread, lambda, entropy) is
+    unchanged — this is the pure routing-aware-vs-spatial control: whether the
+    *routing-aware* target is more useful than plain spatial proximity.
+
+    Args:
+        locs: (B, N, 2) customer coordinates.
+        A_ik: (B, N, K) soft slot assignment matrix.
+        normalize (bool): Divide by the slot mass product (c_k * c_l) — matches
+            how Variant D's aggregate is normalised so the two differ only in
+            the underlying node-level distance d_cons vs d_euc.
+        symmetrize (bool): Average with its transpose (d_euc already symmetric,
+            so this is a no-op kept for parity with Variant D's pipeline).
+
+    Returns:
+        D_euc: (B, K, K) bilinearly-aggregated spatial distance.
+    """
+    B, N, K = A_ik.shape
+    # Pairwise spatial distance: d_euc(i,j) = ||x_i - x_j||_2 -> (B, N, N)
+    diff = locs.unsqueeze(2) - locs.unsqueeze(1)   # (B, N, N, 2)
+    d_euc = torch.norm(diff, p=2, dim=-1)          # (B, N, N)
+    # Bilinear aggregation: A^T d A  -> (B, K, K)
+    D_euc = torch.bmm(A_ik.transpose(1, 2), torch.bmm(d_euc, A_ik))
+
+    if symmetrize:
+        D_euc = 0.5 * (D_euc + D_euc.transpose(-1, -2))
+
+    if normalize:
+        mass = A_ik.sum(dim=1)                     # (B, K)
+        D_euc = D_euc / (mass.unsqueeze(-1) * mass.unsqueeze(-2) + eps)
+
+    return D_euc
+
+
 def _euclidean_target(
     locs: torch.Tensor,
     A_ik: torch.Tensor,
@@ -159,7 +206,11 @@ class MetricPreservationLoss(nn.Module):
 
     Args:
         proj_head (ProjectionHead): Shared phi projection head.
-        variant (str): One of 'C' (Euclidean), 'D' (insertion cost).
+        variant (str): One of 'C' (Euclidean centroid), 'D' (insertion cost),
+            'E' (bilinear spatial Euclidean).
+            'E' is LEGO-Euclidean: same bilinear A^T d A aggregation as 'D' but
+            with the ordinary spatial distance d_euc(i,j)=||x_i-x_j||_2 instead
+            of the route-induced d_cons — the routing-aware-vs-spatial control.
         lambda_init (float): Initial value for the Lagrange multiplier.
         lr_dual (float): Stored for reference; actual lr is set via param group
             in POMOSlot.configure_optimizers.
@@ -167,8 +218,8 @@ class MetricPreservationLoss(nn.Module):
             per batch to reduce memory for large K. None = all K^2 pairs.
     """
 
-    # E excluded: future-regret target not yet implemented
-    SUPPORTED_VARIANTS = {"C", "D"}
+    # E excluded: future-regret target not yet implemented. E is LEGO-Euclidean.
+    SUPPORTED_VARIANTS = {"C", "D", "E"}
 
     def __init__(
         self,
@@ -229,6 +280,14 @@ class MetricPreservationLoss(nn.Module):
             return _aggregate_d_ins_sparse(
                 d_ins_idx,
                 d_ins_val,
+                A_ik,
+                normalize=self.normalize_target,
+                symmetrize=self.symmetrize_target,
+            )  # (B, K, K)
+        elif self.variant == "E":
+            assert locs is not None, "locs required for Variant E"
+            return _euclidean_aggregate(
+                locs,
                 A_ik,
                 normalize=self.normalize_target,
                 symmetrize=self.symmetrize_target,

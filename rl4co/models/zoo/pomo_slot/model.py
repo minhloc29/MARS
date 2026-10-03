@@ -38,7 +38,9 @@ class POMOSlot(POMO):
         embed_dim (int): Encoder/decoder embedding dimension. Must match
             the AttentionModelPolicy embed_dim. Default: 128.
         num_slots (int): K — number of slot/region embeddings.
-        metric_variant (str): Ablation variant — one of "none"/"B", "A", "C", "D".
+        metric_variant (str): Ablation variant — one of "none"/"B", "A", "C", "D", "E".
+            "E" is LEGO-Euclidean: bilinear spatial target (same A^T d A aggregation
+            as "D" but with d_euc=||x_i-x_j||_2 instead of the route-induced d_cons).
         alpha_metric (float): Weight for metric preservation/reconstruction loss.
         beta_entropy (float): Weight for slot entropy regulariser.
         slot_iters (int): Number of SlotAttention refinement iterations.
@@ -50,8 +52,8 @@ class POMOSlot(POMO):
         **pomo_kwargs: All remaining kwargs forwarded to POMO base class.
     """
 
-    # "E" excluded: future-regret target not yet implemented
-    METRIC_VARIANTS = {"none", "B", "A", "C", "D"}
+    # "E" is LEGO-Euclidean (bilinear spatial target), not future-regret.
+    METRIC_VARIANTS = {"none", "B", "A", "C", "D", "E"}
 
     def __init__(
         self,
