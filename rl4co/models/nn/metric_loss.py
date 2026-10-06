@@ -116,6 +116,17 @@ def _aggregate_d_ins_sparse(d_ins_idx, d_ins_val, A_ik, normalize=True, symmetri
     return D_ins
 
 
+def _shuffle_off_diagonal(D: torch.Tensor) -> torch.Tensor:
+    """Permute target pair values independently within each batch item."""
+    B, K, _ = D.shape
+    mask = ~torch.eye(K, dtype=torch.bool, device=D.device)
+    values = D[:, mask]
+    permutation = torch.rand(values.shape, device=D.device).argsort(dim=-1)
+    shuffled = torch.zeros_like(D)
+    shuffled[:, mask] = torch.gather(values, dim=-1, index=permutation)
+    return shuffled
+
+
 def _euclidean_target(
     locs: torch.Tensor,
     A_ik: torch.Tensor,
@@ -179,6 +190,7 @@ class MetricPreservationLoss(nn.Module):
         sample_pairs: int | None = None,
         normalize_target: bool = True,
         symmetrize_target: bool = True,
+        shuffle_target: bool = False,
     ) -> None:
         super().__init__()
 
@@ -192,6 +204,7 @@ class MetricPreservationLoss(nn.Module):
         self.sample_pairs = sample_pairs
         self.normalize_target = normalize_target
         self.symmetrize_target = symmetrize_target
+        self.shuffle_target = shuffle_target
 
         # Lagrange multiplier — stored as log for positivity constraint
         self.log_lambda = nn.Parameter(
@@ -204,7 +217,8 @@ class MetricPreservationLoss(nn.Module):
         immediately rather than after several eval runs."""
         return (
             f"variant={self.variant}, normalize_target={self.normalize_target}, "
-            f"symmetrize_target={self.symmetrize_target}"
+            f"symmetrize_target={self.symmetrize_target}, "
+            f"shuffle_target={self.shuffle_target}"
         )
 
     @property
@@ -268,6 +282,8 @@ class MetricPreservationLoss(nn.Module):
 
         # Compute target distances (detached — target should not backprop)
         D_target = self._get_target(A_ik, locs, d_ins_idx, d_ins_val).detach()
+        if self.shuffle_target:
+            D_target = _shuffle_off_diagonal(D_target)
 
         # Off-diagonal mask (exclude self-pairs k==l)
         off_diag = ~torch.eye(K, dtype=torch.bool, device=slots.device)

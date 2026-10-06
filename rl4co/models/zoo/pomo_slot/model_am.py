@@ -86,6 +86,7 @@ class AMSlot(AttentionModel):
         disable_slots: bool = False,
         normalize_target: bool = True,
         symmetrize_target: bool = True,
+        shuffle_target: bool = False,
         **am_kwargs,
     ) -> None:
         assert metric_variant in self.METRIC_VARIANTS, (
@@ -147,6 +148,7 @@ class AMSlot(AttentionModel):
         self.disable_slots = disable_slots
         self.normalize_target = normalize_target
         self.symmetrize_target = symmetrize_target
+        self.shuffle_target = shuffle_target
 
         # Reference for display (lives inside policy.encoder)
         self.slot_attn = slot_attn
@@ -156,7 +158,7 @@ class AMSlot(AttentionModel):
         self.metric_loss_fn = (
             None if disable_slots else self._build_metric_loss(
                 metric_variant, embed_dim, proj_dim, lambda_init, lr_dual,
-                normalize_target, symmetrize_target,
+                normalize_target, symmetrize_target, shuffle_target,
             )
         )
 
@@ -167,7 +169,8 @@ class AMSlot(AttentionModel):
         )
 
     def _build_metric_loss(self, variant, embed_dim, proj_dim, lambda_init, lr_dual,
-                           normalize_target=True, symmetrize_target=True):
+                           normalize_target=True, symmetrize_target=True,
+                           shuffle_target=False):
         """Construct the metric-preservation loss for metric variants (C/D)."""
         if variant in ("none", "B", "A"):
             return None
@@ -179,6 +182,7 @@ class AMSlot(AttentionModel):
             lr_dual=lr_dual,
             normalize_target=normalize_target,
             symmetrize_target=symmetrize_target,
+            shuffle_target=shuffle_target,
         )
 
     # configure_optimizers: separate dual param group for log_lambda (dual ascent),

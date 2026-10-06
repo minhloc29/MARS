@@ -70,6 +70,7 @@ class POMOSlot(POMO):
         disable_slots: bool = False,
         normalize_target: bool = False,
         symmetrize_target: bool = False,
+        shuffle_target: bool = False,
         **pomo_kwargs,
     ) -> None:
         assert metric_variant in self.METRIC_VARIANTS, (
@@ -124,6 +125,7 @@ class POMOSlot(POMO):
         self.disable_slots = disable_slots
         self.normalize_target = normalize_target
         self.symmetrize_target = symmetrize_target
+        self.shuffle_target = shuffle_target
 
         # Keep a reference to slot_attn for display in the model summary
         # (it's actually inside policy.encoder, but named here for clarity)
@@ -145,13 +147,14 @@ class POMOSlot(POMO):
                 lr_dual=lr_dual,
                 normalize_target=normalize_target,
                 symmetrize_target=symmetrize_target,
+                shuffle_target=shuffle_target,
             )
 
         log.info(
             f"POMOSlot: embed_dim={embed_dim}, K={num_slots}, "
             f"variant={metric_variant}, alpha={alpha_metric}, beta={beta_entropy}, "
             f"normalize_target={normalize_target}, symmetrize_target={symmetrize_target}, "
-            f"disable_slots={disable_slots}"
+            f"shuffle_target={shuffle_target}, disable_slots={disable_slots}"
         )
 
     # configure_optimizers: separate dual param group for log_lambda (dual ascent),
@@ -230,7 +233,7 @@ class POMOSlot(POMO):
         ):
             customers = locs_customers[:, 1:, :]   # (B, N_cust, 2) — matches A_ik
             depot = locs_customers[:, :1, :]        # (B, 1, 2) — node 0 as pseudo-depot
-            d_ins_idx, d_ins_val = compute_sparse_insertion_cost(
+            d_ins_idx, d_iƒns_val = compute_sparse_insertion_cost(
                 customers, k_neighbors=self.k_neighbors, depot_loc=depot,
                 method=self.ins_method,
             )  # (B, N_cust, k) int16, (B, N_cust, k) float32

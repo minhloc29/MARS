@@ -136,6 +136,7 @@ def train(
     beta_entropy: float = 0.01,
     normalize_target: bool = True,
     symmetrize_target: bool = True,
+    shuffle_target: bool = False,
     max_instances: int | None = None,
     backbone: str = "pomo",
     baseline: str | None = None,
@@ -330,6 +331,7 @@ def train(
         lr_dual=lr_dual,
         normalize_target=normalize_target,
         symmetrize_target=symmetrize_target,
+        shuffle_target=shuffle_target,
         ins_method=ins_method,
         optimizer_kwargs={"lr": lr},
     )
@@ -416,7 +418,8 @@ def train(
     # and — for Variant D — the normalize/symmetrize target-aggregation flags).
     norm_tag = ""
     if metric_variant == "D":
-        norm_tag = f"_n{int(normalize_target)}s{int(symmetrize_target)}"
+        norm_tag = (f"_n{int(normalize_target)}s{int(symmetrize_target)}"
+                    f"_sh{int(shuffle_target)}")
 
     base_suffix = f"_bl{baseline}" if backbone == "am" and baseline else ""
     if backbone == "sil":
@@ -483,6 +486,8 @@ def train(
         print(
             f"  Slots: K={num_slots}  proj_dim={proj_dim}  iters={slot_iters}")
     print(f"  ins_method: {ins_method}")
+    if metric_variant == "D":
+        print(f"  shuffle_target: {shuffle_target}")
     print(f"  Output: {log_path}")
     print(f"{'='*60}\n")
 
@@ -502,6 +507,7 @@ def train(
         "ins_method": ins_method,
         "normalize_target": normalize_target,
         "symmetrize_target": symmetrize_target,
+        "shuffle_target": shuffle_target,
         "best_val_reward": best_reward,
         "elapsed_min": round(elapsed / 60, 1),
         "checkpoint": str(checkpoint_cb.best_model_path),
@@ -570,6 +576,7 @@ def train(
     dedup_key = {k: result[k] for k in (
         "backbone", "metric_variant", "num_slots", "num_loc", "dist", "seed",
         "ins_method", "normalize_target", "symmetrize_target",
+        "shuffle_target",
     )}
     if backbone == "sil":
         dedup_key.update(
@@ -762,6 +769,9 @@ def main():
                         action="store_true", default=True)
     parser.add_argument("--no_symmetrize_target",
                         dest="symmetrize_target", action="store_false")
+    parser.add_argument("--shuffle_target", action="store_true",
+                        help="Shuffle metric target pair values within each "
+                             "instance as a negative-control ablation.")
     parser.add_argument("--logger", default="csv", choices=["csv", "wandb"])
     parser.add_argument("--resume", default=None)
     parser.add_argument("--lehd_data_path", default=None)
@@ -826,7 +836,8 @@ def main():
         lambda_init=args.lambda_init, lr_dual=args.lr_dual,
         metric_variant=args.metric_variant, alpha_metric=args.alpha_metric,
         beta_entropy=args.beta_entropy, normalize_target=args.normalize_target,
-        symmetrize_target=args.symmetrize_target, baseline=args.baseline,
+        symmetrize_target=args.symmetrize_target,
+        shuffle_target=args.shuffle_target, baseline=args.baseline,
         disable_slots=args.disable_slots, ins_method=args.ins_method,
         lower_neighbors_num=args.lower_neighbors_num,
         reduction_percentage=args.reduction_percentage, logger=args.logger,

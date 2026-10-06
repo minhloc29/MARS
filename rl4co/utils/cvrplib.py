@@ -119,13 +119,17 @@ def decode_cvrplib(net, env, td, td_reset, model, starts, device):
             return float(best.item()), actions
         elif model == "sil":
             out = net.policy(td_reset, env, phase="test")
-            return float(-out["reward"].reshape(-1).max().item()), None
+            return float(-out["reward"].reshape(-1).max().item()), out["actions"]
         elif model in ("icam", "l2r"):
+            if model == "l2r":
+                r, _, actions = net._rollout(
+                    td, sampling=False, return_actions=True)
+                return float(-r.reshape(-1).max().item()), actions
             r, _ = net._rollout(td, sampling=False)
             return float(-r.reshape(-1).max().item()), None
         elif model == "invit":
             out = net.policy(td, phase="test", decode_type="greedy")
-            return float(-out["reward"].reshape(-1).max().item()), None
+            return float(-out["reward"].reshape(-1).max().item()), out["actions"]
         else:  # elg / dgl / radar
             from rl4co.models.zoo.baseline_cvrp import rollout
 
@@ -220,7 +224,9 @@ def verify_feasible(env, td_r, actions):
 
 
 def evaluate_cvrplib(model, ckpt, data_dir="./data/cvrplib_setX", sizes=None,
-                     num_starts=None, device="cpu") -> dict:
+                     num_starts=None, device="cpu", plot_instances=None,
+                     plot_dir="results/plots", plot_dpi=300,
+                     only_instances=None) -> dict:
     """Evaluate a checkpoint on the CVRPLIB Set X benchmark.
 
     Args:
@@ -231,12 +237,25 @@ def evaluate_cvrplib(model, ckpt, data_dir="./data/cvrplib_setX", sizes=None,
         num_starts: POMO multi-start count (default 100). Ignored by
             elg/dgl/radar (baked pomo_size) and sil/icam/l2r/invit.
         device: torch device string.
+        plot_instances: optional iterable of instance names or zero-based
+            positions in the selected, sorted evaluation list.
+        plot_dir: directory for CVRPLIB route figures.
+        plot_dpi: raster resolution for route PNGs.
+        only_instances: optional iterable with the same selectors as
+            ``plot_instances``; when provided, skip decoding other records.
 
     Returns an aggregate dict (n_inst/num_starts/mean_gap/std_gap/feasible/
     mean_cost/instances) and prints a per-instance table.
     """
     if isinstance(sizes, str):
         sizes = [int(s) for s in sizes.split(",") if s.strip()] or None
+    plot_selectors = {str(value).strip() for value in (plot_instances or [])
+                      if str(value).strip()}
+    only_selectors = {str(value).strip() for value in (only_instances or [])
+                      if str(value).strip()}
+    only_all = "all" in only_selectors
+    plot_all = "all" in plot_selectors
+    selected_index = 0
 
     data = torch.load(Path(data_dir) / "setX.pt", map_location="cpu",
                       weights_only=False)
@@ -275,6 +294,13 @@ def evaluate_cvrplib(model, ckpt, data_dir="./data/cvrplib_setX", sizes=None,
         n = rec["node_coord"].shape[0]
         if sizes and n not in sizes:
             continue
+        plot_this = plot_all or name in plot_selectors or str(
+            selected_index) in plot_selectors
+        run_this = (not only_selectors or only_all or name in only_selectors
+                    or str(selected_index) in only_selectors)
+        selected_index += 1
+        if not run_this:
+            continue
         bks = rec["best_cost"]
         if bks is None:
             bks = float("nan")
@@ -305,6 +331,19 @@ def evaluate_cvrplib(model, ckpt, data_dir="./data/cvrplib_setX", sizes=None,
             continue
         feasible = (verify_feasible(env, td_reset, actions)
                     if actions is not None else True)
+
+        if plot_this and actions is not None:
+            from rl4co.utils.cvrp_plot import render_cvrp_solution
+
+            plot_td = td_reset.detach().cpu()
+            if model == "l2r":
+                plot_td = plot_td.clone()
+                plot_td["locs"] = torch.cat(
+                    [plot_td["depot"].unsqueeze(1), plot_td["locs"]], dim=1)
+            render_cvrp_solution(
+                plot_td, actions.detach().cpu(),
+                Path(plot_dir) / f"{model}_{name}", dpi=plot_dpi)
+            print(f"  [plot] {Path(plot_dir) / (model + '_' + name)}")
 
         # Decoded cost is in [0,1]^2 units; rescale to the raw-coordinate frame
         # that the CVRPLIB best-known cost lives in.

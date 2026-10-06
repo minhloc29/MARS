@@ -41,7 +41,16 @@ def batch_iter(ds, batch_size):
     for i in range(0, n, batch_size):
         chunk = ds[i:i + batch_size]
         if not is_td:
-            chunk = torch.stack(chunk)
+            if chunk and isinstance(chunk[0], dict):
+                chunk = TensorDict(
+                    {
+                        key: torch.stack([sample[key] for sample in chunk])
+                        for key in chunk[0]
+                    },
+                    batch_size=[len(chunk)],
+                )
+            else:
+                chunk = torch.stack(chunk)
         yield chunk
 
 

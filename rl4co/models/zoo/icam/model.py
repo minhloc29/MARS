@@ -24,9 +24,12 @@ class _ICAMEncoderLayer(nn.Module):
         q = self.query(hidden)
         k = self.key(hidden)
         v = self.value(hidden)
-        bias = torch.exp(self.alpha * distance_bias)
-        weighted = (bias @ (torch.exp(k) * v)) / \
-            (bias @ torch.exp(k)).clamp_min(1e-8)
+        attention_logits = (
+            self.alpha * distance_bias.unsqueeze(-1)
+            + k.unsqueeze(1)
+        )
+        attention = torch.softmax(attention_logits, dim=2)
+        weighted = (attention * v.unsqueeze(1)).sum(dim=2)
         attended = torch.sigmoid(q) * weighted
         hidden = self.norm1(
             (hidden + attended).transpose(1, 2)).transpose(1, 2)
@@ -68,9 +71,9 @@ class _ICAMPolicy(nn.Module):
         key = self.key(hidden)
         value = self.value(hidden)
         attention_bias = -log_scale * self.alpha_distance * current_distance + mask
-        weights = torch.exp(attention_bias)
-        context = (weights @ (torch.exp(key) * value)) / \
-            (weights @ torch.exp(key)).clamp_min(1e-8)
+        attention_logits = attention_bias.unsqueeze(-1) + key.unsqueeze(1)
+        attention = torch.softmax(attention_logits, dim=2)
+        context = (attention * value.unsqueeze(1)).sum(dim=2)
         score = torch.matmul(torch.sigmoid(query) *
                              context, hidden.transpose(1, 2))
         score = score / (self.embedding_dim ** 0.5)
@@ -108,8 +111,6 @@ class ICAMCVRP(pl.LightningModule):
         demand = batch["demand"].to(dtype=torch.float32)
         if demand.max() > 1:
             demand = demand / capacity
-        print(f"[debug] demand after _batch: min={demand.min().item():.4f} "
-            f"max={demand.max().item():.4f} mean={demand.mean().item():.4f}")  # ADD THIS
         depot = batch["depot"].to(dtype=torch.float32).unsqueeze(1)
         nodes = batch["locs"].to(dtype=torch.float32)
         return depot, nodes, demand
@@ -150,6 +151,8 @@ class ICAMCVRP(pl.LightningModule):
                     (torch.zeros(batch_size, 1, device=device), demand), dim=1)
                 mask[demand_all[:, None, :] > load[..., None]] = float("-inf")
                 mask[:, :, 0][current != 0] = 0
+                mask = mask.masked_fill(finished[..., None], float("-inf"))
+                mask[:, :, 0][finished] = 0
                 logits = self.policy.logits(
                     hidden, current, load, current_distance, mask, log_scale)
                 probs = torch.softmax(logits, dim=-1)
