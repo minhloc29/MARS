@@ -27,3 +27,8 @@ from rl4co.models.zoo.elg import ELG, ELGPolicy
 from rl4co.models.zoo.mvmoe import MVMoE_AM, MVMoE_POMO
 from rl4co.models.zoo.pomo import POMO
 from rl4co.models.zoo.symnco import SymNCO, SymNCOPolicy
+from rl4co.models.zoo.sil import SIL, SILPolicy
+from rl4co.models.zoo.lehd import LEHDModel, TTRLModel
+from rl4co.models.zoo.invit import INViT
+from rl4co.models.zoo.icam import ICAMCVRP
+from rl4co.models.zoo.pomo_slot import AMSlot, POMOSlot

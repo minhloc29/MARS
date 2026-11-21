@@ -179,6 +179,9 @@ local_nbrun*
 .DS_Store
 outputs/
 
+# generated figure outputs (regenerable from scripts/)
+figures/
+
 # HGS-CVRP for cvrp local search
 HGS-CVRP/
 

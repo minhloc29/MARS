@@ -1,222 +1,180 @@
-</br>
-<div align="center">
+# LEGO: Metric-Aware Slot Abstraction for Routing
 
-<img src="https://raw.githubusercontent.com/ai4co/assets/main/svg/rl4co_animated_full.svg" alt="AI4CO Logo" style="width: 40%; height: auto;">
+A fork of the [RL4CO](https://github.com/ai4co/rl4co) benchmark that extends POMO / AM
+with **metric-aware slot attention** for combinatorial routing (CVRP and its open /
+time-windowed variants). A set of *slot/region* embeddings is learned over the customer
+graph, and the preserved inter-node **intrinsic metric** (a sparse insertion-cost
+geometry) is injected back into the base encoder. The result is a constructive policy
+that keeps the network's learned geometry aligned with the problem's true metric.
 
-</br></br>
-
-
-<a href="https://pytorch.org/get-started/locally/"><img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-ee4c2c?logo=pytorch&logoColor=white"></a>
-<a href="https://pytorchlightning.ai/"><img alt="Lightning" src="https://img.shields.io/badge/-Lightning-792ee5?logo=pytorchlightning&logoColor=white"></a>
-<a href="https://github.com/pytorch/rl"><img alt="base: TorchRL" src="https://img.shields.io/badge/base-TorchRL-red"></a>
-<a href="https://hydra.cc/"><img alt="config: Hydra" src="https://img.shields.io/badge/config-Hydra-89b8cd"></a>
-<a href="https://github.com/psf/black"><img alt="Code style: black" src="https://img.shields.io/badge/code%20style-black-000000.svg"></a>
-<a href="https://join.slack.com/t/ai4co-community/shared_invite/zt-3jsdjs3ec-3KHdV3HwanL884mq_9tyYw"><img alt="Slack" src="https://img.shields.io/badge/slack-chat-611f69.svg?logo=slack"></a>
-<a href="https://opensource.org/licenses/MIT"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-red.svg"></a>
-<a href="https://colab.research.google.com/github/ai4co/rl4co/blob/main/examples/1-quickstart.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
-<a href="https://pypi.org/project/rl4co"><img alt="PyPI" src="https://img.shields.io/pypi/v/rl4co?logo=pypi"></a>
-<a href="https://app.codecov.io/github/ai4co/rl4co/tree/main/rl4co"><img alt="Codecov" src="https://codecov.io/github/ai4co/rl4co/tree/main/badge.svg"></a>
-<a href="https://github.com/ai4co/rl4co/actions/workflows/tests.yml"><img alt="Test" src="https://github.com/ai4co/rl4co/actions/workflows/tests.yml/badge.svg"></a>
-
-<p>
-  <a href="https://rl4co.ai4co.org/"><strong>Documentation</strong></a> |
-  <a href="#getting-started"><strong>Getting Started</strong></a> |
-  <a href="#usage"><strong>Usage</strong></a> |
-  <a href="#contributing"><strong>Contributing</strong></a> |
-  <a href="https://arxiv.org/abs/2306.17100"><strong>Paper</strong></a> |
-  <a href="#join-us"><strong>Join Us</strong></a>
-</p>
+This repository also integrates several published baselines (SIL, DGL, ELG, RADAR, INViT,
+LEHD, ICAM, L2R) so that the slot method and its competitors are trained and evaluated on
+the **same cached instance splits**.
 
 
+## Contents
 
-</div>
-
-
-
-An extensive Reinforcement Learning (RL) for Combinatorial Optimization (CO) benchmark. Our goal is to provide a unified framework for RL-based CO algorithms, and to facilitate reproducible research in this field, decoupling the science from the engineering.
-
-
-RL4CO is built upon:
-- [TorchRL](https://github.com/pytorch/rl): official PyTorch framework for RL algorithms and vectorized environments on GPUs
-- [TensorDict](https://github.com/pytorch-labs/tensordict): a library to easily handle heterogeneous data such as states, actions and rewards
-- [PyTorch Lightning](https://github.com/Lightning-AI/lightning): a lightweight PyTorch wrapper for high-performance AI research
-- [Hydra](https://github.com/facebookresearch/hydra): a framework for elegantly configuring complex applications
-
-<div align="center">
-  <img src="https://github.com/ai4co/rl4co/assets/48984123/0e409784-05a9-4799-b7aa-6c0f76ecf27f" alt="RL4CO-Overview" style="max-width: 90%;">
-</div>
-
-We offer flexible and efficient implementations of the following policies:
-- **Constructive**: learn to construct a solution from scratch
-  - _Autoregressive (AR)_: construct solutions one step at a time via a decoder
-  - _NonAutoregressive (NAR)_: learn to predict a heuristic, such as a heatmap, to then construct a solution
-- **Improvement**: learn to improve a pre-existing solution
-
-<div align="center">
-  <img src="https://github.com/ai4co/rl4co/assets/48984123/9e1f32f9-9884-49b9-b6cd-364861cc8fe7" alt="RL4CO-Policy-Overview" style="max-width: 90%;">
-</div>
-
-We provide several utilities and modularization. For example, we modularize reusable components such as _environment embeddings_ that can easily be swapped to [solve new problems](https://github.com/ai4co/rl4co/blob/main/examples/3-creating-new-env-model.ipynb).
+- [Model](#model) — the slot-attention method and its ablation variants.
+- [Installation](#installation) — from source, using `uv`.
+- [Data](#data) — cached splits with sparse insertion costs (`d_ins`).
+- [Training](#training) — run `train.py` on any integrated backbone.
+- [Evaluation](#evaluation) — decode a checkpoint with `test.py`.
+- [Baseline guides](#baseline-guides) — method-specific notes and fairness caveats.
+- [Layout](#layout) — where things live.
 
 
-<div align="center">
-  <img src="https://github.com/ai4co/rl4co/assets/48984123/c47a9301-4c9f-43fd-b21f-761abeae9717" alt="RL4CO-Env-Embedding" style="max-width: 90%;">
-</div>
+## Model
+
+The core contribution lives in `rl4co/models/zoo/pomo_slot/`:
+
+- **`POMOSlot`** — `POMO` extended with metric-aware slot abstraction. Runs the full
+  POMO policy-gradient loop, replacing the encoder with a `SlotInjectingEncoder` and
+  stacking auxiliary losses (slot-entropy regularisation, metric preservation).
+- **`AMSlot`** — the same slot machinery on the single-start Attention Model.
+- **`SlotInjectingEncoder`** — runs a base `AttentionModelEncoder`, applies SlotAttention
+  over the customer embeddings, and additively injects the resulting slot context back
+  into the hidden states (the depot embedding is left unchanged). Exposes the slot
+  embeddings and soft assignment matrix (`last_slots`, `last_A_ik`) as a side-channel for
+  the auxiliary losses.
+- **`SlotAttention`** (`rl4co/models/nn/slot_attention.py`) — the slot-attention operator.
+
+`POMOSlot` implements four ablation variants selected by `--metric_variant`:
+
+| Variant | Objective |
+| --- | --- |
+| `none` / `B` | Plain POMO — no metric-preservation loss. |
+| `A` | Reconstruction loss: slot centroids reconstructed back onto node coordinates. |
+| `C` | Metric preservation on the learned slot geometry. |
+| `D` *(default)* | Metric preservation on the sparse insertion-cost geometry `d_ins`. |
+
+Pass `--disable_slots` to run the base backbone as a true no-slot baseline.
 
 
-## Getting started
-<a href="https://colab.research.google.com/github/ai4co/rl4co/blob/main/examples/1-quickstart.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
+## Installation
 
-RL4CO is now available for installation on `pip`!
-```bash
-pip install rl4co
-```
-
-To get started, we recommend checking out our [quickstart notebook](examples/1-quickstart.ipynb) or the [minimalistic example](#minimalistic-example) below.
-
-### Install from source
-This command installs the bleeding edge `main` version, useful for staying up-to-date with the latest developments - for instance, if a bug has been fixed since the last official release but a new release hasn’t been rolled out yet:
+Install from source with [`uv`](https://docs.astral.sh/uv/):
 
 ```bash
-pip install -U git+https://github.com/ai4co/rl4co.git
-```
-
-### Local install and development
-
-We recommend local development with the blazing-fast [`uv`](https://docs.astral.sh/uv/) package manager, for instance:
-
-```bash
-git clone https://github.com/ai4co/rl4co && cd rl4co
+git clone <this-repo> && cd LEGO
 uv sync --all-extras
 source .venv/bin/activate
 ```
 
-This will create a new virtual environment in `.venv/` and install all dependencies.
-
-## Usage
-
-MARS and the integrated CVRP baselines can train on the same cached instance
-splits through `train.py`. Method-specific commands and fairness notes are in the
-[SIL](rl4co/models/zoo/sil/README.md), [DGL](rl4co/models/zoo/dgl/README.md), and
-[ELG](rl4co/models/zoo/elg/README.md) guides.
+The project is a fork of RL4CO and reuses its namespace (`rl4co`); the extras
+(`dev`, `graph`, `routing`, `docs`) are declared in `pyproject.toml`.
 
 
-Train model with default configuration (AM on TSP environment):
-```bash
-python run.py
-```
+## Data
 
-> [!TIP]
-> You may check out [this notebook](examples/advanced/1-hydra-config.ipynb) to get started with Hydra!
+The slot method is trained on cached instance splits that store, alongside the routing
+data, a **sparse insertion-cost target** `d_ins` (`d_ins_idx` / `d_ins_val`) used by the
+Variant-D metric-preservation loss. Splits are generated once and shared by every
+backbone so that comparisons train on identical instances.
 
-<details>
-    <summary>Change experiment settings</summary>
-
-Train model with chosen experiment configuration from [configs/experiment/](configs/experiment/)
-```bash
-python run.py experiment=routing/am env=tsp env.num_loc=50 model.optimizer_kwargs.lr=2e-4
-```
-Here you may change the environment, e.g. with `env=cvrp` by command line or by modifying the corresponding experiment e.g. [configs/experiment/routing/am.yaml](configs/experiment/routing/am.yaml).
-
-</details>
-
-
-
-
-<details>
-    <summary>Disable logging</summary>
+Generate the shared splits for a problem / size / distribution:
 
 ```bash
-python run.py experiment=routing/am logger=none '~callbacks.learning_rate_monitor'
+python -m rl4co.data.generate_slot_dataset \
+  --num_locs 100 --dist uniform --n_train 100000 --n_val 1000 --n_test 1000 \
+  --out_dir ./data/slot_datasets_v2 --method insertion --problem cvrp --seed 42
 ```
-Note that `~` is used to disable a callback that would need a logger.
 
-</details>
+`--method` selects the insertion-cost definition (`savings` | `construction` |
+`insertion`). The training script validates that the cached data's method matches
+`--ins_method` so you never train on the wrong cost.
+
+> N=1000 preparation is computationally expensive and creates a multi-gigabyte cache.
+> It is opt-in: `train.py` only generates missing splits when passed
+> `--generate_missing_data`, and errors otherwise with an exact command to run.
 
 
-<details>
-    <summary>Create a sweep over hyperparameters (-m for multirun)</summary>
+## Training
+
+Train the slot method (POMO start, Variant D) on CVRP with N=100 customers:
 
 ```bash
-python run.py -m experiment=routing/am  model.optimizer.lr=1e-3,1e-4,1e-5
-```
-</details>
-
-
-
-### Minimalistic Example
-
-Here is a minimalistic example training the Attention Model with greedy rollout baseline on TSP in less than 30 lines of code:
-
-```python
-from rl4co.envs.routing import TSPEnv, TSPGenerator
-from rl4co.models import AttentionModelPolicy, POMO
-from rl4co.utils import RL4COTrainer
-
-# Instantiate generator and environment
-generator = TSPGenerator(num_loc=50, loc_distribution="uniform")
-env = TSPEnv(generator)
-
-# Create policy and RL model
-policy = AttentionModelPolicy(env_name=env.name, num_encoder_layers=6)
-model = POMO(env, policy, batch_size=64, optimizer_kwargs={"lr": 1e-4})
-
-# Instantiate Trainer and fit
-trainer = RL4COTrainer(max_epochs=10, accelerator="gpu", precision="16-mixed")
-trainer.fit(model)
+python train.py --backbone pomo --variant D --num_loc 100 --dist uniform \
+  --num_slots 8 --ins_method insertion --device 0 --seed 42
 ```
 
-Other examples can be found on our [documentation](https://rl4co.ai4co.org/examples/1-quickstart/)!
+Choose the Attention-model start with `--backbone am`, or a no-slot baseline with
+`--backbone pomo --disable_slots`. Run any integrated baseline with its backbone key:
+`sil`, `invit`, `dgl`, `elg`, `radar`, `icam`, `l2r`, `lehd`, `ttpl`. OVRP and VRPTW
+reuse the CVRP embedding / objective and are selected with `--problem ovrp|vrptw`.
+
+Key flags (see `python train.py --help` for the full list):
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--backbone` | `pomo` | Model to train. |
+| `--variant` / `--metric_variant` | `D` | Slot-metric ablation variant. |
+| `--num_slots` | `8` | Number `K` of slot/region embeddings. |
+| `--slot_iters` | `3` | SlotAttention refinement iterations. |
+| `--alpha_metric` | `0.1` | Weight of the metric-preservation loss. |
+| `--beta_entropy` | `0.01` | Weight of the slot-entropy regulariser. |
+| `--ins_method` | `construction` | Insertion-cost definition (must match data). |
+| `--num_loc` / `--dist` | `100` / `uniform` | Instance size and distribution. |
+| `--problem` | `cvrp` | `cvrp` \| `ovrp` \| `vrptw`. |
+| `--logger` | `csv` | `csv` (default) or `wandb`. |
+| `--device` | `0` | GPU id(s); pass several for DDP. |
+
+If the two required cached split files are missing, `train.py` prints the exact
+data-generation command to run (or accepts `--generate_missing_data` to build them inline
+and then train).
 
 
-### Testing
+## Evaluation
 
-Run tests with `pytest` from the root directory:
+Decode a checkpoint on a cached test split:
 
 ```bash
-pytest tests
+python test.py --model pomo --ckpt /path/to/pomo.ckpt \
+  --num_loc 100 --data_path data/slot_datasets_v2/construction/cvrp100_uniform_test.pt \
+  --n_inst 500 --batch_size 64 --out output/pomo_test.json
 ```
 
-### Known Bugs
+`test.py` also supports dataset-free evaluation on freshly seeded instances when
+`--data_path` is omitted.
 
-You may check out the [issues](https://github.com/ai4co/rl4co/issues) and [discussions](https://github.com/ai4co/rl4co/discussions). We will also periodically post updates on the [FAQ section](https://rl4co.ai4co.org/docs/content/general/faq/).
+> Decoding budgets differ between methods (e.g. POMO uses multi-start rollouts with
+> augmentation; SIL uses one greedy start). Report these budgets alongside results.
 
-## Contributing
 
-Have a suggestion, request, or found a bug? Feel free to [open an issue](https://github.com/ai4co/rl4co/issues) or [submit a pull request](https://github.com/ai4co/rl4co/pulls).
-If you would like to contribute, please check out our contribution guidelines   [here](.github/CONTRIBUTING.md). We welcome and look forward to all contributions to RL4CO!
+## Baseline guides
 
-We are also on [Slack](https://join.slack.com/t/ai4co-community/shared_invite/zt-3jsdjs3ec-3KHdV3HwanL884mq_9tyYw) if you have any questions or would like to discuss RL4CO with us. We are open to collaborations and would love to hear from you 🚀
+- [SIL](rl4co/models/zoo/sil/README.md)
+- [DGL](rl4co/models/zoo/dgl/README.md)
+- [ELG](rl4co/models/zoo/elg/README.md)
+- [INViT](rl4co/models/zoo/invit/README.md)
 
-### Contributors
-<a href="https://github.com/ai4co/rl4co/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=ai4co/rl4co" />
-</a>
+These document the integration, the shared train/eval setting, and the fairness caveats
+when comparing each method against the slot approach.
+
+
+## Layout
+
+```
+train.py                 # unified training entry point for every backbone
+test.py                  # checkpoint evaluation / decoding
+rl4co/data/              # dataset generation, slot dataset + loaders, insertion costs
+rl4co/envs/routing/      # environments (cvrp, ovrp, cvrptw, atsp, mtsp, ...)
+rl4co/models/zoo/        # model zoo, incl. pomo_slot/ (the slot method)
+rl4co/models/nn/         # shared layers: slot_attention, metric_loss, attention, ...
+rl4co/models/rl/         # RL training loops: REINFORCE, PPO, A2C
+scripts/                 # data generation, evaluation, plotting helpers
+```
+
 
 ## Citation
-If you find RL4CO valuable for your research or applied projects:
+
+If you use this work, cite the slot-attention method (LEGO/MARS slot NCO) — add the
+preprint reference here once available — alongside the RL4CO benchmark it builds on:
 
 ```bibtex
 @inproceedings{berto2025rl4co,
     title={{RL4CO: an Extensive Reinforcement Learning for Combinatorial Optimization Benchmark}},
-    author={Federico Berto and Chuanbo Hua and Junyoung Park and Laurin Luttmann and Yining Ma and Fanchen Bu and Jiarui Wang and Haoran Ye and Minsu Kim and Sanghyeok Choi and Nayeli Gast Zepeda and Andr\'e Hottung and Jianan Zhou and Jieyi Bi and Yu Hu and Fei Liu and Hyeonah Kim and Jiwoo Son and Haeyeon Kim and Davide Angioni and Wouter Kool and Zhiguang Cao and Jie Zhang and Kijung Shin and Cathy Wu and Sungsoo Ahn and Guojie Song and Changhyun Kwon and Lin Xie and Jinkyoo Park},
+    author={Federico Berto and Chuanbo Hua and Junyoung Park and Laurin Luttmann and Yining Ma and Fanchen Bu and Jiarui Wang and Haoran Ye and Minsu Kim and Sanghyeok Choi and Nayeli Gast Zepeda and Andr\'e Hottung and Jianan Zhou and Jieyi Bi and Yu Hu and Fei Liu and Hyeonah Kim and Jiwoo Son and Haeyeon Kim and Davide Angioni and Wouter Kool and Zhiguang Cao and Jie Zhang and Kijung Shin and Sungsoo Ahn and Guojie Song and Changhyun Kwon and Lin Xie and Jinkyoo Park},
     booktitle={Proceedings of the 31st ACM SIGKDD Conference on Knowledge Discovery and Data Mining},
-    year={2025},
-    url={https://github.com/ai4co/rl4co}
+    year={2025}
 }
 ```
-
-Note that a [previous version of RL4CO](https://openreview.net/forum?id=YXSJxi8dOV) was also accepted as an oral presentation at the [NeurIPS 2023 GLFrontiers Workshop](https://glfrontiers.github.io/). Since then, the library has greatly evolved and improved!
-
----
-
-
-## Join us
-[![Slack](https://img.shields.io/badge/slack-chat-611f69.svg?logo=slack)](https://join.slack.com/t/ai4co-community/shared_invite/zt-3jsdjs3ec-3KHdV3HwanL884mq_9tyYw)
-
-We invite you to join our AI4CO community, an open research group in Artificial Intelligence (AI) for Combinatorial Optimization (CO)!
-
-
-<div align="center">
-    <img src="https://raw.githubusercontent.com/ai4co/assets/main/svg/ai4co_animated_full.svg" alt="AI4CO Logo" style="width: 30%; height: auto;">
-</div>
