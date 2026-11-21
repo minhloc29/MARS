@@ -64,15 +64,29 @@ def _compute_sparse_d_ins(
     depot: torch.Tensor,
     k_neighbors: int,
     method: str,
+    teacher: str = "nn",
+    seed: int = 0,
+    match_scale: bool = False,
+    demand: Optional[torch.Tensor] = None,
+    capacity: Optional[torch.Tensor] = None,
+    cross_route_mode: str = "hard",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sparse (B, N, k) insertion cost -> (idx int16, val float32).
     depot: (B, 2) or (B, 1, 2). method: savings | construction | insertion.
+    teacher: reference-tour teacher for method="construction"
+             (nn | random | sweep | nn_2opt | nn_split).
+    seed: seed for random teachers.
+    match_scale: rescale random/nn_2opt teacher's d_cons to nn teacher's mean.
+    demand/capacity: required for teacher="nn_split".
+    cross_route_mode: "hard" | "soft" for nn_split.
     """
     from rl4co.data.insertion_cost import compute_sparse_insertion_cost
 
     depot_3d = depot.unsqueeze(1) if depot.dim() == 2 else depot  # (B, 1, 2)
     return compute_sparse_insertion_cost(
-        locs, k_neighbors=k_neighbors, depot_loc=depot_3d, method=method
+        locs, k_neighbors=k_neighbors, depot_loc=depot_3d, method=method,
+        teacher=teacher, seed=seed, match_scale=match_scale,
+        demand=demand, capacity=capacity, cross_route_mode=cross_route_mode,
     )
 
 
@@ -143,12 +157,16 @@ def generate_split(
     method: str,
     chunk_size: int = 512,
     problem: str = "cvrp",
+    teacher: str = "nn",
+    seed: int = 0,
+    match_scale: bool = False,
+    cross_route_mode: str = "hard",
 ) -> dict[str, torch.Tensor | str]:
     """Generate one full split in memory-friendly chunks.
 
     Returns dict: locs, depot, demand, capacity, d_ins_idx, d_ins_val,
-                  format_version, method. For problem="vrptw" the returned dict
-                  additionally carries durations and time_windows.
+                  format_version, method, teacher. For problem="vrptw" the returned
+                  dict additionally carries durations and time_windows.
     """
     gen_fn = _gen_uniform if dist == "uniform" else _gen_clustered
 
@@ -164,7 +182,11 @@ def generate_split(
         depot  = torch.rand(bs, 2)          # (bs, 2) — CVRPEnv expects (B, 2)
         demand = _gen_demands(bs, n)        # (bs, N) already normalized
 
-        d_idx, d_val = _compute_sparse_d_ins(locs, depot, k_neighbors, method)  # (bs,N,k) each
+        d_idx, d_val = _compute_sparse_d_ins(
+            locs, depot, k_neighbors, method,
+            teacher=teacher, seed=seed, match_scale=match_scale,
+            demand=demand, capacity=torch.full((bs,), 1.0, device=demand.device),
+            cross_route_mode=cross_route_mode)  # (bs,N,k) each
 
         all_locs.append(locs)
         all_depots.append(depot)
@@ -193,12 +215,36 @@ def generate_split(
         "d_ins_val":      torch.cat(all_dins_val,  dim=0),        # (B, N, k) float32
         "format_version": "sparse_v2",                            # metadata
         "method":         method,                                 # d_ins cost method tag
+        "teacher":        teacher,                                # reference-tour teacher
+        "match_scale":    match_scale,                            # scale-matched control flag
         "problem":        problem,                                # cvrp | ovrp | vrptw
     }
     if problem == "vrptw":
         out["durations"] = torch.cat(all_durs, dim=0)          # (B, N+1)
         out["time_windows"] = torch.cat(all_tws, dim=0)        # (B, N+1, 2)
     return out
+
+
+def teacher_subdir(method: str, teacher: str, match_scale: bool = False,
+                   cross_route_mode: str = "hard") -> Path:
+    """Shared cache-subfolder for a given method/teacher/scale/cross-route setting.
+
+    The ``nn`` teacher (the historical default) lives directly under ``{method}``
+    so existing cached splits stay valid. Every other teacher gets its own
+    ``teacher=<T>`` subfolder; scale-matched controls get a ``matched_scale``
+    component (so they never collide with their plain counterparts), and nn_split's
+    soft cross-route mode gets its own component so hard/soft never collide.
+    ``train.py`` and the generator must agree on this layout — centralising it here
+    keeps them in sync.
+    """
+    sub = Path(method)
+    if teacher != "nn":
+        sub = sub / f"teacher={teacher}"
+        if match_scale and teacher in ("random", "nn_2opt"):
+            sub = sub / "matched_scale"
+        if teacher == "nn_split" and cross_route_mode == "soft":
+            sub = sub / "cross_soft"
+    return sub
 
 
 def generate_and_save(
@@ -213,16 +259,20 @@ def generate_and_save(
     chunk_size: int | None = None,
     seed: int | None = None,
     problem: str = "cvrp",
+    teacher: str = "nn",
+    match_scale: bool = False,
+    cross_route_mode: str = "hard",
 ) -> None:
-    """Generate and save train/val/test splits to {out_dir}/{method}/ (so
-    different d_ins targets never collide). Problem determines the filename
-    prefix (cvrpN/ovrpN/vrptwN) and whether time-window fields are attached."""
+    """Generate and save train/val/test splits to {out_dir}/{method}/teacher={teacher}/
+    (so different d_ins targets and reference-tour teachers never collide). Problem
+    determines the filename prefix (cvrpN/ovrpN/vrptwN) and whether time-window
+    fields are attached."""
     if chunk_size is None:
         # Dense pairwise work scales as B*N*N. Keep each dense tensor near
         # 64 MB so the several live intermediates remain practical at N=1000.
         chunk_size = max(1, min(512, 16_000_000 // (n * n)))
 
-    out_dir = Path(out_dir) / method
+    out_dir = Path(out_dir) / teacher_subdir(method, teacher, match_scale, cross_route_mode)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     prefix = f"{problem}{n}"
@@ -240,10 +290,13 @@ def generate_and_save(
             torch.manual_seed(seed + split_idx)
         print(
             f"\nGenerating {split} split: {n_instances} instances, "
-            f"problem={problem}, N={n}, dist={dist}, chunk_size={chunk_size}"
+            f"problem={problem}, N={n}, dist={dist}, chunk_size={chunk_size}, "
+            f"teacher={teacher}"
         )
         data = generate_split(
-            n_instances, n, dist, k_neighbors, method, chunk_size, problem=problem)
+            n_instances, n, dist, k_neighbors, method, chunk_size,
+            problem=problem, teacher=teacher, match_scale=match_scale,
+            cross_route_mode=cross_route_mode)
         temporary = fpath.with_suffix(fpath.suffix + ".partial")
         torch.save(data, temporary)
         temporary.replace(fpath)
@@ -264,6 +317,22 @@ def main() -> None:
                         choices=["savings", "construction", "insertion"],
                         help="d_ins target definition. 'insertion' = Route-Conditioned "
                              "Insertion Cost (RCIC), the recommended Variant D target.")
+    parser.add_argument("--teacher",     type=str,   default="nn",
+                        choices=["nn", "random", "sweep", "nn_2opt", "nn_split", "hgs"],
+                        help="Reference-tour teacher used when method='construction': "
+                             "nn (nearest-neighbour, the historical default) | random "
+                             "| sweep (polar) | nn_2opt (2-opt-improved NN) | nn_split "
+                             "(capacity-aware Prins split) | hgs (not enabled in this "
+                             "build). Non-nn teachers are stored under teacher=<T>/.")
+    parser.add_argument("--cross_route_mode", type=str, default="hard",
+                        choices=["hard", "soft"],
+                        help="nn_split cross-route handling: 'hard' pins cross-route "
+                             "pairs to L/2; 'soft' adds L/4 (clipped at L/2). "
+                             "Ignored for other teachers.")
+    parser.add_argument("--match_scale", action="store_true",
+                        help="Rescale the random teacher's d_cons so its mean equals "
+                             "the nn teacher's mean (scale-matched control; off by "
+                             "default, per the reference-teacher study).")
     parser.add_argument("--problem",     type=str,   default="cvrp",
                         choices=["cvrp", "ovrp", "vrptw"],
                         help="Problem instances to generate. ovrp = same CVRP data "
@@ -295,6 +364,9 @@ def main() -> None:
             chunk_size=args.chunk_size,
             seed=args.seed,
             problem=args.problem,
+            teacher=args.teacher,
+            match_scale=args.match_scale,
+            cross_route_mode=args.cross_route_mode,
         )
 
 

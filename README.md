@@ -122,6 +122,62 @@ If the two required cached split files are missing, `train.py` prints the exact
 data-generation command to run (or accepts `--generate_missing_data` to build them inline
 and then train).
 
+## Reference-tour teachers (`--teacher`)
+
+Variant D's `d_cons` geometry can be generated from several reference tours. Only the
+construction of `d_cons` changes: slots, hinge/spread losses, the dual update, entropy,
+hyperparameters, decoding (M=100, no augmentation) and seeds stay identical to the default
+LEGO run. The `nn` teacher is the historical default and is byte-identical to the legacy
+`construction` target.
+
+| Teacher | Reference tour | `d_cons(i,j)` |
+| --- | --- | --- |
+| `nn` | Nearest-neighbour (default) | `min(|p_i-p_j|, L-|p_i-p_j|)` along-tour arc |
+| `random` | Fixed-seed random permutation | same, on a longer random tour |
+| `sweep` | Polar angle about the depot | same, on the angular sweep |
+| `nn_split` | NN order, then capacity-aware **Prins split** | arc within a route; `L/2` (hard) or `arc+L/4` clipped to `L/2` (soft) across routes |
+| `nn_2opt` | NN order, then capacity-agnostic **2-opt** | same, on the improved (shorter) tour |
+| `hgs` | HGS solution (requires `pyvrp`/HGS binary) | not enabled in this build |
+
+Generate and cache a teacher's splits offline once (surface no solver at training time):
+
+```bash
+# nn_split, hard cross-route handling
+python -m rl4co.data.generate_slot_dataset --num_locs 100 --dist uniform \
+  --method construction --teacher nn_split --n_train 100000 --n_val 1000 --n_test 1000 \
+  --out_dir ./data/slot_datasets_v2 --seed 42
+# nn_split, soft cross-route handling
+python -m rl4co.data.generate_slot_dataset --num_locs 100 --dist uniform \
+  --method construction --teacher nn_split --cross_route_mode soft --seed 42 ...
+# nn_2opt, and a matched-scale control for the shorter 2-opt tour
+python -m rl4co.data.generate_slot_dataset --num_locs 100 --dist uniform \
+  --method construction --teacher nn_2opt --seed 42 ...
+python -m rl4co.data.generate_slot_dataset --num_locs 100 --dist uniform \
+  --method construction --teacher nn_2opt --match_scale --seed 42 ...
+```
+
+Each non-`nn` teacher stores its own cache under
+`{out_dir}/{method}/teacher=<T>/` (plus `matched_scale` and `cross_soft` components for
+those variants), so teacher caches never collide. `train.py` reuses the same layout.
+
+Train on a teacher's d_cons (same budget as the default run, seed 0):
+
+```bash
+python train.py --backbone pomo --variant D --teacher nn_split \
+  --num_loc 100 --dist uniform --ins_method construction --num_slots 8 --seed 0 --logger csv
+python train.py --backbone pomo --variant D --teacher nn_2opt \
+  --num_loc 100 --dist uniform --ins_method construction --num_slots 8 --seed 0 --logger csv
+# matched-scale control for the shorter 2-opt tour
+python train.py --backbone pomo --variant D --teacher nn_2opt --match_scale \
+  --num_loc 100 --dist uniform --ins_method construction --num_slots 8 --seed 0 --logger csv
+```
+
+`--match_scale` rescales `d_cons` so its batch mean equals the `nn` teacher's mean, so a
+random or 2-opt teacher with an intrinsically different tour length can be compared at the
+same metric scale. `--cross_route_mode soft` selects the soft nn_split variant. The
+pipe-line, storage format and aggregation (`SlotDataset`, `_aggregate_d_ins_sparse`) are
+shared with the default teacher.
+
 
 ## Evaluation
 

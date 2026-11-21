@@ -142,6 +142,9 @@ def train(
     baseline: str | None = None,
     disable_slots: bool = False,
     ins_method: str = "construction",
+    teacher: str = "nn",
+    match_scale: bool = False,
+    cross_route_mode: str = "hard",
     lower_neighbors_num: int = 50,
     reduction_percentage: float = 0.1,
     logger: str = "csv",
@@ -238,9 +241,14 @@ def train(
                  beta_entropy=beta_entropy)
 
     data_dir = Path(data_dir)
+
+    # Teacher-aware cache location, shared with the generator via the centralised
+    # helper so training and data-generation always agree on the layout.
+    from rl4co.data.generate_slot_dataset import teacher_subdir
+    method_dir = data_dir / teacher_subdir(ins_method, teacher, match_scale, cross_route_mode)
     prefix = f"{problem}{num_loc}"
-    train_path = data_dir / ins_method / f"{prefix}_{dist}_train.pt"
-    val_path = data_dir / ins_method / f"{prefix}_{dist}_val.pt"
+    train_path = method_dir / f"{prefix}_{dist}_train.pt"
+    val_path = method_dir / f"{prefix}_{dist}_val.pt"
 
     missing_paths = [path for path in (
         train_path, val_path) if not path.exists()]
@@ -249,7 +257,7 @@ def train(
 
         print(
             f"Missing {len(missing_paths)} required split(s); generating the shared "
-            f"N={num_loc} {dist} {problem} dataset in {data_dir}."
+            f"N={num_loc} {dist} {problem} dataset (teacher={teacher}) in {data_dir}."
         )
         generate_and_save(
             out_dir=data_dir,
@@ -263,6 +271,9 @@ def train(
             chunk_size=generation_chunk_size,
             seed=seed,
             problem=problem,
+            teacher=teacher,
+            match_scale=match_scale,
+            cross_route_mode=cross_route_mode,
         )
         # Dataset generation consumes random numbers. Restore the experiment
         # seed so a first run and a run reusing the cache initialize identically.
@@ -275,7 +286,7 @@ def train(
             f"python -m rl4co.data.generate_slot_dataset --num_locs {num_loc} "
             f"--dist {dist} --n_train {n_train_eff} --n_val {n_val_eff} "
             f"--n_test {n_val_eff} --out_dir {data_dir} --method {ins_method} "
-            f"--problem {problem} --seed {seed}"
+            f"--teacher {teacher} --problem {problem} --seed {seed}"
         )
         raise FileNotFoundError(
             "Missing required cached dataset split(s):\n  "
@@ -316,6 +327,24 @@ def train(
                   f"Regenerate datasets with the current generator to stamp the method.")
         else:
             print(f"Dataset method '{data_method}' matches --ins_method. OK.")
+
+    # Validate reference-tour teacher tag (Variant D consumes d_cons from a specific
+    # teacher's order). A teacher mismatch silently trains on the wrong geometry, so
+    # refuse it explicitly except for legacy data stamped before the teacher field.
+    if metric_variant == "D" and backbone not in BASELINE_BACKBONES:
+        data_teacher = getattr(train_loader.dataset, "teacher", None)
+        if data_teacher is not None and data_teacher != teacher:
+            raise RuntimeError(
+                f"teacher mismatch: --teacher={teacher!r} but cached dataset "
+                f"{train_path} was generated with teacher={data_teacher!r} (see the "
+                f"'teacher' tag in the .pt). Regenerate with the requested teacher "
+                f"or pass --teacher {data_teacher}."
+            )
+        elif data_teacher is None:
+            print(f"[WARN] {train_path} has no 'teacher' tag (legacy dataset) — "
+                  f"assuming {teacher!r} (pre-teacher caches are always nn).")
+        else:
+            print(f"Dataset teacher '{data_teacher}' matches --teacher. OK.")
 
     # Environment. All three problems reuse the CVRP node features: ovrp drops
     # the return-to-depot arcs (open routes), vrptw attaches Solomon time windows
@@ -519,6 +548,9 @@ def train(
         "problem": problem,
         "seed": seed,
         "ins_method": ins_method,
+        "teacher": teacher,
+        "cross_route_mode": cross_route_mode if teacher == "nn_split" else None,
+        "match_scale": match_scale,
         "normalize_target": normalize_target,
         "symmetrize_target": symmetrize_target,
         "best_val_reward": best_reward,
@@ -588,7 +620,8 @@ def train(
                          ) if result_file.exists() else []
     dedup_key = {k: result[k] for k in (
         "backbone", "metric_variant", "num_slots", "num_loc", "dist", "seed",
-        "ins_method", "normalize_target", "symmetrize_target",
+        "ins_method", "teacher", "cross_route_mode", "match_scale",
+        "normalize_target", "symmetrize_target",
     )}
     if problem != "cvrp":
         dedup_key["problem"] = problem
@@ -611,6 +644,22 @@ def train(
         r.get(k) == v for k, v in dedup_key.items())]
     results.append(result)
     result_file.write_text(json.dumps(results, indent=2))
+
+    # Also append a flat row to a teacher x setting CSV for the ablation table.
+    try:
+        csv_path = result_dir / "teacher_ablation.csv"
+        cols = ["teacher", "cross_route_mode", "match_scale", "num_loc", "dist",
+                "problem", "seed", "best_val_reward", "elapsed_min",
+                "checkpoint", "train_path", "val_path"]
+        import csv as _csv
+        exists = csv_path.exists()
+        with open(csv_path, "a", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            if not exists:
+                w.writeheader()
+            w.writerow(result)
+    except Exception as _e:  # never crash training on logging failure
+        print(f"[WARN] could not write teacher_ablation.csv: {_e}")
 
     print(f"\nDone. Best val reward: {best_reward} | {elapsed/60:.1f} min")
     return result
@@ -767,6 +816,21 @@ def main():
     parser.add_argument("--beta_entropy", type=float, default=0.01)
     parser.add_argument("--ins_method", default="construction",
                         choices=["savings", "construction", "insertion"])
+    parser.add_argument("--teacher", default="nn",
+                        choices=["nn", "random", "sweep", "nn_2opt", "nn_split", "hgs"],
+                        help="Reference-tour teacher for the d_cons geometry of "
+                             "Variant D: nn (default) | random | sweep | nn_2opt | "
+                             "nn_split | hgs (not enabled in this build). Non-nn "
+                             "teachers read/write cached splits under teacher=<T>/.")
+    parser.add_argument("--cross_route_mode", default="hard",
+                        choices=["hard", "soft"],
+                        help="nn_split cross-route handling: 'hard' pins cross-route "
+                             "pairs to L/2; 'soft' adds L/4 (clipped at L/2). "
+                             "Ignored unless --teacher nn_split.")
+    parser.add_argument("--match_scale", action="store_true",
+                        help="Rescale the random teacher's d_cons so its mean equals "
+                             "the nn teacher's mean (control enabling a matched-scale "
+                             "comparison; off by default).")
     parser.add_argument("--lower_neighbors_num", type=int, default=50)
     parser.add_argument("--reduction_percentage", type=float, default=0.1)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -857,6 +921,8 @@ def main():
         beta_entropy=args.beta_entropy, normalize_target=args.normalize_target,
         symmetrize_target=args.symmetrize_target, baseline=args.baseline,
         disable_slots=args.disable_slots, ins_method=args.ins_method,
+        teacher=args.teacher, match_scale=args.match_scale,
+        cross_route_mode=args.cross_route_mode,
         lower_neighbors_num=args.lower_neighbors_num,
         reduction_percentage=args.reduction_percentage, logger=args.logger,
         resume=args.resume, num_workers=args.num_workers,

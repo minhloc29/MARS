@@ -40,6 +40,9 @@ class SlotDataset(torch.utils.data.Dataset):
         self.time_windows = data.get("time_windows", None)  # (N_inst, N+1, 2)
         # d_ins cost-method tag stamped by the generator; None for legacy datasets.
         self.method: str | None = data.get("method", None)
+        # Reference-tour teacher tag stamped by the generator; None for legacy
+        # datasets (pre-teacher caches are always nearest-neighbour "nn").
+        self.teacher: str | None = data.get("teacher", None)
 
         # Sparse d_ins only needed for Variant D; load it conditionally to keep
         # the other ablation variants memory-light.
