@@ -21,7 +21,7 @@ except Exception:
 from rl4co.data.slot_dataset import make_dataloader
 
 try:
-    from rl4co.envs import CVRPEnv
+    from rl4co.envs import CVRPEnv, OVRPEnv
     from rl4co.models.zoo.dgl import DGL
     from rl4co.models.zoo.elg import ELG
     from rl4co.models.zoo.icam import ICAMCVRP
@@ -116,6 +116,7 @@ def _make_trainer(run_name: str, log_path: Path, epochs: int,
 def train(
     num_loc: int = 100,
     dist: str = "uniform",
+    problem: str = "cvrp",
     data_dir: str | Path = DEFAULT_DATA_DIR,
     output: str = "./output",
     seed: int = 42,
@@ -237,8 +238,9 @@ def train(
                  beta_entropy=beta_entropy)
 
     data_dir = Path(data_dir)
-    train_path = data_dir / ins_method / f"cvrp{num_loc}_{dist}_train.pt"
-    val_path = data_dir / ins_method / f"cvrp{num_loc}_{dist}_val.pt"
+    prefix = f"{problem}{num_loc}"
+    train_path = data_dir / ins_method / f"{prefix}_{dist}_train.pt"
+    val_path = data_dir / ins_method / f"{prefix}_{dist}_val.pt"
 
     missing_paths = [path for path in (
         train_path, val_path) if not path.exists()]
@@ -247,7 +249,7 @@ def train(
 
         print(
             f"Missing {len(missing_paths)} required split(s); generating the shared "
-            f"N={num_loc} {dist} dataset in {data_dir}."
+            f"N={num_loc} {dist} {problem} dataset in {data_dir}."
         )
         generate_and_save(
             out_dir=data_dir,
@@ -260,6 +262,7 @@ def train(
             method=ins_method,
             chunk_size=generation_chunk_size,
             seed=seed,
+            problem=problem,
         )
         # Dataset generation consumes random numbers. Restore the experiment
         # seed so a first run and a run reusing the cache initialize identically.
@@ -272,7 +275,7 @@ def train(
             f"python -m rl4co.data.generate_slot_dataset --num_locs {num_loc} "
             f"--dist {dist} --n_train {n_train_eff} --n_val {n_val_eff} "
             f"--n_test {n_val_eff} --out_dir {data_dir} --method {ins_method} "
-            f"--seed {seed}"
+            f"--problem {problem} --seed {seed}"
         )
         raise FileNotFoundError(
             "Missing required cached dataset split(s):\n  "
@@ -315,7 +318,8 @@ def train(
             print(f"Dataset method '{data_method}' matches --ins_method. OK.")
 
     # Environment
-    env = CVRPEnv(generator_params=dict(num_loc=num_loc))
+    env = (OVRPEnv if problem == "ovrp" else CVRPEnv)(
+        generator_params=dict(num_loc=num_loc))
 
     # Model
     model_cls = MODEL_CLASSES[backbone]
@@ -450,6 +454,8 @@ def train(
     else:
         run_name = (f"{backbone}_slot_{metric_variant}_K{num_slots}_N{num_loc}_{dist}_"
                     f"{ins_method}{norm_tag}_seed{seed}{base_suffix}")
+    if problem != "cvrp":
+        run_name = f"{run_name}_prob{problem}"
     log_path = Path(output) / run_name
 
     trainer, checkpoint_cb, _ = _make_trainer(
@@ -498,6 +504,7 @@ def train(
         "num_slots": None if backbone in BASELINE_BACKBONES else num_slots,
         "num_loc": num_loc,
         "dist": dist,
+        "problem": problem,
         "seed": seed,
         "ins_method": ins_method,
         "normalize_target": normalize_target,
@@ -571,6 +578,8 @@ def train(
         "backbone", "metric_variant", "num_slots", "num_loc", "dist", "seed",
         "ins_method", "normalize_target", "symmetrize_target",
     )}
+    if problem != "cvrp":
+        dedup_key["problem"] = problem
     if backbone == "sil":
         dedup_key.update(
             {k: v for k, v in result.items() if k.startswith("sil_")})
@@ -713,6 +722,13 @@ def main():
                         choices=[50, 100, 200, 500, 1000])
     parser.add_argument("--dist", default="uniform",
                         choices=["uniform", "clustered"])
+    parser.add_argument("--problem", default="cvrp",
+                        choices=["cvrp", "ovrp", "vrptw"],
+                        help="Problem to train/eval. ovrp and vrptw reuse the "
+                             "CVRP embedding/objective (constraint-agnostic); "
+                             "--problem selects the cached dataset prefix and the "
+                             "environment. vrptw attaches Solomon time windows to "
+                             "the data for feasibility reporting only.")
     parser.add_argument("--data_dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--output", default="./output")
     parser.add_argument("--seed", type=int, default=42)
@@ -817,7 +833,8 @@ def main():
     args = parser.parse_args()
 
     train(
-        num_loc=args.num_loc, dist=args.dist, data_dir=args.data_dir,
+        num_loc=args.num_loc, dist=args.dist, problem=args.problem,
+        data_dir=args.data_dir,
         output=args.output, seed=args.seed, device=args.device,
         n_train=args.n_train, n_val=args.n_val, epochs=args.epochs,
         batch_size=args.batch_size, lr=args.lr, max_instances=args.max_instances,

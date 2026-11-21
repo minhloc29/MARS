@@ -21,6 +21,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate & cache a CVRP eval dataset")
     parser.add_argument("--num_loc", type=int, required=True,
                         help="Number of CUSTOMERS N (must match --num_loc in test.py).")
+    parser.add_argument("--problem", type=str, default="cvrp",
+                        choices=["cvrp", "ovrp", "vrptw"],
+                        help="Problem to generate. ovrp = identical CVRP data under "
+                             "a different filename prefix (the open-route reward is a "
+                             "decode-time choice, so no generator change). vrptw = CVRP "
+                             "data plus Solomon-style time_windows/durations attached "
+                             "for feasibility reporting (constraint-agnostic training). "
+                             "vrptw/ovrp save a .pt (so the extra fields survive); cvrp "
+                             "saves an .npz as before.")
     parser.add_argument("--n_inst", type=int, default=1000, help="Number of instances")
     parser.add_argument("--seed", type=int, default=1234,
                         help="Seed for the generated instances. Use the SAME seed as "
@@ -75,23 +84,55 @@ def main() -> None:
         d = td["locs"][:, :1, :]          # depot row, kept fixed
         td["locs"] = (d + args.alpha * (td["locs"] - d)).clamp(0.0, 1.0)
 
+    # VRPTW: attach Solomon-style time windows + zero durations, save as .pt so
+    # test.py's eval_utils.evaluate() can read them for feasibility reporting.
+    problem = args.problem
+    is_pt = problem in ("ovrp", "vrptw")
+    if problem == "vrptw":
+        from rl4co.data.generate_slot_dataset import _gen_time_windows
+        # generator td: locs = (B, N, 2) customers-only, depot = (B, 2).
+        # Match the cached .pt dataset layout that test.py expects: locs (B, N, 2),
+        # depot (B, 2), demand (B, N), plus time_windows/durations (B, N+1, ...) with
+        # depot-first rows (index 0 = depot).
+        depot = td["depot"].clone()                    # (B, 2)
+        custs = td["locs"].clone()                     # (B, N, 2)
+        tw, durs = _gen_time_windows(custs, depot)     # (B, N+1, 2), (B, N+1)
+        data_dict = {
+            "locs": custs,              # (B, N, 2)
+            "depot": depot,             # (B, 2)
+            "demand": td["demand"],     # (B, N)
+            "time_windows": tw,
+            "durations": durs,
+        }
+    else:
+        data_dict = td.to_dict()  # npz path for cvrp kept as before
+
     if args.out is None:
         cap = f"_cap{args.capacity:g}" if args.capacity is not None else ""
+        base = f"{problem}_{args.num_loc}"
         if args.alpha != 1.0:
-            out = Path(f"data/test/cvrp_{args.num_loc}_{args.loc_dist}"
-                       f"_alpha{args.alpha}{cap}_seed{args.seed}.npz")
+            out = Path(f"data/test/{base}_{args.loc_dist}"
+                       f"_alpha{args.alpha}{cap}_seed{args.seed}"
+                       + (".pt" if is_pt else ".npz"))
         elif args.loc_dist == "uniform":
-            out = Path(f"data/test/cvrp_{args.num_loc}_uniform{cap}_seed{args.seed}.npz")
+            out = Path(f"data/test/{base}_uniform{cap}_seed{args.seed}"
+                       + (".pt" if is_pt else ".npz"))
         elif args.loc_dist == "gaussian":
-            out = Path(f"data/test/cvrp_{args.num_loc}_gaussian_mean{args.loc_mean}_std{args.loc_std}{cap}_seed{args.seed}.npz")
+            out = Path(f"data/test/{base}_gaussian_mean{args.loc_mean}_std{args.loc_std}{cap}_seed{args.seed}"
+                       + (".pt" if is_pt else ".npz"))
         elif args.loc_dist == "cluster":
-            out = Path(f"data/test/cvrp_{args.num_loc}_cluster_n{args.n_cluster}{cap}_seed{args.seed}.npz")
+            out = Path(f"data/test/{base}_cluster_n{args.n_cluster}{cap}_seed{args.seed}"
+                       + (".pt" if is_pt else ".npz"))
     else:
         out = Path(args.out)
-    
+
     out.parent.mkdir(parents=True, exist_ok=True)
-    save_tensordict_to_npz(td, out)
-    print(f"[OK] generated {len(td)} CVRP instances at num_loc={args.num_loc} "
+    if is_pt:
+        import torch
+        torch.save(data_dict, out)
+    else:
+        save_tensordict_to_npz(td, out)
+    print(f"[OK] generated {len(td)} {problem} instances at num_loc={args.num_loc} "
           f"(seed={args.seed}) -> {out}")
 
 

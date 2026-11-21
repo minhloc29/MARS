@@ -8,7 +8,7 @@ import lightning.pytorch as pl
 import torch
 
 from rl4co.data.transforms import StateAugmentation
-from rl4co.envs import CVRPEnv
+from rl4co.envs import CVRPEnv, OVRPEnv
 from rl4co.models.zoo.elg import ELG
 from rl4co.models.zoo.icam import ICAMCVRP
 from rl4co.models.zoo.invit import INViT
@@ -49,6 +49,13 @@ def main() -> None:
     parser.add_argument("--data_dir", type=str, default="./data/cvrplib_setX",
                         help="Directory holding setX.pt (only for "
                              "--dataset cvrplib).")
+    parser.add_argument("--problem", type=str, default="cvrp",
+                        choices=["cvrp", "ovrp", "vrptw"],
+                        help="Problem to evaluate. OVRP uses the same CVRP "
+                             "checkpoint with an open-route (no return) reward; "
+                             "VRPTW attaches Solomon time windows for feasibility "
+                             "reporting (constraint-agnostic: the model still "
+                             "ignores them, like capacity).")
     parser.add_argument("--num_loc", type=int, default=None,
                         help="Target number of customers N (required for "
                              "--dataset synthetic).")
@@ -130,7 +137,8 @@ def main() -> None:
         print(f"Saved to {out_path}")
         return
 
-    env = CVRPEnv(generator_params=dict(num_loc=args.num_loc))
+    env = (OVRPEnv if args.problem == "ovrp" else CVRPEnv)(
+        generator_params=dict(num_loc=args.num_loc))
     model_cls = MODEL_CLASSES[args.model]
     model = model_cls.load_from_checkpoint(
         args.ckpt, env=env, map_location=args.device)
@@ -153,7 +161,21 @@ def main() -> None:
         model.best_policy_state = model.repair_policy_state = None
 
     if args.data_path:
-        ds = eval_utils.load_npz(args.data_path, args.num_loc)
+        if args.data_path.endswith(".pt"):
+            import torch as _torch
+            from tensordict import TensorDict as _TD
+            data = _torch.load(args.data_path, map_location="cpu",
+                               weights_only=False)
+            keys = [k for k in ("locs", "depot", "demand", "capacity",
+                                "durations", "time_windows")
+                    if k in data]
+            ds_td = _TD(
+                {k: data[k] for k in keys},
+                batch_size=[data["locs"].size(0)])
+            env = env.__class__(generator_params=dict(num_loc=args.num_loc))
+            ds = ds_td
+        else:
+            ds = eval_utils.load_npz(args.data_path, args.num_loc)
     else:
         ds = env.dataset(batch_size=[args.n_inst])
 
@@ -164,17 +186,22 @@ def main() -> None:
         result = eval_utils.evaluate(model, args, env, ds)
     result["backbone"] = args.model
     result["num_loc"] = args.num_loc
+    result["problem"] = args.problem
     result["seed"] = args.seed
     result["ckpt"] = str(args.ckpt)
     result["data_path"] = (
         str(Path(args.data_path).resolve()) if args.data_path else None)
 
-    print(f"[OK] evaluated at num_loc={args.num_loc} customers  "
+    print(f"[OK] evaluated problem={args.problem} at num_loc={args.num_loc} customers  "
           f"n={result['n_inst']}  "
           f"mean tour = {result['mean_tour_length']:.4f} "
           f"(mean reward = {result['mean_reward']:.4f})  "
           f"inference = {result['elapsed_seconds']:.2f}s "
           f"({result['throughput_per_sec']:.0f} inst/s)")
+    if "feasible_frac" in result:
+        print(f"[TW] {args.problem} feasible = {result['n_feasible']}"
+              f"/{result['n_inst']} = {result['feasible_frac']*100:.1f}% "
+              f"(any multi-start start satisfies the time windows)")
     if "mean_tour_length_local_search" in result:
         print(f"[LS] local-search refined mean tour = "
               f"{result['mean_tour_length_local_search']:.4f} "
@@ -205,7 +232,7 @@ def main() -> None:
         print(f"[OK] rendered {rendered} route plot(s) -> {plot_dir}")
 
     out_path = args.out or Path("results") / \
-        f"eval_{args.model}_{args.num_loc}_{args.seed}.json"
+        f"eval_{args.problem}_{args.model}_{args.num_loc}_{args.seed}.json"
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_path).write_text(json.dumps(result, indent=2))
     print(f"Saved to {out_path}")

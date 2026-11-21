@@ -76,6 +76,65 @@ def _compute_sparse_d_ins(
     )
 
 
+def _gen_time_windows(
+    locs: torch.Tensor,
+    depot: torch.Tensor,
+    max_time: float = 480,
+    scale: float = 150.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate Solomon-style time windows + dummy service durations for
+    CVRP-coordinate instances (locs/depot in [0,1]).
+
+    Mirrors :class:`CVRPTWGenerator`: travel time is scaled by ``scale`` (150)
+    so a [0,1] distance unit maps to the classic Solomon 150~ coordinate frame
+    with ``max_time=480``. Produces ``time_windows`` (B, N+1, 2) of "service
+    must *start* within [start, end]" bounds, and zero service durations.
+
+    Returns:
+        (time_windows, durations), both float32, in raw time units.
+    """
+    B = locs.shape[0]
+    N = locs.shape[1]
+    # distance from depot to each customer, scaled to Solomon frame
+    dist = torch.cdist(depot.unsqueeze(1), locs, p=2).squeeze(1) * scale   # (B, N)
+    dist = torch.cat((torch.zeros(B, 1), dist), dim=1)                     # (B, N+1)
+    durations = torch.zeros(B, N + 1, dtype=torch.float32)
+
+    upper_bound = max_time - dist - durations                              # (B, N+1)
+    ts_1 = torch.rand(B, N + 1)
+    ts_2 = torch.rand(B, N + 1)
+    min_ts = (dist + (upper_bound - dist) * ts_1).int()
+    max_ts = (dist + (upper_bound - dist) * ts_2).int()
+    min_times = torch.min(min_ts, max_ts).float()
+    max_times = torch.max(min_ts, max_ts).float()
+
+    # depot window [0, max_time]
+    min_times[:, 0] = 0.0
+    max_times[:, 0] = max_time
+
+    # guard min < max (as in CVRPTWGenerator)
+    mask = min_times == max_times
+    if torch.any(mask):
+        min_tmp = min_times.clone()
+        min_tmp[mask] = torch.max(dist[mask].int(), min_tmp[mask] - 1).float()
+        min_times = min_tmp
+        mask = min_times == max_times
+        if torch.any(mask):
+            max_tmp = max_times.clone()
+            max_tmp[mask] = torch.min(
+                torch.floor(upper_bound[mask]).int(),
+                torch.max(
+                    torch.ceil(min_tmp[mask] + durations[mask]).int(),
+                    max_tmp[mask] + 1,
+                ),
+            ).float()
+            max_times = max_tmp
+
+    time_windows = torch.stack((min_times, max_times), dim=-1)             # (B, N+1, 2)
+    durations[:, 0] = 0.0
+    return time_windows, durations
+
+
 def generate_split(
     n_instances: int,
     n: int,
@@ -83,16 +142,19 @@ def generate_split(
     k_neighbors: int,
     method: str,
     chunk_size: int = 512,
+    problem: str = "cvrp",
 ) -> dict[str, torch.Tensor | str]:
     """Generate one full split in memory-friendly chunks.
 
     Returns dict: locs, depot, demand, capacity, d_ins_idx, d_ins_val,
-                  format_version, method.
+                  format_version, method. For problem="vrptw" the returned dict
+                  additionally carries durations and time_windows.
     """
     gen_fn = _gen_uniform if dist == "uniform" else _gen_clustered
 
     all_locs, all_depots, all_demands = [], [], []
     all_dins_idx, all_dins_val = [], []
+    all_durs, all_tws = [], []
 
     for start in range(0, n_instances, chunk_size):
         end = min(start + chunk_size, n_instances)
@@ -110,14 +172,19 @@ def generate_split(
         all_dins_idx.append(d_idx)
         all_dins_val.append(d_val)
 
+        if problem == "vrptw":
+            tw, durs = _gen_time_windows(locs, depot)          # (bs,N+1,2), (bs,N+1)
+            all_durs.append(durs)
+            all_tws.append(tw)
+
         if (start // chunk_size) % 10 == 0:
             print(
-                f"  [{dist}] N={n} -- generated {end}/{n_instances} instances...",
+                f"  [{problem}:{dist}] N={n} -- generated {end}/{n_instances} instances...",
                 flush=True,
             )
 
     n_total = sum(t.shape[0] for t in all_locs)
-    return {
+    out: dict[str, torch.Tensor | str] = {
         "locs":           torch.cat(all_locs,      dim=0),        # (B, N, 2)
         "depot":          torch.cat(all_depots,    dim=0),        # (B, 2)
         "demand":         torch.cat(all_demands,   dim=0),        # (B, N)
@@ -126,7 +193,12 @@ def generate_split(
         "d_ins_val":      torch.cat(all_dins_val,  dim=0),        # (B, N, k) float32
         "format_version": "sparse_v2",                            # metadata
         "method":         method,                                 # d_ins cost method tag
+        "problem":        problem,                                # cvrp | ovrp | vrptw
     }
+    if problem == "vrptw":
+        out["durations"] = torch.cat(all_durs, dim=0)          # (B, N+1)
+        out["time_windows"] = torch.cat(all_tws, dim=0)        # (B, N+1, 2)
+    return out
 
 
 def generate_and_save(
@@ -140,9 +212,11 @@ def generate_and_save(
     method: str,
     chunk_size: int | None = None,
     seed: int | None = None,
+    problem: str = "cvrp",
 ) -> None:
     """Generate and save train/val/test splits to {out_dir}/{method}/ (so
-    different d_ins targets never collide)."""
+    different d_ins targets never collide). Problem determines the filename
+    prefix (cvrpN/ovrpN/vrptwN) and whether time-window fields are attached."""
     if chunk_size is None:
         # Dense pairwise work scales as B*N*N. Keep each dense tensor near
         # 64 MB so the several live intermediates remain practical at N=1000.
@@ -151,11 +225,12 @@ def generate_and_save(
     out_dir = Path(out_dir) / method
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    prefix = f"{problem}{n}"
     splits = [("train", n_train), ("val", n_val), ("test", n_test)]
     for split_idx, (split, n_instances) in enumerate(splits):
         if n_instances == 0:
             continue
-        fpath = out_dir / f"cvrp{n}_{dist}_{split}.pt"
+        fpath = out_dir / f"{prefix}_{dist}_{split}.pt"
         if fpath.exists():
             print(f"  Skipping {fpath} (already exists).")
             continue
@@ -164,10 +239,11 @@ def generate_and_save(
         if seed is not None:
             torch.manual_seed(seed + split_idx)
         print(
-            f"\nGenerating {split} split: {n_instances} instances, N={n}, "
-            f"dist={dist}, chunk_size={chunk_size}"
+            f"\nGenerating {split} split: {n_instances} instances, "
+            f"problem={problem}, N={n}, dist={dist}, chunk_size={chunk_size}"
         )
-        data = generate_split(n_instances, n, dist, k_neighbors, method, chunk_size)
+        data = generate_split(
+            n_instances, n, dist, k_neighbors, method, chunk_size, problem=problem)
         temporary = fpath.with_suffix(fpath.suffix + ".partial")
         torch.save(data, temporary)
         temporary.replace(fpath)
@@ -188,6 +264,12 @@ def main() -> None:
                         choices=["savings", "construction", "insertion"],
                         help="d_ins target definition. 'insertion' = Route-Conditioned "
                              "Insertion Cost (RCIC), the recommended Variant D target.")
+    parser.add_argument("--problem",     type=str,   default="cvrp",
+                        choices=["cvrp", "ovrp", "vrptw"],
+                        help="Problem instances to generate. ovrp = same CVRP data "
+                             "under an different filename prefix (open-route reward is "
+                             "a decode-time choice). vrptw additionally attaches "
+                             "durations + time_windows to each instance.")
     parser.add_argument("--k_neighbors", type=int,   default=15)
     parser.add_argument("--chunk_size",  type=int,   default=None,
                         help="Instances per generation chunk (default: adaptive to num_locs)")
@@ -212,6 +294,7 @@ def main() -> None:
             method=args.method,
             chunk_size=args.chunk_size,
             seed=args.seed,
+            problem=args.problem,
         )
 
 
