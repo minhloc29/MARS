@@ -21,7 +21,7 @@ except Exception:
 from rl4co.data.slot_dataset import make_dataloader
 
 try:
-    from rl4co.envs import CVRPEnv, OVRPEnv
+    from rl4co.envs import CVRPTWEnv, CVRPEnv, OVRPEnv
     from rl4co.models.zoo.dgl import DGL
     from rl4co.models.zoo.elg import ELG
     from rl4co.models.zoo.icam import ICAMCVRP
@@ -317,9 +317,17 @@ def train(
         else:
             print(f"Dataset method '{data_method}' matches --ins_method. OK.")
 
-    # Environment
-    env = (OVRPEnv if problem == "ovrp" else CVRPEnv)(
-        generator_params=dict(num_loc=num_loc))
+    # Environment. All three problems reuse the CVRP node features: ovrp drops
+    # the return-to-depot arcs (open routes), vrptw attaches Solomon time windows
+    # so the CVRPTWEnv simulates time-window feasibility during rollout. The
+    # geometry teacher / init-context embeddings stay on the CVRP node features.
+    env_cls = {  # constraint-agnostic by design: same model body, env differs only
+        # in reward / time-window simulation.
+        "cvrp": CVRPEnv,
+        "ovrp": OVRPEnv,
+        "vrptw": CVRPTWEnv,
+    }[problem]
+    env = env_cls(generator_params=dict(num_loc=num_loc))
 
     # Model
     model_cls = MODEL_CLASSES[backbone]
