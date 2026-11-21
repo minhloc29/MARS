@@ -8,6 +8,7 @@ from rl4co.envs.routing import (
     CVRPTWEnv,
     DenseRewardTSPEnv,
     MTSPEnv,
+    OVRPEnv,
     TSPEnv,
     TSPkoptEnv,
 )
@@ -20,6 +21,7 @@ ENV_REGISTRY = {
     "cvrptw": CVRPTWEnv,
     "cvrpmvc": CVRPMVCEnv,
     "mtsp": MTSPEnv,
+    "ovrp": OVRPEnv,
     "tsp": TSPEnv,
     "tsp_kopt": TSPkoptEnv,
 }

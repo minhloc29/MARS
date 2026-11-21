@@ -70,7 +70,12 @@ class L2RModel(pl.LightningModule):
             "node_demand": demand,
         }
 
-    def _rollout(self, batch: dict[str, torch.Tensor], sampling: bool):
+    def _rollout(
+        self,
+        batch: dict[str, torch.Tensor],
+        sampling: bool,
+        return_actions: bool = False,
+    ):
         dataset = self._make_dataset(batch)
         device = dataset["node_xy"].device
         env = self.l2r_env_cls(
@@ -119,7 +124,10 @@ class L2RModel(pl.LightningModule):
                                      for item in log_probs], dim=1).sum(1)
         lower_log_prob = torch.stack([item[1].log()
                                      for item in log_probs], dim=1).sum(1)
-        return reward, upper_log_prob + lower_log_prob
+        log_prob = upper_log_prob + lower_log_prob
+        if return_actions:
+            return reward, log_prob, env.selected_node_list
+        return reward, log_prob
 
     def _shared_step(self, batch, phase: str):
         batch = {key: value.to(self.device) for key, value in batch.items()}

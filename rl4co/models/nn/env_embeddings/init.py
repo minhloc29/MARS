@@ -23,6 +23,7 @@ def env_init_embedding(env_name: str, config: dict) -> nn.Module:
         "cvrp": VRPInitEmbedding,
         "cvrptw": VRPTWInitEmbedding,
         "cvrpmvc": VRPInitEmbedding,
+        "ovrp": VRPInitEmbedding,  # open CVRP: same (x,y,demand) node features
         "svrp": SVRPInitEmbedding,
         "sdvrp": VRPInitEmbedding,
         "pctsp": PCTSPInitEmbedding,

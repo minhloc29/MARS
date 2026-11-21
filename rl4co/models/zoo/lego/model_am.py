@@ -17,9 +17,11 @@ from rl4co.models.nn.metric_loss import (
     MetricPreservationLoss,
     ProjectionHead,
     SlotEntropyLoss,
+    _construction_target,
+    _geometry_diagnostics,
 )
 from rl4co.models.rl.reinforce.baselines import SharedBaseline
-from rl4co.models.zoo.pomo_slot.policy import SlotInjectingEncoder
+from rl4co.models.zoo.lego.policy import SlotInjectingEncoder
 from rl4co.utils.pylogger import get_pylogger
 
 log = get_pylogger(__name__)
@@ -35,7 +37,8 @@ class SingleSharedBaseline(SharedBaseline):
     for POMO and over the batch for single-start AM.
     """
 
-    def eval(self, td, reward, env=None, on_dim=-1):  # e.g. [batch] or [batch, n_start]
+    # e.g. [batch] or [batch, n_start]
+    def eval(self, td, reward, env=None, on_dim=-1):
         return reward.mean(dim=on_dim, keepdims=True), 0
 
 
@@ -88,6 +91,9 @@ class AMSlot(AttentionModel):
         disable_slots: bool = False,
         normalize_target: bool = True,
         symmetrize_target: bool = True,
+        geom_mode: str = "full",
+        spread_cap: float | None = None,
+        lambda_max: float = 50.0,
         **am_kwargs,
     ) -> None:
         assert metric_variant in self.METRIC_VARIANTS, (
@@ -149,6 +155,12 @@ class AMSlot(AttentionModel):
         self.disable_slots = disable_slots
         self.normalize_target = normalize_target
         self.symmetrize_target = symmetrize_target
+        self.geom_mode = geom_mode
+        self.spread_cap = spread_cap
+        self.lambda_max = lambda_max
+        self._spread_reference = None
+        self._spread_warned = False
+        self._geometry_val_logged = False
 
         # Reference for display (lives inside policy.encoder)
         self.slot_attn = slot_attn
@@ -158,7 +170,7 @@ class AMSlot(AttentionModel):
         self.metric_loss_fn = (
             None if disable_slots else self._build_metric_loss(
                 metric_variant, embed_dim, proj_dim, lambda_init, lr_dual,
-                normalize_target, symmetrize_target,
+                normalize_target, symmetrize_target, geom_mode, spread_cap,
             )
         )
 
@@ -169,7 +181,8 @@ class AMSlot(AttentionModel):
         )
 
     def _build_metric_loss(self, variant, embed_dim, proj_dim, lambda_init, lr_dual,
-                           normalize_target=True, symmetrize_target=True):
+                           normalize_target=True, symmetrize_target=True,
+                           geom_mode="full", spread_cap=None):
         """Construct the metric-preservation loss for metric variants (C/D)."""
         if variant in ("none", "B", "A"):
             return None
@@ -181,12 +194,15 @@ class AMSlot(AttentionModel):
             lr_dual=lr_dual,
             normalize_target=normalize_target,
             symmetrize_target=symmetrize_target,
+            geom_mode=geom_mode,
+            spread_cap=spread_cap,
         )
 
     # configure_optimizers: separate dual param group for log_lambda (dual ascent),
     # delegating to base to keep the AM LR scheduler.
     def configure_optimizers(self):
-        if self.metric_loss_fn is None:
+        if self.metric_loss_fn is None or not hasattr(
+                self.metric_loss_fn, "log_lambda"):
             # No dual parameter — use base class as-is
             return super().configure_optimizers()
 
@@ -197,19 +213,44 @@ class AMSlot(AttentionModel):
         dual_params = [self.metric_loss_fn.log_lambda]
 
         param_groups = [
-            {"params": main_params},                      # uses base lr + scheduler
-            {"params": dual_params, "lr": lr_dual},       # dual ascent, no scheduler
+            # uses base lr + scheduler
+            {"params": main_params},
+            # dual ascent, no scheduler
+            {"params": dual_params, "lr": lr_dual},
         ]
         return super().configure_optimizers(parameters=param_groups)
 
-    # on_after_optimizer_step: clamp log_lambda (dual ascent). Same safety net
-    # as POMOSlot (see model.py for rationale).
-    def on_after_optimizer_step(self, optimizer):
-        if self.metric_loss_fn is None:
+    def _clamp_lambda(self):
+        if self.metric_loss_fn is None or not hasattr(
+                self.metric_loss_fn, "log_lambda"):
             return
-        lambda_max = getattr(self, "lambda_max", 50.0)
         with torch.no_grad():
-            self.metric_loss_fn.log_lambda.data.clamp_(max=math.log(lambda_max))
+            self.metric_loss_fn.log_lambda.data.clamp_(
+                max=math.log(self.lambda_max))
+
+    def on_before_zero_grad(self, optimizer):
+        self._clamp_lambda()
+
+    def on_validation_epoch_start(self):
+        self._geometry_val_logged = False
+
+    def _geometry_log_info(self, slots, A_ik, locs, depot,
+                           d_ins_idx, d_ins_val):
+        if self.metric_loss_fn is not None:
+            return self.metric_loss_fn.diagnostics(
+                slots, A_ik, locs, depot, d_ins_idx, d_ins_val)
+        latent_dist = torch.cdist(slots, slots, p=2)
+        target, _, _ = _construction_target(
+            locs, depot, A_ik,
+            normalize=self.normalize_target,
+            symmetrize=self.symmetrize_target,
+        )
+        stats = _geometry_diagnostics(latent_dist, target, A_ik)
+        stats.update({
+            "metric_lambda": torch.zeros((), device=slots.device),
+            "metric_L_viol": torch.zeros((), device=slots.device),
+        })
+        return stats
 
     # shared_step: extract d_ins, run AM (single-start), read slot side-channel,
     # add aux loss. Mirrors POMOSlot.shared_step except it calls the base AM
@@ -238,28 +279,37 @@ class AMSlot(AttentionModel):
         device = self.device
         batch = batch.to(device)
         if d_ins_idx is not None:
-            d_ins_idx = d_ins_idx.to(device)  # keep as int16 for transfer, cast in loss fn
+            # keep as int16 for transfer, cast in loss fn
+            d_ins_idx = d_ins_idx.to(device)
         if d_ins_val is not None:
             d_ins_val = d_ins_val.to(device)
         # Read locs BEFORE base shared_step mutates the batch
         locs_customers: torch.Tensor | None = None
-        if self.metric_variant not in ("none", "B"):
-            raw_locs = batch.get("locs") if hasattr(batch, "get") else batch["locs"]
-            locs_customers = raw_locs.to(device)  # (B, N, 2) — customers only, no depot
+        if not self.disable_slots:
+            raw_locs = batch.get("locs") if hasattr(
+                batch, "get") else batch["locs"]
+            # (B, N, 2) — customers only, no depot
+            locs_customers = raw_locs.to(device)
+        depot = batch.get("depot") if hasattr(batch, "get") else batch["depot"]
+        if depot is not None and depot.ndim == 2:
+            depot = depot.unsqueeze(1)
 
         # Fallback: compute d_ins on-the-fly if Variant D needs it, but the
         # dataset didn't cache it (mirrors POMOSlot — see model.py for indexing notes)
         if (
             self.metric_variant == "D"
+            and self.geom_mode != "spread_only"
             and d_ins_idx is None
             and d_ins_val is None
             and locs_customers is not None
             and locs_customers.shape[1] > 1
         ):
-            customers = locs_customers[:, 1:, :]   # (B, N_cust, 2) — matches A_ik
-            depot = locs_customers[:, :1, :]        # (B, 1, 2) — node 0 as pseudo-depot
+            # (B, N_cust, 2) — matches A_ik
+            customers = locs_customers[:, 1:, :]
+            # (B, 1, 2) — node 0 as pseudo-depot
+            pseudo_depot = locs_customers[:, :1, :]
             d_ins_idx, d_ins_val = compute_sparse_insertion_cost(
-                customers, k_neighbors=self.k_neighbors, depot_loc=depot,
+                customers, k_neighbors=self.k_neighbors, depot_loc=pseudo_depot,
                 method=self.ins_method,
             )  # (B, N_cust, k) int16, (B, N_cust, k) float32
 
@@ -267,16 +317,37 @@ class AMSlot(AttentionModel):
         # inside policy.forward(); slots/A_ik available via side-channel after.
         out = super().shared_step(batch, batch_idx, phase, dataloader_idx)
 
-        # Skip aux losses during val/test, or when slots are disabled.
-        if phase != "train" or self.metric_variant in ("none", "B") or self.disable_slots:
+        # Skip aux losses during test, or when slots are disabled.
+        if phase == "test" or self.disable_slots:
             return out
 
         # Read slot side-channel
         slots = self.policy.encoder.last_slots  # (B, K, d)
-        A_ik  = self.policy.encoder.last_A_ik   # (B, N, K)
+        A_ik = self.policy.encoder.last_A_ik   # (B, N, K)
 
         if slots is None or A_ik is None:
-            log.warning("SlotInjectingEncoder side-channel is None — skipping aux loss.")
+            log.warning(
+                "SlotInjectingEncoder side-channel is None — skipping aux loss.")
+            return out
+
+        if self.metric_variant in ("none", "B"):
+            with torch.no_grad():
+                slot_info = self._geometry_log_info(
+                    slots, A_ik, locs_customers, depot,
+                    d_ins_idx, d_ins_val)
+            for key, value in slot_info.items():
+                self.log(f"train/{key}", value, on_step=True, on_epoch=True)
+            return out
+
+        if phase != "train":
+            if not self._geometry_val_logged:
+                with torch.no_grad():
+                    val_info = self._geometry_log_info(
+                        slots, A_ik, locs_customers, depot,
+                        d_ins_idx, d_ins_val)
+                for key, value in val_info.items():
+                    self.log(f"val/{key}", value, on_step=False, on_epoch=True)
+                self._geometry_val_logged = True
             return out
 
         # Compute auxiliary losses
@@ -307,7 +378,13 @@ class AMSlot(AttentionModel):
                 locs=locs,
                 d_ins_idx=d_ins_idx,
                 d_ins_val=d_ins_val,
+                depot=depot,
             )
+            if self.geom_mode == "spread_only":
+                with torch.no_grad():
+                    metric_info.update(self.metric_loss_fn.diagnostics(
+                        slots, A_ik, locs, depot,
+                        d_ins_idx, d_ins_val))
             aux_loss = aux_loss + self.alpha_metric * metric_loss
             log_dict.update(metric_info)
 
@@ -315,11 +392,22 @@ class AMSlot(AttentionModel):
         policy_loss = out.get("loss", None)
         if policy_loss is not None and aux_loss.requires_grad:
             out["loss"] = policy_loss + aux_loss
-            log_dict["aux_loss"]    = aux_loss.detach()
+            log_dict["aux_loss"] = aux_loss.detach()
             log_dict["policy_loss"] = policy_loss.detach()
 
         # Log to Lightning
         for k, v in log_dict.items():
-            self.log(f"train/{k}", v, prog_bar=False, on_step=True, on_epoch=True)
+            self.log(f"train/{k}", v, prog_bar=False,
+                     on_step=True, on_epoch=True)
+
+        if self.geom_mode == "spread_only" and "metric_D_latent_mean" in log_dict:
+            current = float(log_dict["metric_D_latent_mean"])
+            if self._spread_reference is None:
+                self._spread_reference = max(current, 1e-8)
+            elif (not self._spread_warned
+                  and current > 10.0 * self._spread_reference):
+                log.warning(
+                    "spread_only mean D_latent exceeded 10x its epoch-1 value")
+                self._spread_warned = True
 
         return out

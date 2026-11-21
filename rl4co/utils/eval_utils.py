@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
-from rl4co.models.zoo.pomo_slot.model_am import SingleSharedBaseline
+from rl4co.models.zoo.lego.model_am import SingleSharedBaseline
 from rl4co.data.utils import load_npz_to_tensordict
 from rl4co.utils.decoding import get_decoding_strategy
 from rl4co.utils.ops import unbatchify, get_tour_length
@@ -153,6 +153,7 @@ def decode_radar(model, batch, args, env):
 
 REGISTRY = {
     "am": decode_am,
+    "lego": decode_pomo,   # POMOSlot is a POMO-based model
     "pomo": decode_pomo,
     "pomo_base": decode_pomo,
     "sil": decode_sil,
@@ -193,11 +194,53 @@ def apply_local_search(
         log.warning(f"local_search unavailable, skipping: {e}")
         return None
 
+def _time_window_feasibility(
+    locs, actions, time_windows, durations, eps: float = 1e-6,
+) -> torch.Tensor:
+    """Whether every service *start* falls within its time window.
+
+    ``locs`` (B, N+1, 2) depot-first, ``actions`` (B, T), ``time_windows``
+    (B, N+1, 2) depot-first, ``durations`` (B, N+1). Each route is treated as an
+    independent trip leaving the depot at time 0 (standard Solomon reading):
+    a ``0`` action ends the current route and resets time/location to the depot;
+    each customer's service *starts* at max(arrival, window start) and must be
+    <= window end.
+
+    Returns (B,) boolean — True if all service starts meet their windows.
+    """
+    if actions.dim() == 1:
+        actions = actions[:, None]
+    B = locs.shape[0]
+    feasible = torch.ones(B, dtype=torch.bool, device=locs.device)
+    curr_loc = locs[:, 0]                          # (B, 2) depot (index 0)
+    curr_time = torch.zeros(B, device=locs.device)
+    T = actions.shape[1]
+    for t in range(T):
+        node = actions[:, t]                       # (B,)
+        dest = gather_by_index(locs, node)         # (B, 2)
+        dist = (curr_loc - dest).norm(dim=-1)      # (B,)
+        arrival = curr_time + dist
+        nz = node != 0
+        if torch.any(nz):
+            start_ok = arrival[nz] <= time_windows[nz, node[nz].long(), 1] + eps
+            feasible[nz] = feasible[nz] & start_ok
+        # advance time: service starts at max(arrival, window start) + duration
+        tw_start = gather_by_index(time_windows[..., 0], node)     # (B,)
+        dur = gather_by_index(durations, node)                     # (B,)
+        new_time = torch.maximum(arrival, tw_start) + dur
+        curr_time = torch.where(nz, new_time, torch.zeros_like(new_time))
+        curr_loc = dest
+    return feasible
+
+
 def evaluate(model, args, env, ds, return_instances: int | None = None):
     model.eval()
     dec = REGISTRY[args.model]
     rewards = []
+    actions_buf = []
+    tw_buf, dur_buf, loc_buf = [], [], []
     num_starts = 1
+    has_tw = False
     # When plotting is requested, keep the first ``return_instances`` decoded
     # solutions (post-reset td with depot + actions) so routes can be drawn.
     plot_instances = [] if return_instances else None
@@ -208,11 +251,20 @@ def evaluate(model, args, env, ds, return_instances: int | None = None):
             if isinstance(batch, dict):
                 batch = TensorDict(batch, batch_size=[batch["demand"].size(0)])
             batch = batch.to(args.device)
+            tw_keys = {"time_windows", "durations", "locs", "depot"}
+            if tw_keys.issubset(batch.keys()):
+                has_tw = True
+                tw_buf.append(batch["time_windows"].cpu())
+                dur_buf.append(batch["durations"].cpu())
+                loc_buf.append(
+                    torch.cat((batch["depot"][:, None, :], batch["locs"]), -2).cpu())
 
             batch_for_plot = batch.clone() if plot_instances is not None else None
 
             reward_batch, num_starts, actions = dec(model, batch, args, env)
             rewards.append(reward_batch.cpu())
+            if has_tw:
+                actions_buf.append(actions.cpu())
 
             if plot_instances is not None and actions is not None:
                 B = batch_for_plot.batch_size[0]
@@ -238,6 +290,25 @@ def evaluate(model, args, env, ds, return_instances: int | None = None):
         "elapsed_seconds": elapsed,
         "throughput_per_sec": len(reward) / elapsed if elapsed > 0 else 0.0,
     }
+    # VRPTW (constraint-agnostic) — time-window feasibility of the decoded tours.
+    # ``actions`` is laid out start-major (index = s*B + i); we mark an instance
+    # feasible if ANY decoded start satisfies every time window.
+    if has_tw:
+        B = reward.shape[0]
+        tw_all = torch.cat(tw_buf)
+        dur_all = torch.cat(dur_buf)
+        loc_all = torch.cat(loc_buf)
+        acts_all = torch.cat(actions_buf)
+        ns = num_starts if num_starts else 1
+        T = acts_all.shape[-1]
+        acts_all = acts_all.view(B, ns, T)
+        feas_any = torch.zeros(B, dtype=torch.bool)
+        for s in range(ns):
+            feas_s = _time_window_feasibility(
+                loc_all, acts_all[:, s], tw_all, dur_all)
+            feas_any = feas_any | feas_s.cpu()
+        result["n_feasible"] = int(feas_any.sum().item())
+        result["feasible_frac"] = float(feas_any.float().mean().item())
     if return_instances is not None:
         return result, plot_instances
     return result

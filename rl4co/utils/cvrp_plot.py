@@ -15,6 +15,14 @@ import torch
 from rl4co.utils.ops import get_tour_length
 
 
+DEPOT_COLOR = "#9F1D35"
+CUSTOMER_EDGE = "#263746"
+ROUTE_PALETTE = (
+    "#0072B2", "#E69F00", "#009E73", "#D55E00", "#7B2CBF",
+    "#8C564B", "#CC79A7", "#17BECF", "#BCBD22", "#4C78A8",
+)
+
+
 def best_tour(td_reset, actions):
     """Return the depot-inclusive index sequence for the best-cost start.
 
@@ -30,6 +38,12 @@ def best_tour(td_reset, actions):
     """
     locs = td_reset["locs"]                     # (1, N_full, 2) depot-first
     acts = actions.detach()
+    if acts.ndim == 3:
+        if acts.shape[0] != 1:
+            raise ValueError(
+                f"best_tour expects one instance, got batch size {acts.shape[0]}"
+            )
+        acts = acts[0]
     if acts.ndim == 1:
         acts = acts.unsqueeze(0)
     starts = acts.shape[0]
@@ -45,11 +59,12 @@ def best_tour(td_reset, actions):
     # Wrap with the depot at both ends (get_tour_length connects the last node
     # back to the first, so the leading depot is implicit; we duplicate it so
     # the polyline visibly returns to the depot).
-    tour = torch.cat([torch.zeros(1, dtype=best.dtype), best])   # [0, a_0, ...]
+    tour = torch.cat([torch.zeros(1, dtype=best.dtype), best]
+                     )   # [0, a_0, ...]
     return torch.cat([tour, torch.zeros(1, dtype=best.dtype)])   # [..., 0]
 
 
-def render_cvrp_solution(td_reset, actions, out_stem, dpi=300):
+def render_cvrp_solution(td_reset, actions, out_stem, dpi=300, title=None):
     """Draw one CVRP solution and save ``<out_stem>.pdf`` and ``<out_stem>.png``.
 
     Args:
@@ -57,6 +72,7 @@ def render_cvrp_solution(td_reset, actions, out_stem, dpi=300):
         actions: decoded action sequence (may be multistart; best start is drawn).
         out_stem: output path without extension (e.g. ``results/plots/am_inst0``).
         dpi: raster resolution for the PNG.
+        title: optional instance name shown above the plot.
 
     Returns the matplotlib Figure (caller may close it).
     """
@@ -66,44 +82,44 @@ def render_cvrp_solution(td_reset, actions, out_stem, dpi=300):
 
     tour = best_tour(td_reset, actions).tolist()
     locs = td_reset["locs"][0].cpu().numpy()      # (N_full, 2), depot first
-    tour_xy = locs[tour]                          # (len(tour), 2)
-
-    fig, ax = plt.subplots(figsize=(5, 5))
-    # Muted, publication-friendly palette.
-    depot_color = "#222222"
-    cust_color = "#4C72B0"
-    route_colors = ["#8C8C8C", "#C44E52", "#55A868", "#CCB974", "#8172B2",
-                    "#64B5CD", "#DD8452"]
-
+    customer_count = max(0, len(locs) - 1)
+    fig, ax = plt.subplots(figsize=(5.2, 5.2))
     # ---- routes: split the tour at depot returns, each as a thin polyline ----
     seg = []
     color_idx = 0
     for a in tour:
         if a == 0:
             if len(seg) > 1:
-                pts = locs[seg]
+                pts = locs[seg + [0]]
                 ax.plot(pts[:, 0], pts[:, 1],
-                        color=route_colors[color_idx % len(route_colors)],
-                        lw=1.4, alpha=0.85, zorder=2)
+                        color=ROUTE_PALETTE[color_idx % len(ROUTE_PALETTE)],
+                        lw=0.65 if customer_count > 100 else 1.15,
+                        alpha=0.62, zorder=1)
                 color_idx += 1
             seg = [a]
         else:
             seg.append(a)
     if len(seg) > 1:
-        pts = locs[seg]
+        pts = locs[seg + [0]]
         ax.plot(pts[:, 0], pts[:, 1],
-                color=route_colors[color_idx % len(route_colors)],
-                lw=1.4, alpha=0.85, zorder=2)
+                color=ROUTE_PALETTE[color_idx % len(ROUTE_PALETTE)],
+                lw=0.65 if customer_count > 100 else 1.15,
+                alpha=0.62, zorder=1)
 
     # ---- nodes ----
     # Customers first (under the depot marker).
-    ax.scatter(locs[1:, 0], locs[1:, 1], s=18, color=cust_color,
-               edgecolors="white", linewidths=0.4, zorder=3)
-    # Depot as a distinct filled square.
-    ax.scatter(locs[0, 0], locs[0, 1], s=64, marker="s", color=depot_color,
-               zorder=4)
+    ax.scatter(locs[1:, 0], locs[1:, 1],
+               s=12 if customer_count > 100 else 25,
+               facecolors="white", edgecolors=CUSTOMER_EDGE,
+               linewidths=0.45 if customer_count > 100 else 0.75, zorder=2)
+    # Depot as a distinct star.
+    ax.scatter(locs[0, 0], locs[0, 1], s=140, marker="*", color=DEPOT_COLOR,
+               edgecolors="white", linewidths=0.9, zorder=3)
 
     ax.set_aspect("equal", adjustable="datalim")
+    if title:
+        ax.set_title(title, fontsize=11, pad=10, loc="left",
+                     fontweight="semibold", color=CUSTOMER_EDGE)
     ax.axis("off")
     ax.margins(0.06)
     fig.set_facecolor("white")

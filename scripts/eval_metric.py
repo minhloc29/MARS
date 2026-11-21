@@ -28,8 +28,8 @@ import torch
 from tensordict import TensorDict
 
 from rl4co.envs import CVRPEnv
-from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
-from rl4co.models.zoo.pomo_slot.model_am import SingleSharedBaseline
+from rl4co.models.zoo.lego import POMOSlot, AMSlot
+from rl4co.models.zoo.lego.model_am import SingleSharedBaseline
 from rl4co.models.nn.metric_loss import _aggregate_d_ins_sparse
 
 

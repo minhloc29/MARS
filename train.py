@@ -21,7 +21,7 @@ except Exception:
 from rl4co.data.slot_dataset import make_dataloader
 
 try:
-    from rl4co.envs import CVRPEnv
+    from rl4co.envs import CVRPEnv, OVRPEnv
     from rl4co.models.zoo.dgl import DGL
     from rl4co.models.zoo.elg import ELG
     from rl4co.models.zoo.icam import ICAMCVRP
@@ -29,7 +29,7 @@ try:
     from rl4co.models.zoo.l2r import L2RModel
     from rl4co.models.zoo.lehd import LEHDModel, TTRLModel
     from rl4co.models.zoo.lehd.model import make_lehd_dataloaders
-    from rl4co.models.zoo.pomo_slot import AMSlot, POMOSlot
+    from rl4co.models.zoo.lego import AMSlot, POMOSlot
     from rl4co.models.zoo.radar import RADAR
     from rl4co.models.zoo.sil import SIL
     FULL_RL4CO = True
@@ -47,7 +47,8 @@ DEFAULT_DATA_DIR = LOCAL_DATA_DIR if LOCAL_DATA_DIR.exists() else MARS_DATA_DIR
 
 
 MODEL_CLASSES = {
-    "pomo": POMOSlot,
+    "lego": POMOSlot,
+    "pomo": POMOSlot,  # CLI alias kept for README compatibility
     "am": AMSlot,
     "l2r": L2RModel,
     "icam": ICAMCVRP,
@@ -116,6 +117,7 @@ def _make_trainer(run_name: str, log_path: Path, epochs: int,
 def train(
     num_loc: int = 100,
     dist: str = "uniform",
+    problem: str = "cvrp",
     data_dir: str | Path = DEFAULT_DATA_DIR,
     output: str = "./output",
     seed: int = 42,
@@ -131,7 +133,10 @@ def train(
     slot_iters: int = 3,
     lambda_init: float = 1.0,
     lr_dual: float = 1e-3,
+    lambda_max: float = 50.0,
     metric_variant: str = "D",
+    geom_mode: str = "full",
+    spread_cap: float | None = None,
     alpha_metric: float = 0.1,
     beta_entropy: float = 0.01,
     normalize_target: bool = True,
@@ -236,12 +241,16 @@ def train(
         n_train, max_instances) if max_instances is not None else n_train
     n_val_eff = min(n_val, max(1, max_instances // 10)
                     ) if max_instances is not None else n_val
-    v_cfg = dict(metric_variant=metric_variant, alpha_metric=alpha_metric,
-                 beta_entropy=beta_entropy)
+    v_cfg = dict(metric_variant=metric_variant, geom_mode=geom_mode,
+                 spread_cap=spread_cap, lambda_max=lambda_max,
+                 alpha_metric=alpha_metric, beta_entropy=beta_entropy)
 
     data_dir = Path(data_dir)
-    train_path = data_dir / ins_method / f"cvrp{num_loc}_{dist}_train.pt"
-    val_path = data_dir / ins_method / f"cvrp{num_loc}_{dist}_val.pt"
+    # ovrp/cvrp share identical instance data; the problem only changes the
+    # filename prefix (and the reward at decode). vrptw prepends its own data.
+    data_prefix = f"{problem}{num_loc}"
+    train_path = data_dir / ins_method / f"{data_prefix}_{dist}_train.pt"
+    val_path = data_dir / ins_method / f"{data_prefix}_{dist}_val.pt"
 
     missing_paths = [path for path in (
         train_path, val_path) if not path.exists()]
@@ -250,7 +259,7 @@ def train(
 
         print(
             f"Missing {len(missing_paths)} required split(s); generating the shared "
-            f"N={num_loc} {dist} dataset in {data_dir}."
+            f"N={num_loc} {dist} {problem} dataset in {data_dir}."
         )
         generate_and_save(
             out_dir=data_dir,
@@ -263,6 +272,7 @@ def train(
             method=ins_method,
             chunk_size=generation_chunk_size,
             seed=seed,
+            problem=problem,
         )
         # Dataset generation consumes random numbers. Restore the experiment
         # seed so a first run and a run reusing the cache initialize identically.
@@ -275,7 +285,7 @@ def train(
             f"python -m rl4co.data.generate_slot_dataset --num_locs {num_loc} "
             f"--dist {dist} --n_train {n_train_eff} --n_val {n_val_eff} "
             f"--n_test {n_val_eff} --out_dir {data_dir} --method {ins_method} "
-            f"--seed {seed}"
+            f"--problem {problem} --seed {seed}"
         )
         raise FileNotFoundError(
             "Missing required cached dataset split(s):\n  "
@@ -317,8 +327,15 @@ def train(
         else:
             print(f"Dataset method '{data_method}' matches --ins_method. OK.")
 
-    # Environment
-    env = CVRPEnv(generator_params=dict(num_loc=num_loc))
+    # Environment. ovrp uses OVRPEnv (open-route reward, same CVRP embedding so a
+    # CVRP checkpoint loads). vrptw is constraint-agnostic: the *learner* sees a
+    # CVRP environment (capacity mask, closed-tour reward) and ignores time
+    # windows exactly as it ignores nothing else it wasn't asked to reason about;
+    # the time windows are present in the data for a downstream feasibility metric.
+    if problem == "ovrp":
+        env = OVRPEnv(generator_params=dict(num_loc=num_loc))
+    else:  # cvrp and vrptw share the CVRP decision/reward structure
+        env = CVRPEnv(generator_params=dict(num_loc=num_loc))
 
     # Model
     model_cls = MODEL_CLASSES[backbone]
@@ -452,12 +469,17 @@ def train(
                     f"_si{radar_sinkhorn_iters}_sn{int(radar_scale_norm)}")
     elif geometry_aware_no_slots:
         run_name = (f"{backbone}_geometry_{metric_variant}_noslot_N{num_loc}_"
-                    f"{dist}_{ins_method}_seed{seed}")
+                    f"{dist}_{ins_method}_gm{geom_mode}_seed{seed}")
     elif disable_slots:
-        run_name = f"{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
+        run_name = (f"{backbone}_noslot_N{num_loc}_{dist}_gm{geom_mode}_"
+                    f"seed{seed}{base_suffix}")
     else:
         run_name = (f"{backbone}_slot_{metric_variant}_K{num_slots}_N{num_loc}_{dist}_"
-                    f"{ins_method}{norm_tag}_seed{seed}{base_suffix}")
+                    f"{ins_method}{norm_tag}_gm{geom_mode}_seed{seed}{base_suffix}")
+    if "_gm" not in run_name:
+        run_name = f"{run_name}_gm{geom_mode}"
+    if problem != "cvrp":
+        run_name = f"{run_name}_prob{problem}"
     log_path = Path(output) / run_name
 
     trainer, checkpoint_cb, _ = _make_trainer(
@@ -503,9 +525,14 @@ def train(
     result = {
         "backbone": backbone,
         "metric_variant": None if backbone in BASELINE_BACKBONES else metric_variant,
+        "geom_mode": geom_mode,
+        "spread_cap": spread_cap,
+        "lambda_max": lambda_max,
+        "lr_dual": lr_dual,
         "num_slots": None if backbone in BASELINE_BACKBONES else num_slots,
         "num_loc": num_loc,
         "dist": dist,
+        "problem": problem,
         "seed": seed,
         "ins_method": ins_method,
         "normalize_target": normalize_target,
@@ -578,7 +605,7 @@ def train(
                          ) if result_file.exists() else []
     dedup_key = {k: result[k] for k in (
         "backbone", "metric_variant", "num_slots", "num_loc", "dist", "seed",
-        "ins_method", "normalize_target", "symmetrize_target",
+        "problem", "ins_method", "normalize_target", "symmetrize_target",
         "geometry_aware_no_slots",
     )}
     if backbone == "sil":
@@ -726,6 +753,13 @@ def main():
                         choices=[50, 100, 200, 500, 1000])
     parser.add_argument("--dist", default="uniform",
                         choices=["uniform", "clustered"])
+    parser.add_argument("--problem", default="cvrp",
+                        choices=["cvrp", "ovrp", "vrptw"],
+                        help="Problem to train on. ovrp = open VRP (open-route "
+                             "reward; same CVRP instance data/embedding). vrptw = "
+                             "constraint-agnostic VRPTW: the model keeps the CVRP "
+                             "(x,y,demand) embedding and objective; time windows are "
+                             "attached to the data for eval-only feasibility.")
     parser.add_argument("--data_dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--output", default="./output")
     parser.add_argument("--seed", type=int, default=42)
@@ -746,8 +780,13 @@ def main():
     parser.add_argument("--slot_iters", type=int, default=3)
     parser.add_argument("--lambda_init", type=float, default=1.0)
     parser.add_argument("--lr_dual", type=float, default=1e-4)
+    parser.add_argument("--lambda_max", type=float, default=50.0)
     parser.add_argument("--metric_variant", "--variant", default="D",
                         choices=["none", "A", "B", "C", "D", "E"])
+    parser.add_argument("--geom_mode", default="full",
+                        choices=["full", "spread_only", "shuffled"])
+    parser.add_argument("--spread_cap", type=float, default=None,
+                        help="Optional cap on latent distances in spread_only mode.")
     parser.add_argument("--alpha_metric", type=float, default=0.1)
     parser.add_argument("--beta_entropy", type=float, default=0.01)
     parser.add_argument("--ins_method", default="construction",
@@ -834,15 +873,18 @@ def main():
     args = parser.parse_args()
 
     train(
-        num_loc=args.num_loc, dist=args.dist, data_dir=args.data_dir,
+        num_loc=args.num_loc, dist=args.dist, problem=args.problem,
+        data_dir=args.data_dir,
         output=args.output, seed=args.seed, device=args.device,
         n_train=args.n_train, n_val=args.n_val, epochs=args.epochs,
         batch_size=args.batch_size, lr=args.lr, max_instances=args.max_instances,
         backbone=args.backbone, embed_dim=args.embed_dim, num_slots=args.num_slots,
         proj_dim=args.proj_dim, slot_iters=args.slot_iters,
         lambda_init=args.lambda_init, lr_dual=args.lr_dual,
+        lambda_max=args.lambda_max,
         metric_variant=args.metric_variant, alpha_metric=args.alpha_metric,
         beta_entropy=args.beta_entropy, normalize_target=args.normalize_target,
+        geom_mode=args.geom_mode, spread_cap=args.spread_cap,
         symmetrize_target=args.symmetrize_target, baseline=args.baseline,
         disable_slots=args.disable_slots, ins_method=args.ins_method,
         geometry_aware_no_slots=args.geometry_aware_no_slots,

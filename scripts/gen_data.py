@@ -4,8 +4,10 @@ import argparse
 from pathlib import Path
 
 import lightning.pytorch as pl
+from tensordict import TensorDict
 from rl4co.envs import CVRPEnv
 from rl4co.data.utils import save_tensordict_to_npz
+from rl4co.data.generate_slot_dataset import _gen_time_windows
 
 
 def main() -> None:
@@ -30,6 +32,12 @@ def main() -> None:
                         choices=["uniform", "gaussian", "cluster", "gaussian_mixture",
                                  "mixed", "mix_distribution", "exponential", "poisson"],
                         help="Customer location distribution. Default: uniform.")
+    parser.add_argument("--problem", type=str, default="cvrp",
+                        choices=["cvrp", "ovrp", "vrptw"],
+                        help="Problem to generate. ovrp = identical CVRP instances "
+                             "under the open-route reading (same data, different "
+                             "prefix). vrptw additionally attaches Solomon-style "
+                             "time_windows + durations for eval-only feasibility.")
 
     # Distribution-specific arguments (only the ones matching --loc_dist are consumed).
     dist_args = parser.add_argument_group("distribution arguments")
@@ -75,24 +83,46 @@ def main() -> None:
         d = td["locs"][:, :1, :]          # depot row, kept fixed
         td["locs"] = (d + args.alpha * (td["locs"] - d)).clamp(0.0, 1.0)
 
+    # VRPTW (constraint-agnostic): attach Solomon-style time windows + zero
+    # service durations, matching the convention used by the slot-dataset
+    # generator (locs/depot in [0,1], demand normalized, travel scaled by 150).
+    if args.problem == "vrptw":
+        if args.alpha != 1.0:
+            raise ValueError("--problem vrptw does not combine with --alpha.")
+        time_windows, durations = _gen_time_windows(
+            td["locs"], td["depot"], max_time=480, scale=150.0)
+        B = td.batch_size[0]
+        td = TensorDict(
+            {
+                "depot": td["depot"],                       # (B, 2)
+                "locs": td["locs"],                          # (B, N, 2)
+                "demand": td["demand"],                      # (B, N)
+                "capacity": td["capacity"],                  # (B, 1)
+                "durations": durations,                      # (B, N+1)
+                "time_windows": time_windows,                # (B, N+1, 2)
+            },
+            batch_size=[B],
+        )
+
     if args.out is None:
         cap = f"_cap{args.capacity:g}" if args.capacity is not None else ""
+        prefix = args.problem
         if args.alpha != 1.0:
-            out = Path(f"data/test/cvrp_{args.num_loc}_{args.loc_dist}"
+            out = Path(f"data/test/{prefix}_{args.num_loc}_{args.loc_dist}"
                        f"_alpha{args.alpha}{cap}_seed{args.seed}.npz")
         elif args.loc_dist == "uniform":
-            out = Path(f"data/test/cvrp_{args.num_loc}_uniform{cap}_seed{args.seed}.npz")
+            out = Path(f"data/test/{prefix}_{args.num_loc}_uniform{cap}_seed{args.seed}.npz")
         elif args.loc_dist == "gaussian":
-            out = Path(f"data/test/cvrp_{args.num_loc}_gaussian_mean{args.loc_mean}_std{args.loc_std}{cap}_seed{args.seed}.npz")
+            out = Path(f"data/test/{prefix}_{args.num_loc}_gaussian_mean{args.loc_mean}_std{args.loc_std}{cap}_seed{args.seed}.npz")
         elif args.loc_dist == "cluster":
-            out = Path(f"data/test/cvrp_{args.num_loc}_cluster_n{args.n_cluster}{cap}_seed{args.seed}.npz")
+            out = Path(f"data/test/{prefix}_{args.num_loc}_cluster_n{args.n_cluster}{cap}_seed{args.seed}.npz")
     else:
         out = Path(args.out)
-    
+
     out.parent.mkdir(parents=True, exist_ok=True)
     save_tensordict_to_npz(td, out)
-    print(f"[OK] generated {len(td)} CVRP instances at num_loc={args.num_loc} "
-          f"(seed={args.seed}) -> {out}")
+    print(f"[OK] generated {len(td)} {args.problem} instances at num_loc="
+          f"{args.num_loc} (seed={args.seed}) -> {out}")
 
 
 if __name__ == "__main__":

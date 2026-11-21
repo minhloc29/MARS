@@ -21,6 +21,7 @@ def env_context_embedding(env_name: str, config: dict) -> nn.Module:
         "cvrp": VRPContext,
         "cvrptw": VRPTWContext,
         "cvrpmvc": VRPContext,
+        "ovrp": VRPContext,  # open VRP: same CVRP context features
         "ffsp": FFSPContext,
         "svrp": SVRPContext,
         "sdvrp": VRPContext,

@@ -8,13 +8,13 @@ import lightning.pytorch as pl
 import torch
 
 from rl4co.data.transforms import StateAugmentation
-from rl4co.envs import CVRPEnv
+from rl4co.envs import CVRPEnv, OVRPEnv
 from rl4co.models.zoo.elg import ELG
 from rl4co.models.zoo.icam import ICAMCVRP
 from rl4co.models.zoo.invit import INViT
 from rl4co.models.zoo.l2r import L2RModel
 from rl4co.models.zoo.pomo import POMO
-from rl4co.models.zoo.pomo_slot import AMSlot, POMOSlot
+from rl4co.models.zoo.lego import AMSlot, POMOSlot
 from rl4co.models.zoo.radar import RADAR
 from rl4co.models.zoo.sil import SIL
 from rl4co.utils import eval_utils
@@ -22,7 +22,7 @@ from rl4co.utils.cvrplib import evaluate_cvrplib
 
 MODEL_CLASSES = {
     "am": AMSlot,
-    "pomo": POMOSlot,
+    "lego": POMOSlot,
     "pomo_base": POMO,
     "sil": SIL,
     "icam": ICAMCVRP,
@@ -39,7 +39,7 @@ def main() -> None:
     )
     parser.add_argument("--ckpt", type=str, required=True,
                         help="Path to a trained checkpoint")
-    parser.add_argument("--model", type=str, default="am",
+    parser.add_argument("--model", type=str, default="lego",
                         choices=sorted(MODEL_CLASSES),
                         help="Model class. Must match the checkpoint.")
     parser.add_argument("--dataset", type=str, default="synthetic",
@@ -52,11 +52,18 @@ def main() -> None:
     parser.add_argument("--num_loc", type=int, default=None,
                         help="Target number of customers N (required for "
                              "--dataset synthetic).")
+    parser.add_argument("--problem", type=str, default="cvrp",
+                        choices=["cvrp", "ovrp", "vrptw"],
+                        help="Problem being evaluated. ovrp decodes with the "
+                             "open-route reward (OVRPEnv). vrptw decodes with the "
+                             "CVRP structure (constraint-agnostic) and additionally "
+                             "reports time-window feasibility when the data carries "
+                             "time_windows/durations.")
     parser.add_argument("--n_inst", type=int, default=1000,
                         help="Number of eval instances")
     parser.add_argument("--batch_size", type=int, default=128,
                         help="Eval batch size")
-    parser.add_argument("--num_starts", type=int, default=50,
+    parser.add_argument("--num_starts", type=int, default=100,
                         help="Multi-start greedy for POMO/AM checkpoints. For "
                              "--dataset cvrplib this is the POMO multi-start "
                              "count (default 100). Not used by elg/dgl/radar "
@@ -76,6 +83,10 @@ def main() -> None:
     parser.add_argument("--plot_dir", type=str, default=None,
                         help="Output directory for --plot figures "
                              "(default: results/plots).")
+    parser.add_argument("--plot_instances", type=str, default=None,
+                        help="CVRPLIB instances to plot, comma-separated by "
+                             "name or zero-based position in the selected "
+                             "sorted list; use 'all' for every instance.")
     parser.add_argument("--augment", action="store_true",
                         help="Evaluate eight geometric augmentations (AM/POMO).")
     parser.add_argument("--local_search", action="store_true",
@@ -89,9 +100,9 @@ def main() -> None:
     parser.add_argument("--out", type=str, default=None,
                         help="JSON path to save results.")
     parser.add_argument("--num_slots", type=int, default=None,
-                    help="Override SlotAttention K at inference (pomo/am only).")
+                        help="Override SlotAttention K at inference (pomo/am only).")
     parser.add_argument("--slot_iters", type=int, default=None,
-                    help="Override SlotAttention iterations at inference.")
+                        help="Override SlotAttention iterations at inference.")
     parser.add_argument("--k_neighbors", type=int, default=None)
     args = parser.parse_args()
 
@@ -107,10 +118,14 @@ def main() -> None:
 
     # ---- CVRPLIB Set X: shared per-instance harness (rl4co/utils/cvrplib.py)
     if args.dataset == "cvrplib":
+        plot_instances = ([item.strip() for item in args.plot_instances.split(",")
+                           if item.strip()]
+                          if args.plot_instances else None)
         result = evaluate_cvrplib(
             args.model, args.ckpt, data_dir=args.data_dir,
             sizes=args.sizes, num_starts=args.num_starts,
-            device=str(args.device))
+            device=str(args.device), plot_instances=plot_instances,
+            plot_dir=args.plot_dir or "results/plots")
         result["backbone"] = args.model
         result["seed"] = args.seed
         result["ckpt"] = str(args.ckpt)
@@ -130,12 +145,15 @@ def main() -> None:
         print(f"Saved to {out_path}")
         return
 
-    env = CVRPEnv(generator_params=dict(num_loc=args.num_loc))
+    if args.problem == "ovrp":
+        env = OVRPEnv(generator_params=dict(num_loc=args.num_loc))
+    else:  # cvrp and vrptw use the CVRP decision/reward structure (constraint-agnostic)
+        env = CVRPEnv(generator_params=dict(num_loc=args.num_loc))
     model_cls = MODEL_CLASSES[args.model]
     model = model_cls.load_from_checkpoint(
         args.ckpt, env=env, map_location=args.device)
     model.to(args.device)
-    
+
     sa = getattr(getattr(model, "policy", None), "encoder", None)
     sa = getattr(sa, "slot_attn", None)
     if sa is not None:
@@ -164,17 +182,21 @@ def main() -> None:
         result = eval_utils.evaluate(model, args, env, ds)
     result["backbone"] = args.model
     result["num_loc"] = args.num_loc
+    result["problem"] = args.problem
     result["seed"] = args.seed
     result["ckpt"] = str(args.ckpt)
     result["data_path"] = (
         str(Path(args.data_path).resolve()) if args.data_path else None)
 
-    print(f"[OK] evaluated at num_loc={args.num_loc} customers  "
+    print(f"[OK] evaluated {args.problem} at num_loc={args.num_loc} customers  "
           f"n={result['n_inst']}  "
           f"mean tour = {result['mean_tour_length']:.4f} "
           f"(mean reward = {result['mean_reward']:.4f})  "
           f"inference = {result['elapsed_seconds']:.2f}s "
           f"({result['throughput_per_sec']:.0f} inst/s)")
+    if "feasible_frac" in result:
+        print(f"[TW] time-window feasibility = {result['feasible_frac']*100:.2f}% "
+              f"({result['n_feasible']}/{result['n_inst']})")
     if "mean_tour_length_local_search" in result:
         print(f"[LS] local-search refined mean tour = "
               f"{result['mean_tour_length_local_search']:.4f} "

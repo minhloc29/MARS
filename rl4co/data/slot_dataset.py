@@ -33,6 +33,11 @@ class SlotDataset(torch.utils.data.Dataset):
         self.depot = data["depot"]    # (N_inst, 2)
         self.demand = data["demand"]   # (N_inst, N)
         self.capacity = data.get("capacity", None)
+        # Optional problem-specific fields (VRPTW). Carried only when present
+        # so the model that ignores them (constraint-agnostic transfer) loads
+        # the same checkpoint as the CVRP one.
+        self.durations = data.get("durations", None)      # (N_inst, N+1)
+        self.time_windows = data.get("time_windows", None)  # (N_inst, N+1, 2)
         # d_ins cost-method tag stamped by the generator; None for legacy datasets.
         self.method: str | None = data.get("method", None)
 
@@ -52,6 +57,10 @@ class SlotDataset(torch.utils.data.Dataset):
             self.demand = self.demand[:max_instances]
             if self.capacity is not None:
                 self.capacity = self.capacity[:max_instances]
+            if self.durations is not None:
+                self.durations = self.durations[:max_instances]
+            if self.time_windows is not None:
+                self.time_windows = self.time_windows[:max_instances]
             if self.d_ins_idx is not None:
                 self.d_ins_idx = self.d_ins_idx[:max_instances]
             if self.d_ins_val is not None:
@@ -68,6 +77,10 @@ class SlotDataset(torch.utils.data.Dataset):
         }
         if self.capacity is not None:
             item["capacity"] = self.capacity[idx]   # (1,)
+        if self.durations is not None:
+            item["durations"] = self.durations[idx]        # (N+1,)
+        if self.time_windows is not None:
+            item["time_windows"] = self.time_windows[idx]  # (N+1, 2)
         if self.d_ins_idx is not None:
             item["d_ins_idx"] = self.d_ins_idx[idx]  # (N, k) int16
         if self.d_ins_val is not None:
