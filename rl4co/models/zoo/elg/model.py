@@ -27,6 +27,7 @@ class ELG(pl.LightningModule):
         distance_penalty: bool = True,
         logit_clipping: float = 50.0,
         xi: float = -1.0,
+        problem: str = "cvrp",
         optimizer_kwargs: dict | None = None,
     ):
         super().__init__()
@@ -48,7 +49,8 @@ class ELG(pl.LightningModule):
             self.policy.local_enabled = self.current_epoch >= self.hparams.warmup_epochs
 
     def training_step(self, batch, batch_idx):
-        out = rollout(self.policy, batch, self.hparams.pomo_size, "sampling")
+        problem = self.hparams.get("problem", "cvrp")
+        out = rollout(self.policy, batch, self.hparams.pomo_size, "sampling", problem=problem)
         reward, log_prob = out["reward"], out["log_prob"]
         advantage = reward - reward.mean(1, keepdim=True)
         objective = -(advantage.detach() * log_prob)
@@ -61,13 +63,15 @@ class ELG(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        out = rollout(self.policy, batch, self.hparams.pomo_size, "greedy", False)
+        problem = self.hparams.get("problem", "cvrp")
+        out = rollout(self.policy, batch, self.hparams.pomo_size, "greedy", False, problem=problem)
         reward = out["reward"].max(1).values
         self.log("val/reward", reward.mean(), on_epoch=True, prog_bar=True, batch_size=reward.size(0))
         return reward
 
     def test_step(self, batch, batch_idx):
-        out = rollout(self.policy, batch, self.hparams.pomo_size, "greedy", False)
+        problem = self.hparams.get("problem", "cvrp")
+        out = rollout(self.policy, batch, self.hparams.pomo_size, "greedy", False, problem=problem)
         reward = out["reward"].max(1).values
         self.log("test/reward", reward.mean(), batch_size=reward.size(0))
         return out

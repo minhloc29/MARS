@@ -12,6 +12,32 @@ from dataclasses import dataclass
 import torch
 
 
+def open_route_reward(coords: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    """Open (OVRP) route reward from ordered 3D coordinates and the encoded
+    action IDs that produced them.
+
+    ``coords`` is (B, W, T, 2) = the coordinate at each visit *after* the
+    initial depot, i.e. ``coords[..., k, :]`` is the node reached by action
+    ``actions[..., k]`` (0 = depot, 1..N = customers). The arc from the previous
+    visit into ``coords[..., k]`` belongs to an open route iff its destination
+    is a customer (``actions[..., k] != 0``); the final return-to-depot arc —
+    and any arc whose destination is the depot — is excluded. This mirrors
+    :meth:`rl4co.envs.routing.ovrp.env.OVRPEnv._get_reward`.
+
+    Args:
+        coords: (B, W, T, 2) coordinates of every visited node including the
+            depot visits recorded in ``actions``.
+        actions: (B, W, T) encoded actions (0 = depot, 1..N = customers).
+
+    Returns:
+        (B, W) negative open-route tour length, matching CVRP closed-tour sign
+        convention so shared POMO-style advantages/right uses it unchanged.
+    """
+    arc = (coords[:, :, 1:] - coords[:, :, :-1]).norm(dim=-1)          # (B, W, T-1)
+    dest_customer = (actions[:, :, 1:] != 0).to(arc.dtype)             # (B, W, T-1)
+    return -(arc * dest_customer).sum(-1)
+
+
 def normalize_batch(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     locs = batch["locs"].float()
     depot = batch["depot"].float()
@@ -110,19 +136,29 @@ class CVRPState:
         norm_demand = self.demand[:, None].expand(b, w, n1) / self.load.clamp_min(1e-7)[..., None]
         return cur_dist, theta, rel_xy, norm_demand
 
-    def reward(self) -> torch.Tensor:
+    def reward(self, problem: str = "cvrp") -> torch.Tensor:
         actions = torch.stack(self.actions, -1)
         b, w, steps = actions.shape
         coords = self.xy[:, None].expand(b, w, -1, 2).gather(
             2, actions[..., None].expand(b, w, steps, 2)
         )
+        if problem == "ovrp":
+            # Open routes: drop every arc whose destination is the depot, i.e.
+            # the final return-to-depot leg of each route and any re-anchoring
+            # depot visit. Same convention as OVRPEnv._get_reward.
+            return open_route_reward(coords, actions)
         # Rollout begins and ends at depot, so adjacent segments contain the
         # complete route cost and no cyclic shortcut is introduced.
         return -(coords[:, :, 1:] - coords[:, :, :-1]).norm(dim=-1).sum(-1)
 
 
-def rollout(policy, batch, width: int, decode_type: str, return_log_probs: bool = True):
-    """POMO-compatible rollout shared by ELG and DGL adapters."""
+def rollout(policy, batch, width: int, decode_type: str, return_log_probs: bool = True,
+            problem: str = "cvrp"):
+    """POMO-compatible rollout shared by ELG and DGL adapters.
+
+    ``problem`` selects the reward convention: "ovrp" uses open-route reward
+    (drop return-to-depot arcs), otherwise closed-tour CVRP reward.
+    """
     state = CVRPState.from_batch(batch, width=min(width, batch["locs"].size(1)))
     b, w = state.current.shape
     depot = torch.zeros(b, w, dtype=torch.long, device=state.xy.device)
@@ -151,6 +187,6 @@ def rollout(policy, batch, width: int, decode_type: str, return_log_probs: bool 
             )
         state.step(selected)
 
-    reward = state.reward()
+    reward = state.reward(problem=problem)
     log_prob = torch.stack(log_probs, -1).sum(-1) if log_probs else torch.zeros_like(reward)
     return {"reward": reward, "log_prob": log_prob, "actions": torch.stack(state.actions, -1)}

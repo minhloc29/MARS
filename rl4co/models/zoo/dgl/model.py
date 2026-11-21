@@ -9,7 +9,7 @@ from ..baseline_cvrp import CVRPState, rollout
 from .policy import DGLPolicy
 
 
-def _nearest_neighbor_labels(batch):
+def _nearest_neighbor_labels(batch, problem: str = "cvrp"):
 
     state = CVRPState.from_batch(batch)
     b = state.batch_size
@@ -21,7 +21,7 @@ def _nearest_neighbor_labels(batch):
         ).squeeze(1)
         selected = distance.masked_fill(mask[:, 0], float("inf")).argmin(-1, keepdim=True)
         state.step(selected)
-    return torch.stack(state.actions, -1)[:, 0], state.reward()[:, 0]
+    return torch.stack(state.actions, -1)[:, 0], state.reward(problem=problem)[:, 0]
 
 
 class DGL(pl.LightningModule):
@@ -37,6 +37,7 @@ class DGL(pl.LightningModule):
         pomo_size: int = 16,
         improve_every: int = 1,
         logit_clipping: float = 10.0,
+        problem: str = "cvrp",
         optimizer_kwargs: dict | None = None,
     ):
         super().__init__()
@@ -67,7 +68,8 @@ class DGL(pl.LightningModule):
         missing_rows = [i for i, key in enumerate(ids) if key not in self.solution_pool]
         if missing_rows:
             subset = {k: v[missing_rows] for k, v in batch.items() if k != "instance_id"}
-            actions, rewards = _nearest_neighbor_labels(subset)
+            problem = self.hparams.get("problem", "cvrp")
+            actions, rewards = _nearest_neighbor_labels(subset, problem=problem)
             for row, action, reward in zip(missing_rows, actions, rewards):
                 self.solution_pool[ids[row]] = action.detach().cpu().to(torch.int16)
                 self.solution_rewards[ids[row]] = float(reward)
@@ -98,7 +100,9 @@ class DGL(pl.LightningModule):
 
     @torch.no_grad()
     def _improve_pool(self, batch):
-        result = rollout(self.policy, batch, self.hparams.pomo_size, "greedy", False)
+        problem = self.hparams.get("problem", "cvrp")
+        result = rollout(self.policy, batch, self.hparams.pomo_size, "greedy", False,
+                         problem=problem)
         best_reward, best_idx = result["reward"].max(1)
         ids = batch["instance_id"].tolist()
         for row, key in enumerate(ids):
@@ -125,7 +129,9 @@ class DGL(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        result = rollout(self.policy, batch, self.hparams.pomo_size, "greedy", False)
+        problem = self.hparams.get("problem", "cvrp")
+        result = rollout(self.policy, batch, self.hparams.pomo_size, "greedy", False,
+                         problem=problem)
         reward = result["reward"].max(1).values
         self.log("val/reward", reward.mean(), on_epoch=True, prog_bar=True, batch_size=len(reward))
         return reward
@@ -143,7 +149,9 @@ class DGL(pl.LightningModule):
         self.solution_rewards = checkpoint.get("dgl_solution_rewards", {})
 
     def test_step(self, batch, batch_idx):
-        result = rollout(self.policy, batch, self.hparams.pomo_size, "greedy", False)
+        problem = self.hparams.get("problem", "cvrp")
+        result = rollout(self.policy, batch, self.hparams.pomo_size, "greedy", False,
+                         problem=problem)
         reward = result["reward"].max(1).values
         self.log("test/reward", reward.mean(), batch_size=len(reward))
         return result

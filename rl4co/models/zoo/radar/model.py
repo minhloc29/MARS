@@ -58,6 +58,7 @@ class RADAR(pl.LightningModule):
         sinkhorn_iters: int   = 10,
         pomo_size:      int   = 100,
         scale_norm:     bool  = False,
+        problem:        str   = "cvrp",
         optimizer_kwargs: dict | None = None,
     ):
         super().__init__()
@@ -91,6 +92,7 @@ class RADAR(pl.LightningModule):
             width=self.hparams.pomo_size,
             decode_type="sampling",
             return_log_probs=True,
+            problem=self.hparams.get("problem", "cvrp"),
         )
         reward, log_prob = out["reward"], out["log_prob"]
         # POMO REINFORCE: advantage over in-batch mean
@@ -117,6 +119,7 @@ class RADAR(pl.LightningModule):
             width=self.hparams.pomo_size,
             decode_type="greedy",
             return_log_probs=False,
+            problem=self.hparams.get("problem", "cvrp"),
         )
         reward = out["reward"].max(1).values
         self.log("val/reward", reward.mean(), on_epoch=True, prog_bar=True,
@@ -131,6 +134,7 @@ class RADAR(pl.LightningModule):
             width=self.hparams.pomo_size,
             decode_type="greedy",
             return_log_probs=False,
+            problem=self.hparams.get("problem", "cvrp"),
         )
         reward = out["reward"].max(1).values
         self.log("test/reward", reward.mean(), batch_size=reward.size(0))

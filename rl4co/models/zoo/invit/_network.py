@@ -223,6 +223,7 @@ class INViTPolicy(nn.Module):
         state_encoder_layers: int = 2,
         action_encoder_layers: int = 2,
         decoder_layers: int = 3,
+        problem: str = "cvrp",
     ):
         super().__init__()
         if not state_sizes or any(size < action_size for size in state_sizes):
@@ -234,6 +235,7 @@ class INViTPolicy(nn.Module):
         feedforward_dim = feedforward_dim or 4 * embed_dim
         self.action_size = action_size
         self.state_sizes = tuple(state_sizes)
+        self.problem = problem
         self.action_encoder = NestedViewEncoder(
             embed_dim, feedforward_dim, action_encoder_layers, num_heads
         )
@@ -414,7 +416,7 @@ class INViTPolicy(nn.Module):
 
         action_tensor = torch.stack(actions, dim=1)
         log_likelihood = torch.stack(log_probabilities, dim=1).sum(1)
-        reward = -route_length(nodes, depot, action_tensor)
+        reward = -route_length(nodes, depot, action_tensor, problem=self.problem)
         return {
             "reward": reward,
             "actions": action_tensor,
@@ -422,9 +424,20 @@ class INViTPolicy(nn.Module):
         }
 
 
-def route_length(nodes: torch.Tensor, depot: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-    """Compute closed CVRP route length for RL4CO-style 0=depot actions."""
+def route_length(nodes: torch.Tensor, depot: torch.Tensor, actions: torch.Tensor,
+                 problem: str = "cvrp") -> torch.Tensor:
+    """Compute CVRP/OVRP route length for RL4CO-style 0=depot actions."""
     coordinates = torch.cat((depot[:, None], nodes), dim=1)
     selected = coordinates.gather(1, actions[..., None].expand(-1, -1, 2))
     path = torch.cat((depot[:, None], selected, depot[:, None]), dim=1)
+    if problem == "ovrp":
+        # Open routes: exclude every arc whose destination is the depot, i.e.
+        # drop the trailing return-to-depot leg of each route. The path has T+1
+        # arcs (trailing synthetic depot added below); the last arc ends at the
+        # depot, so the destination mask is actions padded with a 0.
+        all_arcs = (path[:, 1:] - path[:, :-1]).norm(dim=-1)     # (B, T+1)
+        dest_customer = torch.cat(
+            [(actions != 0).to(all_arcs.dtype), torch.zeros_like(all_arcs[:, :1])], -1
+        )
+        return (all_arcs * dest_customer).sum(-1)
     return (path[:, 1:] - path[:, :-1]).norm(dim=-1).sum(1)

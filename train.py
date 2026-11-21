@@ -370,6 +370,7 @@ def train(
         model_kwargs = dict(
             env=env,
             embed_dim=embed_dim,
+            problem=problem,
             feedforward_dim=invit_feedforward_dim,
             num_heads=invit_num_heads,
             state_sizes=tuple(invit_state_sizes),
@@ -384,14 +385,16 @@ def train(
         )
     elif backbone == "dgl":
         model_kwargs = dict(
-            env=env, embed_dim=embed_dim, num_layers=dgl_num_layers,
+            env=env, embed_dim=embed_dim, problem=problem,
+            num_layers=dgl_num_layers,
             num_heads=dgl_num_heads, feedforward_dim=dgl_feedforward_dim,
             knn=dgl_knn, depot_knn=dgl_depot_knn, pomo_size=dgl_pomo_size,
             improve_every=dgl_improve_every, optimizer_kwargs={"lr": lr},
         )
     elif backbone == "elg":
         model_kwargs = dict(
-            env=env, embed_dim=embed_dim, num_layers=elg_num_layers,
+            env=env, embed_dim=embed_dim, problem=problem,
+            num_layers=elg_num_layers,
             num_heads=elg_num_heads, feedforward_dim=elg_feedforward_dim,
             local_size=elg_local_size, local_dim=elg_local_dim,
             local_heads=elg_local_heads, pomo_size=elg_pomo_size,
@@ -401,6 +404,7 @@ def train(
     elif backbone == "radar":
         model_kwargs = dict(
             env=env,
+            problem=problem,
             embed_dim=radar_embed_dim,
             encoder_layers=radar_encoder_layers,
             num_heads=radar_num_heads,

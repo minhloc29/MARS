@@ -26,6 +26,7 @@ class INViT(pl.LightningModule):
         baseline_tolerance: float = 1e-3,
         scheduler_gamma: float = 0.99,
         backprop_chunk_size: int = 16,
+        problem: str = "cvrp",
         optimizer_kwargs: dict | None = None,
     ):
         super().__init__()
@@ -43,6 +44,7 @@ class INViT(pl.LightningModule):
             state_encoder_layers=state_encoder_layers,
             action_encoder_layers=action_encoder_layers,
             decoder_layers=decoder_layers,
+            problem=problem,
         )
         self.baseline_policy = copy.deepcopy(self.policy).requires_grad_(False)
         self.baseline_policy.eval()
