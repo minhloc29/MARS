@@ -8,6 +8,8 @@ data_dir="${DATA_DIR:-${repo_dir}/data/slot_datasets_v2}"
 output_dir="${OUTPUT_DIR:-${repo_dir}/output_cross_geo_seed42}"
 device="${DEVICE:-0}"
 logger="${LOGGER:-csv}"
+batch_size="${BATCH_SIZE:-64}"
+epochs="${EPOCHS:-100}"
 
 cd "${repo_dir}"
 exec "${python_bin}" train.py \
@@ -20,8 +22,8 @@ exec "${python_bin}" train.py \
     --dist uniform \
     --n_train 100000 \
     --n_val 1000 \
-    --batch_size 64 \
-    --epochs 100 \
+    --batch_size "${batch_size}" \
+    --epochs "${epochs}" \
     --embed_dim 64 \
     --num_slots 8 \
     --lr 1e-4 \
@@ -35,4 +37,5 @@ exec "${python_bin}" train.py \
     --device "${device}" \
     --data_dir "${data_dir}" \
     --output "${output_dir}" \
-    --logger "${logger}"
+    --logger "${logger}" \
+    "$@"
