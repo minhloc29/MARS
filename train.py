@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 
@@ -62,6 +63,30 @@ MODEL_CLASSES = {
 
 
 BASELINE_BACKBONES = {"sil", "invit", "dgl", "elg", "radar"}
+CONFIG_DIR = REPO_ROOT / "configs" / "baselines"
+
+
+def load_baseline_config(backbone: str, config: str | None = None) -> dict:
+    """Load a baseline's hyperparameters from YAML.
+
+    Defaults live at ``configs/baselines/<backbone>.yaml``; ``--config <path>``
+    overrides for a per-run sweep. ``lehd``/``ttpl`` share `lehd.yaml`.
+    Returns an empty dict for LEGO slot backbones (no config needed).
+    """
+    if backbone not in BASELINE_BACKBONES and backbone not in ("lehd", "ttpl"):
+        return {}
+    name = "lehd" if backbone in ("lehd", "ttpl") else backbone
+    path = Path(config) if config else CONFIG_DIR / f"{name}.yaml"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Baseline config for '{backbone}' not found: {path}\n"
+            f"Place a YAML at {CONFIG_DIR / (name + '.yaml')} or pass --config <path>."
+        )
+    import yaml
+    with open(path) as f:
+        cfg = yaml.safe_load(f) or {}
+    print(f"Loaded {backbone} baseline config from {path}")
+    return cfg
 
 
 def _make_trainer(run_name: str, log_path: Path, epochs: int,
@@ -150,58 +175,13 @@ def train(
     logger: str = "csv",
     resume: str | None = None,
     num_workers: int = 4,
-    sil_repair_budget: int = 5,
-    sil_improve_every: int = 20,
-    sil_max_subtour_length: int = 64,
-    sil_num_layers: int = 6,
-    sil_parallel_reconstruction: bool = True,
-    sil_update_mode: str = "batch",
     generate_missing_data: bool = False,
     generation_chunk_size: int | None = None,
-    # ---- LEHD / TTPL baseline arguments ----
+    # ---- Baseline config (loaded from YAML, see load_baseline_config) ----
+    config: dict | None = None,
+    # Per-run LEHD data paths stay CLI flags (they're paths, not hyperparameters).
     lehd_data_path: str | None = None,
     lehd_val_data_path: str | None = None,
-    lehd_decoder_layers: int = 6,
-    invit_action_size: int = 15,
-    invit_state_sizes: tuple[int, ...] = (35, 50, 65),
-    invit_num_heads: int = 8,
-    invit_state_encoder_layers: int = 2,
-    invit_action_encoder_layers: int = 2,
-    invit_decoder_layers: int = 3,
-    invit_feedforward_dim: int | None = None,
-    invit_baseline_tolerance: float = 1e-3,
-    invit_scheduler_gamma: float = 0.99,
-    invit_backprop_chunk_size: int = 16,
-    # ---- DGL baseline arguments ----
-    dgl_knn: int = 100,
-    dgl_depot_knn: int = 100,
-    dgl_pomo_size: int = 16,
-    dgl_num_layers: int = 3,
-    dgl_num_heads: int = 8,
-    dgl_feedforward_dim: int | None = None,
-    dgl_improve_every: int = 1,
-    # ---- ELG baseline arguments ----
-    elg_pomo_size: int = 50,
-    elg_num_layers: int = 6,
-    elg_num_heads: int = 8,
-    elg_feedforward_dim: int | None = None,
-    elg_local_size: int = 40,
-    elg_local_dim: int = 32,
-    elg_local_heads: int = 4,
-    elg_mode: str = "joint",
-    elg_warmup_epochs: int = 0,
-    elg_scale_norm: bool = True,
-    # ---- RADAR baseline arguments ----
-    radar_embed_dim: int = 64,
-    radar_encoder_layers: int = 6,
-    radar_num_heads: int = 8,
-    radar_ff_dim: int = 256,
-    radar_ms_hidden_dim: int = 16,
-    radar_svd_rank: int = 10,
-    radar_logit_clipping: float = 10.0,
-    radar_sinkhorn_iters: int = 10,
-    radar_pomo_size: int = 100,
-    radar_scale_norm: bool = False,
 ):
     assert FULL_RL4CO, (
         "Full rl4co import failed. Ensure torchrl DLL is installed correctly "
@@ -229,7 +209,7 @@ def train(
             resume=resume,
             lehd_data_path=lehd_data_path,
             lehd_val_data_path=lehd_val_data_path,
-            lehd_decoder_layers=lehd_decoder_layers,
+            config=config,
         )
 
     pl.seed_everything(seed)
@@ -388,63 +368,35 @@ def train(
         )
     elif backbone == "sil":
         model_kwargs = dict(
-            env=env, embed_dim=embed_dim, num_layers=sil_num_layers,
-            repair_budget=sil_repair_budget, improve_every=sil_improve_every,
-            max_subtour_length=sil_max_subtour_length,
-            parallel_reconstruction=sil_parallel_reconstruction,
-            update_mode=sil_update_mode,
-            optimizer_kwargs={"lr": lr},
+            env=env, embed_dim=embed_dim,
+            optimizer_kwargs={"lr": lr}, **config,
         )
     elif backbone == "invit":
+        cfg = dict(config)  # state_sizes is a list in YAML; model expects tuple
+        cfg["state_sizes"] = tuple(cfg["state_sizes"])
         model_kwargs = dict(
             env=env,
             embed_dim=embed_dim,
             problem=problem,
-            feedforward_dim=invit_feedforward_dim,
-            num_heads=invit_num_heads,
-            state_sizes=tuple(invit_state_sizes),
-            action_size=invit_action_size,
-            state_encoder_layers=invit_state_encoder_layers,
-            action_encoder_layers=invit_action_encoder_layers,
-            decoder_layers=invit_decoder_layers,
-            baseline_tolerance=invit_baseline_tolerance,
-            scheduler_gamma=invit_scheduler_gamma,
-            backprop_chunk_size=invit_backprop_chunk_size,
             optimizer_kwargs={"lr": lr},
+            **cfg,
         )
     elif backbone == "dgl":
         model_kwargs = dict(
             env=env, embed_dim=embed_dim, problem=problem,
-            num_layers=dgl_num_layers,
-            num_heads=dgl_num_heads, feedforward_dim=dgl_feedforward_dim,
-            knn=dgl_knn, depot_knn=dgl_depot_knn, pomo_size=dgl_pomo_size,
-            improve_every=dgl_improve_every, optimizer_kwargs={"lr": lr},
+            optimizer_kwargs={"lr": lr}, **config,
         )
     elif backbone == "elg":
         model_kwargs = dict(
             env=env, embed_dim=embed_dim, problem=problem,
-            num_layers=elg_num_layers,
-            num_heads=elg_num_heads, feedforward_dim=elg_feedforward_dim,
-            local_size=elg_local_size, local_dim=elg_local_dim,
-            local_heads=elg_local_heads, pomo_size=elg_pomo_size,
-            mode=elg_mode, warmup_epochs=elg_warmup_epochs,
-            scale_norm=elg_scale_norm, optimizer_kwargs={"lr": lr},
+            optimizer_kwargs={"lr": lr}, **config,
         )
     elif backbone == "radar":
         model_kwargs = dict(
             env=env,
             problem=problem,
-            embed_dim=radar_embed_dim,
-            encoder_layers=radar_encoder_layers,
-            num_heads=radar_num_heads,
-            ff_dim=radar_ff_dim,
-            ms_hidden_dim=radar_ms_hidden_dim,
-            svd_rank=radar_svd_rank,
-            logit_clipping=radar_logit_clipping,
-            sinkhorn_iters=radar_sinkhorn_iters,
-            pomo_size=radar_pomo_size,
-            scale_norm=radar_scale_norm,
             optimizer_kwargs={"lr": lr},
+            **config,
         )
     elif backbone == "am":
         model_kwargs["baseline"] = baseline if baseline is not None else "shared"
@@ -464,32 +416,13 @@ def train(
         norm_tag = f"_n{int(normalize_target)}s{int(symmetrize_target)}"
 
     base_suffix = f"_bl{baseline}" if backbone == "am" and baseline else ""
-    if backbone == "sil":
-        run_name = (f"sil_N{num_loc}_{dist}_{ins_method}_seed{seed}_d{embed_dim}"
-                    f"_l{sil_num_layers}_r{sil_repair_budget}_i{sil_improve_every}"
-                    f"_s{sil_max_subtour_length}_u{sil_update_mode}"
-                    f"_prc{int(sil_parallel_reconstruction)}")
-    elif backbone == "invit":
-        state_tag = "-".join(map(str, invit_state_sizes))
-        run_name = (f"invit_N{num_loc}_{dist}_{ins_method}_seed{seed}_d{embed_dim}"
-                    f"_a{invit_action_size}_s{state_tag}_h{invit_num_heads}"
-                    f"_se{invit_state_encoder_layers}_ae{invit_action_encoder_layers}"
-                    f"_de{invit_decoder_layers}_c{invit_backprop_chunk_size}")
-    elif backbone == "dgl":
-        run_name = (f"dgl_N{num_loc}_{dist}_{ins_method}_seed{seed}_d{embed_dim}"
-                    f"_k{dgl_knn}-{dgl_depot_knn}_p{dgl_pomo_size}"
-                    f"_l{dgl_num_layers}_i{dgl_improve_every}")
-    elif backbone == "elg":
-        run_name = (f"elg_N{num_loc}_{dist}_{ins_method}_seed{seed}_d{embed_dim}"
-                    f"_p{elg_pomo_size}_l{elg_num_layers}_local{elg_local_size}"
-                    f"_{elg_mode}_w{elg_warmup_epochs}")
-    elif backbone == "radar":
-        run_name = (f"radar_N{num_loc}_{dist}_{ins_method}_seed{seed}"
-                    f"_d{radar_embed_dim}_l{radar_encoder_layers}"
-                    f"_h{radar_num_heads}_ff{radar_ff_dim}"
-                    f"_p{radar_pomo_size}_k{radar_svd_rank}"
-                    f"_ms{radar_ms_hidden_dim}_c{radar_logit_clipping:g}"
-                    f"_si{radar_sinkhorn_iters}_sn{int(radar_scale_norm)}")
+    if backbone in BASELINE_BACKBONES:
+        # Baseline run names carry a compact config digest so distinct
+        # hyperparameters (from YAML or --config) don't collide in output dirs.
+        cfg_digest = hashlib.sha256(
+            json.dumps(config, sort_keys=True).encode()).hexdigest()[:6]
+        run_name = (f"{backbone}_N{num_loc}_{dist}_{ins_method}_seed{seed}"
+                    f"_d{embed_dim}_c{cfg_digest}")
     elif disable_slots:
         run_name = f"{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
     else:
@@ -508,24 +441,9 @@ def train(
     print(f"Training {model_cls.__name__} | N={num_loc} | {dist}")
     print(
         f"  Epochs: {epochs}  Batch: {batch_size}  LR: {lr}")
-    if backbone == "sil":
-        print(f"  SIL: repair_budget={sil_repair_budget}, improve_every={sil_improve_every}, "
-              f"max_subtour_length={sil_max_subtour_length}, update_mode={sil_update_mode}, "
-              f"PRC={sil_parallel_reconstruction}")
-        print("  Slot/metric/entropy flags do not apply to SIL; ins_method selects the shared data folder.")
-    elif backbone == "dgl":
-        print(f"  DGL: knn={dgl_knn}, depot_knn={dgl_depot_knn}, pomo={dgl_pomo_size}, "
-              f"layers={dgl_num_layers}, improve_every={dgl_improve_every}")
-        print("  Slot/metric/entropy flags do not apply to DGL; ins_method selects the shared data folder.")
-    elif backbone == "elg":
-        print(f"  ELG: pomo={elg_pomo_size}, layers={elg_num_layers}, "
-              f"local_size={elg_local_size}, mode={elg_mode}, warmup={elg_warmup_epochs}")
-        print("  Slot/metric/entropy flags do not apply to ELG; ins_method selects the shared data folder.")
-    elif backbone == "radar":
-        print(f"  RADAR: embed={radar_embed_dim}, layers={radar_encoder_layers}, "
-              f"heads={radar_num_heads}, ff={radar_ff_dim}, pomo={radar_pomo_size}, "
-              f"svd_rank={radar_svd_rank}, sinkhorn_iters={radar_sinkhorn_iters}")
-        print("  Slot/metric/entropy flags do not apply to RADAR; ins_method selects the shared data folder.")
+    if backbone in BASELINE_BACKBONES:
+        print(f"  {backbone.upper()} config: {json.dumps(config, sort_keys=True)}")
+        print("  Slot/metric/entropy flags do not apply to baselines; ins_method selects the shared data folder.")
     else:
         print(
             f"  Slots: K={num_slots}  proj_dim={proj_dim}  iters={slot_iters}")
@@ -564,52 +482,18 @@ def train(
         "n_train": len(train_loader.dataset),
         "n_val": len(val_loader.dataset),
     }
-    if backbone == "sil":
-        result.update(normalize_target=None, symmetrize_target=None,
-                      sil_repair_budget=sil_repair_budget, sil_improve_every=sil_improve_every,
-                      sil_max_subtour_length=sil_max_subtour_length, sil_num_layers=sil_num_layers,
-                      sil_update_mode=sil_update_mode,
-                      sil_parallel_reconstruction=sil_parallel_reconstruction,
-                      dataset_signature=model.dataset_signature)
-    elif backbone == "invit":
-        result.update(
-            invit_action_size=invit_action_size,
-            invit_state_sizes=list(invit_state_sizes),
-            invit_num_heads=invit_num_heads,
-            invit_state_encoder_layers=invit_state_encoder_layers,
-            invit_action_encoder_layers=invit_action_encoder_layers,
-            invit_decoder_layers=invit_decoder_layers,
-            invit_feedforward_dim=invit_feedforward_dim or 4 * embed_dim,
-            invit_baseline_tolerance=invit_baseline_tolerance,
-            invit_scheduler_gamma=invit_scheduler_gamma,
-            invit_backprop_chunk_size=invit_backprop_chunk_size,
-        )
-    elif backbone == "dgl":
+    if backbone in BASELINE_BACKBONES:
+        # Record the config (prefixed by backbone) so ablation rows stay readable.
+        prefix = {"sil": "sil_", "invit": "invit_", "dgl": "dgl_",
+                  "elg": "elg_", "radar": "radar_"}[backbone]
+        cfg_view = dict(config)
+        if backbone == "invit" and "state_sizes" in cfg_view:
+            cfg_view["state_sizes"] = list(cfg_view["state_sizes"])
+        if backbone in ("dgl", "sil"):
+            cfg_view["dataset_signature"] = model.dataset_signature
         result.update(
             normalize_target=None, symmetrize_target=None,
-            dgl_knn=dgl_knn, dgl_depot_knn=dgl_depot_knn,
-            dgl_pomo_size=dgl_pomo_size, dgl_num_layers=dgl_num_layers,
-            dgl_num_heads=dgl_num_heads, dgl_feedforward_dim=dgl_feedforward_dim or 4 * embed_dim,
-            dgl_improve_every=dgl_improve_every,
-            dataset_signature=model.dataset_signature,
-        )
-    elif backbone == "elg":
-        result.update(
-            normalize_target=None, symmetrize_target=None,
-            elg_pomo_size=elg_pomo_size, elg_num_layers=elg_num_layers,
-            elg_num_heads=elg_num_heads, elg_feedforward_dim=elg_feedforward_dim or 4 * embed_dim,
-            elg_local_size=elg_local_size, elg_local_dim=elg_local_dim,
-            elg_local_heads=elg_local_heads, elg_mode=elg_mode,
-            elg_warmup_epochs=elg_warmup_epochs, elg_scale_norm=elg_scale_norm,
-        )
-    elif backbone == "radar":
-        result.update(
-            normalize_target=None, symmetrize_target=None,
-            radar_embed_dim=radar_embed_dim, radar_encoder_layers=radar_encoder_layers,
-            radar_num_heads=radar_num_heads, radar_ff_dim=radar_ff_dim,
-            radar_ms_hidden_dim=radar_ms_hidden_dim, radar_svd_rank=radar_svd_rank,
-            radar_logit_clipping=radar_logit_clipping, radar_sinkhorn_iters=radar_sinkhorn_iters,
-            radar_pomo_size=radar_pomo_size, radar_scale_norm=radar_scale_norm,
+            **{f"{prefix}{k}": v for k, v in cfg_view.items()},
         )
 
     # Dedup identical configs: rerun replaces, never appends a duplicate row.
@@ -625,21 +509,14 @@ def train(
     )}
     if problem != "cvrp":
         dedup_key["problem"] = problem
-    if backbone == "sil":
+    if backbone in BASELINE_BACKBONES:
+        prefix = {"sil": "sil_", "invit": "invit_", "dgl": "dgl_",
+                  "elg": "elg_", "radar": "radar_"}[backbone]
         dedup_key.update(
-            {k: v for k, v in result.items() if k.startswith("sil_")})
-        dedup_key.update({k: result[k] for k in (
-            "embed_dim", "batch_size", "dataset_signature")})
-    elif backbone == "invit":
-        dedup_key.update({k: v for k, v in result.items()
-                         if k.startswith("invit_")})
-    elif backbone == "dgl":
-        dedup_key.update({k: v for k, v in result.items() if k.startswith("dgl_")})
-        dedup_key.update({"dataset_signature": result["dataset_signature"]})
-    elif backbone == "elg":
-        dedup_key.update({k: v for k, v in result.items() if k.startswith("elg_")})
-    elif backbone == "radar":
-        dedup_key.update({k: v for k, v in result.items() if k.startswith("radar_")})
+            {k: v for k, v in result.items() if k.startswith(prefix)})
+        if backbone in ("dgl", "sil"):
+            dedup_key["dataset_signature"] = result["dataset_signature"]
+        dedup_key.update({"embed_dim": embed_dim, "batch_size": batch_size, "lr": lr})
     results = [r for r in results if not all(
         r.get(k) == v for k, v in dedup_key.items())]
     results.append(result)
@@ -682,7 +559,7 @@ def _train_lehd(
     resume: str | None,
     lehd_data_path: str | None,
     lehd_val_data_path: str | None,
-    lehd_decoder_layers: int,
+    config: dict,
 ) -> dict:
     """Train LEHD or TTPL backbone under the same Lightning Trainer as MARS."""
     import json
@@ -706,7 +583,7 @@ def _train_lehd(
         val_data_path=lehd_val_data_path,
         num_loc=num_loc,
         embed_dim=embed_dim,
-        decoder_layer_num=lehd_decoder_layers,
+        decoder_layer_num=config["decoder_layers"],
         n_train_episodes=n_train,
         n_val_episodes=n_val,
         optimizer_kwargs={"lr": lr},
@@ -722,7 +599,7 @@ def _train_lehd(
 
     run_name = (
         f"{backbone}_N{num_loc}_seed{seed}_d{embed_dim}"
-        f"_dec{lehd_decoder_layers}"
+        f"_dec{config['decoder_layers']}"
     )
     log_path = Path(output) / run_name
 
@@ -732,7 +609,7 @@ def _train_lehd(
     print(f"\n{'='*60}")
     print(f"Training {model_cls.__name__} | N={num_loc}")
     print(f"  Epochs: {epochs}  Batch: {batch_size}  LR: {lr}")
-    print(f"  embed_dim: {embed_dim}  decoder_layers: {lehd_decoder_layers}")
+    print(f"  embed_dim: {embed_dim}  decoder_layers: {config['decoder_layers']}")
     print(f"  n_train: {n_train}  n_val: {n_val}")
     print(f"  data: {lehd_data_path}")
     print(f"  Output: {log_path}")
@@ -749,7 +626,7 @@ def _train_lehd(
         "num_loc": num_loc,
         "seed": seed,
         "embed_dim": embed_dim,
-        "decoder_layers": lehd_decoder_layers,
+        "decoder_layers": config["decoder_layers"],
         "best_val_reward": best_reward,
         "elapsed_min": round(elapsed / 60, 1),
         "checkpoint": str(checkpoint_cb.best_model_path),
@@ -836,14 +713,6 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--generate_missing_data", action="store_true")
     parser.add_argument("--generation_chunk_size", type=int, default=None)
-    parser.add_argument("--sil_repair_budget", type=int, default=5)
-    parser.add_argument("--sil_improve_every", type=int, default=20)
-    parser.add_argument("--sil_max_subtour_length", type=int, default=64)
-    parser.add_argument("--sil_num_layers", type=int, default=6)
-    parser.add_argument("--sil_update_mode",
-                        choices=["batch", "node"], default="batch")
-    parser.add_argument(
-        "--sil_no_prc", dest="sil_parallel_reconstruction", action="store_false")
     parser.add_argument("--baseline", default=None)
     parser.add_argument("--disable_slots", action="store_true")
     parser.add_argument("--normalize_target",
@@ -858,55 +727,15 @@ def main():
     parser.add_argument("--resume", default=None)
     parser.add_argument("--lehd_data_path", default=None)
     parser.add_argument("--lehd_val_data_path", default=None)
-    parser.add_argument("--lehd_decoder_layers", type=int, default=6)
-    parser.add_argument("--invit_action_size", type=int, default=15)
-    parser.add_argument("--invit_state_sizes", type=int,
-                        nargs="+", default=[35, 50, 65])
-    parser.add_argument("--invit_num_heads", type=int, default=8)
-    parser.add_argument("--invit_state_encoder_layers", type=int, default=2)
-    parser.add_argument("--invit_action_encoder_layers", type=int, default=2)
-    parser.add_argument("--invit_decoder_layers", type=int, default=3)
-    parser.add_argument("--invit_feedforward_dim", type=int, default=None)
-    parser.add_argument("--invit_baseline_tolerance", type=float, default=1e-3)
-    parser.add_argument("--invit_scheduler_gamma", type=float, default=0.99)
-    parser.add_argument("--invit_backprop_chunk_size", type=int, default=16)
-    parser.add_argument("--dgl_knn", type=int, default=50)
-    parser.add_argument("--dgl_depot_knn", type=int, default=50)
-    parser.add_argument("--dgl_pomo_size", type=int, default=4)
-    parser.add_argument("--dgl_num_layers", type=int, default=3)
-    parser.add_argument("--dgl_num_heads", type=int, default=8)
-    parser.add_argument("--dgl_feedforward_dim", type=int, default=None)
-    parser.add_argument("--dgl_improve_every", type=int, default=1)
-    parser.add_argument("--elg_pomo_size", type=int, default=50)
-    parser.add_argument("--elg_num_layers", type=int, default=6)
-    parser.add_argument("--elg_num_heads", type=int, default=8)
-    parser.add_argument("--elg_feedforward_dim", type=int, default=None)
-    parser.add_argument("--elg_local_size", type=int, default=40)
-    parser.add_argument("--elg_local_dim", type=int, default=32)
-    parser.add_argument("--elg_local_heads", type=int, default=4)
-    parser.add_argument("--elg_mode", choices=["joint", "only_global", "only_local"], default="joint")
-    parser.add_argument("--elg_warmup_epochs", type=int, default=0)
-    parser.add_argument("--elg_no_scale_norm", dest="elg_scale_norm", action="store_false")
-    # ---- RADAR baseline arguments ----
-    parser.add_argument("--radar_embed_dim", type=int, default=64)
-    parser.add_argument("--radar_encoder_layers", type=int, default=6)
-    parser.add_argument("--radar_num_heads", type=int, default=8)
-    parser.add_argument("--radar_ff_dim", type=int, default=256)
-    parser.add_argument("--radar_ms_hidden_dim", type=int, default=16)
-    parser.add_argument("--radar_svd_rank", type=int, default=10)
-    parser.add_argument("--radar_logit_clipping", type=float, default=10.0)
-    parser.add_argument("--radar_sinkhorn_iters", type=int, default=10)
-    parser.add_argument("--radar_pomo_size", type=int, default=100)
     parser.add_argument(
-        "--radar_scale_norm", action="store_true",
-        help="Normalize RADAR's POMO advantage (off by default for fidelity)",
-    )
-    parser.add_argument(
-        "--radar_no_scale_norm", dest="radar_scale_norm", action="store_false",
-        help=argparse.SUPPRESS,
-    )
-    parser.set_defaults(radar_scale_norm=False)
+        "--config", default=None,
+        help="Path to a baseline hyperparameter YAML (defaults to "
+             "configs/baselines/<backbone>.yaml). For LEGO slot backbones "
+             "(pomo/am/l2r/icam) this is ignored.")
     args = parser.parse_args()
+
+    # Baseline hyperparameters come from YAML; LEGO backbones need no config.
+    config = load_baseline_config(args.backbone, args.config)
 
     train(
         num_loc=args.num_loc, dist=args.dist, problem=args.problem,
@@ -915,6 +744,7 @@ def main():
         n_train=args.n_train, n_val=args.n_val, epochs=args.epochs,
         batch_size=args.batch_size, lr=args.lr, max_instances=args.max_instances,
         backbone=args.backbone, embed_dim=args.embed_dim, num_slots=args.num_slots,
+        config=config,
         proj_dim=args.proj_dim, slot_iters=args.slot_iters,
         lambda_init=args.lambda_init, lr_dual=args.lr_dual,
         metric_variant=args.metric_variant, alpha_metric=args.alpha_metric,
@@ -926,54 +756,10 @@ def main():
         lower_neighbors_num=args.lower_neighbors_num,
         reduction_percentage=args.reduction_percentage, logger=args.logger,
         resume=args.resume, num_workers=args.num_workers,
-        sil_repair_budget=args.sil_repair_budget,
-        sil_improve_every=args.sil_improve_every,
-        sil_max_subtour_length=args.sil_max_subtour_length,
-        sil_num_layers=args.sil_num_layers,
-        sil_update_mode=args.sil_update_mode,
-        sil_parallel_reconstruction=args.sil_parallel_reconstruction,
         generate_missing_data=args.generate_missing_data,
         generation_chunk_size=args.generation_chunk_size,
         lehd_data_path=args.lehd_data_path,
         lehd_val_data_path=args.lehd_val_data_path,
-        lehd_decoder_layers=args.lehd_decoder_layers,
-        invit_action_size=args.invit_action_size,
-        invit_state_sizes=tuple(args.invit_state_sizes),
-        invit_num_heads=args.invit_num_heads,
-        invit_state_encoder_layers=args.invit_state_encoder_layers,
-        invit_action_encoder_layers=args.invit_action_encoder_layers,
-        invit_decoder_layers=args.invit_decoder_layers,
-        invit_feedforward_dim=args.invit_feedforward_dim,
-        invit_baseline_tolerance=args.invit_baseline_tolerance,
-        invit_scheduler_gamma=args.invit_scheduler_gamma,
-        invit_backprop_chunk_size=args.invit_backprop_chunk_size,
-        dgl_knn=args.dgl_knn,
-        dgl_depot_knn=args.dgl_depot_knn,
-        dgl_pomo_size=args.dgl_pomo_size,
-        dgl_num_layers=args.dgl_num_layers,
-        dgl_num_heads=args.dgl_num_heads,
-        dgl_feedforward_dim=args.dgl_feedforward_dim,
-        dgl_improve_every=args.dgl_improve_every,
-        elg_pomo_size=args.elg_pomo_size,
-        elg_num_layers=args.elg_num_layers,
-        elg_num_heads=args.elg_num_heads,
-        elg_feedforward_dim=args.elg_feedforward_dim,
-        elg_local_size=args.elg_local_size,
-        elg_local_dim=args.elg_local_dim,
-        elg_local_heads=args.elg_local_heads,
-        elg_mode=args.elg_mode,
-        elg_warmup_epochs=args.elg_warmup_epochs,
-        elg_scale_norm=args.elg_scale_norm,
-        radar_embed_dim=args.radar_embed_dim,
-        radar_encoder_layers=args.radar_encoder_layers,
-        radar_num_heads=args.radar_num_heads,
-        radar_ff_dim=args.radar_ff_dim,
-        radar_ms_hidden_dim=args.radar_ms_hidden_dim,
-        radar_svd_rank=args.radar_svd_rank,
-        radar_logit_clipping=args.radar_logit_clipping,
-        radar_sinkhorn_iters=args.radar_sinkhorn_iters,
-        radar_pomo_size=args.radar_pomo_size,
-        radar_scale_norm=args.radar_scale_norm,
     )
 
 
