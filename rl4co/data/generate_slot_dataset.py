@@ -161,8 +161,18 @@ def generate_split(
     seed: int = 0,
     match_scale: bool = False,
     cross_route_mode: str = "hard",
+    base: dict | None = None,
 ) -> dict[str, torch.Tensor | str]:
     """Generate one full split in memory-friendly chunks.
+
+    ``base`` (optional) supplies pre-sampled ``locs/depot/demand`` (and, for
+    vrptw, ``durations/time_windows``) to reuse across teachers, so only the
+    teacher-specific ``d_ins`` is recomputed — the expensive slice. When ``base``
+    is given the instances are *not* resampled, guaranteeing byte-identical
+    instances across teachers and skipping the redundant base generation/save.
+    ``base`` must be a dict with at least ``locs``, ``depot``, ``demand`` (and
+    ``time_windows``/``durations`` when ``problem == "vrptw"``); any prefix of
+    ``n_instances`` is reused (extra base rows are ignored).
 
     Returns dict: locs, depot, demand, capacity, d_ins_idx, d_ins_val,
                   format_version, method, teacher. For problem="vrptw" the returned
@@ -174,13 +184,21 @@ def generate_split(
     all_dins_idx, all_dins_val = [], []
     all_durs, all_tws = [], []
 
+    if base is not None:
+        n_instances = min(n_instances, base["locs"].shape[0])
+
     for start in range(0, n_instances, chunk_size):
         end = min(start + chunk_size, n_instances)
         bs = end - start
 
-        locs   = gen_fn(bs, n)              # (bs, N, 2)
-        depot  = torch.rand(bs, 2)          # (bs, 2) — CVRPEnv expects (B, 2)
-        demand = _gen_demands(bs, n)        # (bs, N) already normalized
+        if base is not None:
+            locs   = base["locs"][start:end]              # reuse identical instances
+            depot  = base["depot"][start:end]
+            demand = base["demand"][start:end]
+        else:
+            locs   = gen_fn(bs, n)              # (bs, N, 2)
+            depot  = torch.rand(bs, 2)          # (bs, 2) — CVRPEnv expects (B, 2)
+            demand = _gen_demands(bs, n)        # (bs, N) already normalized
 
         d_idx, d_val = _compute_sparse_d_ins(
             locs, depot, k_neighbors, method,
@@ -195,7 +213,10 @@ def generate_split(
         all_dins_val.append(d_val)
 
         if problem == "vrptw":
-            tw, durs = _gen_time_windows(locs, depot)          # (bs,N+1,2), (bs,N+1)
+            if base is not None and "time_windows" in base:
+                tw, durs = base["time_windows"][start:end], base["durations"][start:end]
+            else:
+                tw, durs = _gen_time_windows(locs, depot)          # (bs,N+1,2), (bs,N+1)
             all_durs.append(durs)
             all_tws.append(tw)
 
@@ -272,15 +293,43 @@ def generate_and_save(
         # 64 MB so the several live intermediates remain practical at N=1000.
         chunk_size = max(1, min(512, 16_000_000 // (n * n)))
 
-    out_dir = Path(out_dir) / teacher_subdir(method, teacher, match_scale, cross_route_mode)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
+    out_dir = Path(out_dir)
     prefix = f"{problem}{n}"
     splits = [("train", n_train), ("val", n_val), ("test", n_test)]
+
+    # Shared generic base: the ``nn`` teacher's instances (locs/depot/demand/
+    # capacity, + time_windows/durations for vrptw) are teacher-independent, so
+    # they're generated once and persisted as a base-only .pt in the ``nn``
+    # folder. Every non-nn teacher reuses those identical instances and only
+    # recomputes its d_ins slice (the expensive part) via ``generate_split(base=)``.
+    # Each teacher still writes a FULLY self-contained split .pt in its own
+    # folder, so the on-disk contract every consumer relies on is unchanged.
+    base_dir = out_dir / teacher_subdir(method, "nn", False, "hard")
+
+    # Load the shared base instances for a split (raises with a helpful message).
+    def _load_base(split: str) -> dict:
+        base_fpath = base_dir / f"{prefix}_{dist}_{split}.pt"
+        if not base_fpath.exists():
+            raise FileNotFoundError(
+                f"Shared base for {split} split not found: {base_fpath}.\n"
+                f"Generate the {method}/{problem}{n} base once first with "
+                f"'--teacher nn', so teachers {teacher!r} can reuse identical "
+                f"instances instead of resampling them."
+            )
+        data = torch.load(base_fpath, map_location="cpu", weights_only=False)
+        # Only the instance tensors are the reusable base; d_ins is teacher-specific.
+        keep = ["locs", "depot", "demand", "capacity"]
+        if problem == "vrptw":
+            keep += ["durations", "time_windows"]
+        return {k: data[k] for k in keep if k in data}
+
+    per_teacher_dir = out_dir / teacher_subdir(method, teacher, match_scale, cross_route_mode)
+    per_teacher_dir.mkdir(parents=True, exist_ok=True)
+
     for split_idx, (split, n_instances) in enumerate(splits):
         if n_instances == 0:
             continue
-        fpath = out_dir / f"{prefix}_{dist}_{split}.pt"
+        fpath = per_teacher_dir / f"{prefix}_{dist}_{split}.pt"
         if fpath.exists():
             print(f"  Skipping {fpath} (already exists).")
             continue
@@ -293,10 +342,35 @@ def generate_and_save(
             f"problem={problem}, N={n}, dist={dist}, chunk_size={chunk_size}, "
             f"teacher={teacher}"
         )
-        data = generate_split(
-            n_instances, n, dist, k_neighbors, method, chunk_size,
-            problem=problem, teacher=teacher, match_scale=match_scale,
-            cross_route_mode=cross_route_mode)
+        if teacher == "nn":
+            # Generate fresh instances and persist them. For nn, per_teacher_dir ==
+            # base_dir and fpath == the base path, so the bottom save writes the nn
+            # split straight into the canonical base folder; later teachers read
+            # only its instance tensors (locs/depot/demand/...) as the shared base.
+            data = generate_split(
+                n_instances, n, dist, k_neighbors, method, chunk_size,
+                problem=problem, teacher=teacher, match_scale=match_scale,
+                cross_route_mode=cross_route_mode)
+        else:
+            # Reuse the identical instances; recompute only the d_ins slice.
+            base_inst = _load_base(split)
+            if base_inst["locs"].shape[0] < n_instances:
+                raise ValueError(
+                    f"Base {split} has {base_inst['locs'].shape[0]} instances, "
+                    f"fewer than the requested {n_instances}. Regenerate the base "
+                    f"with --n_train/--n_val/--n_test at least this large."
+                )
+            data = generate_split(
+                n_instances, n, dist, k_neighbors, method, chunk_size,
+                problem=problem, teacher=teacher, match_scale=match_scale,
+                cross_route_mode=cross_route_mode,
+                base=base_inst)
+        # Stamp the same metadata train.py / eval scripts expect.
+        data["format_version"] = "sparse_v2"
+        data["method"] = method
+        data["teacher"] = teacher
+        data["match_scale"] = match_scale
+        data["problem"] = problem
         temporary = fpath.with_suffix(fpath.suffix + ".partial")
         torch.save(data, temporary)
         temporary.replace(fpath)
