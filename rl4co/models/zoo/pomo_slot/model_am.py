@@ -12,6 +12,7 @@ from rl4co.models.zoo.am import AttentionModel
 from rl4co.models.zoo.am import AttentionModelPolicy
 from rl4co.models.zoo.am.encoder import AttentionModelEncoder
 from rl4co.models.nn.slot_attention import SlotAttention
+from rl4co.models.nn.cross_attention_slots import CrossAttentionSlots
 from rl4co.data.insertion_cost import compute_sparse_insertion_cost
 from rl4co.models.nn.metric_loss import (
     MetricPreservationLoss,
@@ -67,6 +68,7 @@ class AMSlot(AttentionModel):
 
     # "E" excluded: future-regret target not yet implemented
     METRIC_VARIANTS = {"none", "B", "A", "C", "D"}
+    SLOT_MODULES = {"slot", "cross", "cross_iter"}
 
     def __init__(
         self,
@@ -86,10 +88,14 @@ class AMSlot(AttentionModel):
         disable_slots: bool = False,
         normalize_target: bool = True,
         symmetrize_target: bool = True,
+        slot_module: str = "slot",
         **am_kwargs,
     ) -> None:
         assert metric_variant in self.METRIC_VARIANTS, (
             f"metric_variant must be one of {self.METRIC_VARIANTS}, got '{metric_variant}'"
+        )
+        assert slot_module in self.SLOT_MODULES, (
+            f"slot_module must be one of {self.SLOT_MODULES}, got '{slot_module}'"
         )
 
         # Base encoder used directly when disable_slots (plain AM — no slots).
@@ -114,11 +120,29 @@ class AMSlot(AttentionModel):
             slot_attn = None
         else:
             # Wrap the base encoder with slot injection.
-            slot_attn = SlotAttention(
-                num_slots=num_slots,
-                dim=embed_dim,
-                iters=slot_iters,
-            )
+            if slot_module == "slot":
+                slot_attn = SlotAttention(
+                    num_slots=num_slots,
+                    dim=embed_dim,
+                    iters=slot_iters,
+                )
+            elif slot_module == "cross":
+                slot_attn = CrossAttentionSlots(
+                    num_slots=num_slots,
+                    dim=embed_dim,
+                    iters=1,
+                    iterative=False,
+                )
+            elif slot_module == "cross_iter":
+                slot_attn = CrossAttentionSlots(
+                    num_slots=num_slots,
+                    dim=embed_dim,
+                    iters=slot_iters,
+                    iterative=True,
+                )
+            else:
+                raise ValueError(f"Unknown slot_module: {slot_module}")
+
             slot_encoder = SlotInjectingEncoder(base_encoder, slot_attn)
             policy = AttentionModelPolicy(
                 encoder=slot_encoder,
@@ -147,6 +171,7 @@ class AMSlot(AttentionModel):
         self.disable_slots = disable_slots
         self.normalize_target = normalize_target
         self.symmetrize_target = symmetrize_target
+        self.slot_module = slot_module
 
         # Reference for display (lives inside policy.encoder)
         self.slot_attn = slot_attn

@@ -142,6 +142,7 @@ def train(
     baseline: str | None = None,
     disable_slots: bool = False,
     ins_method: str = "construction",
+    slot_module: str = "slot",
     teacher: str = "nn",
     match_scale: bool = False,
     cross_route_mode: str = "hard",
@@ -374,6 +375,8 @@ def train(
         ins_method=ins_method,
         optimizer_kwargs={"lr": lr},
     )
+    if backbone in ("pomo", "am"):
+        model_kwargs["slot_module"] = slot_module
 
     if backbone == "l2r":
         model_kwargs["lower_neighbors_num"] = lower_neighbors_num
@@ -493,7 +496,8 @@ def train(
     elif disable_slots:
         run_name = f"{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
     else:
-        run_name = (f"{backbone}_slot_{metric_variant}_K{num_slots}_N{num_loc}_{dist}_"
+        slot_prefix = "slot" if slot_module == "slot" else slot_module
+        run_name = (f"{backbone}_{slot_prefix}_{metric_variant}_K{num_slots}_N{num_loc}_{dist}_"
                     f"{ins_method}{norm_tag}_seed{seed}{base_suffix}")
     if problem != "cvrp":
         run_name = f"{run_name}_prob{problem}"
@@ -846,6 +850,10 @@ def main():
         "--sil_no_prc", dest="sil_parallel_reconstruction", action="store_false")
     parser.add_argument("--baseline", default=None)
     parser.add_argument("--disable_slots", action="store_true")
+    parser.add_argument("--slot_module", default="slot",
+                        choices=["slot", "cross", "cross_iter"],
+                        help="Slot aggregation module: slot (default SlotAttention), "
+                             "cross (single-pass CrossAttention), cross_iter (iterative CrossAttention).")
     parser.add_argument("--normalize_target",
                         action="store_true", default=True)
     parser.add_argument("--no_normalize_target",
@@ -921,6 +929,7 @@ def main():
         beta_entropy=args.beta_entropy, normalize_target=args.normalize_target,
         symmetrize_target=args.symmetrize_target, baseline=args.baseline,
         disable_slots=args.disable_slots, ins_method=args.ins_method,
+        slot_module=args.slot_module,
         teacher=args.teacher, match_scale=args.match_scale,
         cross_route_mode=args.cross_route_mode,
         lower_neighbors_num=args.lower_neighbors_num,

@@ -99,6 +99,9 @@ def main() -> None:
                     help="Override SlotAttention K at inference (pomo/am only).")
     parser.add_argument("--slot_iters", type=int, default=None,
                     help="Override SlotAttention iterations at inference.")
+    parser.add_argument("--slot_module", type=str, default=None,
+                    choices=["slot", "cross", "cross_iter"],
+                    help="Override slot module architecture at inference.")
     parser.add_argument("--k_neighbors", type=int, default=None)
     args = parser.parse_args()
 
@@ -140,8 +143,10 @@ def main() -> None:
     env = (OVRPEnv if args.problem == "ovrp" else CVRPEnv)(
         generator_params=dict(num_loc=args.num_loc))
     model_cls = MODEL_CLASSES[args.model]
-    model = model_cls.load_from_checkpoint(
-        args.ckpt, env=env, map_location=args.device)
+    load_kwargs = dict(env=env, map_location=args.device)
+    if args.slot_module is not None and args.model in ("pomo", "am"):
+        load_kwargs["slot_module"] = args.slot_module
+    model = model_cls.load_from_checkpoint(args.ckpt, **load_kwargs)
     model.to(args.device)
     
     sa = getattr(getattr(model, "policy", None), "encoder", None)
