@@ -110,8 +110,6 @@ class ICAMCVRP(pl.LightningModule):
         demand = batch["demand"].to(dtype=torch.float32)
         if demand.max() > 1:
             demand = demand / capacity
-        print(f"[debug] demand after _batch: min={demand.min().item():.4f} "
-            f"max={demand.max().item():.4f} mean={demand.mean().item():.4f}")  # ADD THIS
         depot = batch["depot"].to(dtype=torch.float32).unsqueeze(1)
         nodes = batch["locs"].to(dtype=torch.float32)
         return depot, nodes, demand
@@ -151,7 +149,18 @@ class ICAMCVRP(pl.LightningModule):
                 demand_all = torch.cat(
                     (torch.zeros(batch_size, 1, device=device), demand), dim=1)
                 mask[demand_all[:, None, :] > load[..., None]] = float("-inf")
+                # The depot is the only escape for a route whose remaining
+                # demand exceeds every open customer: allow it whenever the
+                # agent is NOT currently at the depot. (The mask at the depot
+                # stays 0, so a truly exhausted route falls through to the
+                # finished break below.)
                 mask[:, :, 0][current != 0] = 0
+                # A row that is at the depot with no feasible customer left
+                # would produce all--inf logits -> NaN softmax -> multinomial
+                # crash (CUDA device-side assert). Force it to the depot so the
+                # finished() recovery below ends the rollout cleanly.
+                deadlock = (mask == float("-inf")).all(-1)
+                mask[deadlock, 0] = 0
                 logits = self.policy.logits(
                     hidden, current, load, current_distance, mask, log_scale)
                 probs = torch.softmax(logits, dim=-1)

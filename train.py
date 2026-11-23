@@ -500,7 +500,9 @@ def main():
         from baselines.train_baseline import run as run_baseline
         from baselines.train_baseline import load_baseline_config
         config = load_baseline_config(args.backbone, None)
-        run_baseline(backbone=args.backbone, config=config, **vars(args))
+        args_dict = vars(args)
+        args_dict.pop("config", None)  # --config is a path; run() wants the loaded dict.
+        run_baseline(config=config, **args_dict)
         return
 
     train(
