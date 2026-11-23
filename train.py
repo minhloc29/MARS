@@ -299,6 +299,10 @@ def train(
     if backbone == "l2r":
         model_kwargs["lower_neighbors_num"] = lower_neighbors_num
         model_kwargs["reduction_percentage"] = reduction_percentage
+        # L2R's reward is closed-tour (cvrp) or open-route (ovrp); the env and
+        # its capacity/reduction logic are identical either way. Needs to be
+        # threaded explicitly because the shared model_kwargs block omits it.
+        model_kwargs["problem"] = problem
     elif backbone == "icam":
         model_kwargs = dict(
             env=env,

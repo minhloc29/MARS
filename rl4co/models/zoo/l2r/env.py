@@ -33,11 +33,13 @@ class StepState:
 
 
 class CandidateReductionCVRPEnv:
-    def __init__(self, *, device, problem_size, lower_neighbors_num, reduction_percentage):
+    def __init__(self, *, device, problem_size, lower_neighbors_num, reduction_percentage,
+                 problem: str = "cvrp"):
         self.device = device
         self.problem_size = problem_size
         self.lower_neighbors_num = lower_neighbors_num
         self.reduction_percentage = reduction_percentage
+        self.problem = problem
         self.round_error_epsilon = 1e-5
         self.reset_state = ResetState()
         self.step_state = StepState()
@@ -141,7 +143,17 @@ class CandidateReductionCVRPEnv:
     def _travel_distance(self):
         index = self.selected_node_list.unsqueeze(2).expand(-1, -1, 2)
         ordered = self.depot_node_xy.gather(1, index)
-        return ((ordered - ordered.roll(-1, dims=1)) ** 2).sum(2).sqrt().sum(1)
+        # Edge k spans selected_node_list[k] -> selected_node_list[k+1 mod T]
+        # (the last edge is the wrap-around closing arc).
+        edges = ((ordered - ordered.roll(-1, dims=1)) ** 2).sum(2).sqrt()  # (B, T)
+        if self.problem == "ovrp":
+            # Open routes: drop every arc whose destination is a depot (node 0),
+            # including mid-route returns and the final closing arc, matching the
+            # OVRPEnv._get_reward convention (open-route tour length).
+            dest_is_customer = (
+                self.selected_node_list.roll(-1, dims=1) != 0).to(edges.dtype)
+            edges = edges * dest_is_customer
+        return edges.sum(1)
 
     def get_upper_input(self):
         if self.current_node is None:

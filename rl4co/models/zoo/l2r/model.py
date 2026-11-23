@@ -23,9 +23,10 @@ class L2RModel(pl.LightningModule):
         **kwargs,
     ) -> None:
         super().__init__()
-        if problem != "cvrp":
+        if problem not in ("cvrp", "ovrp"):
             raise NotImplementedError(
-                "The L2R adapter currently supports --env cvrp only.")
+                "The L2R adapter currently supports problem in ('cvrp', 'ovrp') "
+                f"only; got {problem!r}.")
 
         self.problem = problem
         self.lower_neighbors_num = lower_neighbors_num
@@ -78,6 +79,7 @@ class L2RModel(pl.LightningModule):
             problem_size=dataset["node_xy"].shape[1],
             lower_neighbors_num=self.lower_neighbors_num,
             reduction_percentage=self.hparams.reduction_percentage,
+            problem=self.problem,
         )
         env.load_problems(dataset)
         reset_state, _, _ = env.reset()
