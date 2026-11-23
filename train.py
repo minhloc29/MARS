@@ -98,6 +98,7 @@ def _make_trainer(run_name: str, log_path: Path, epochs: int,
         monitor="val/reward",
         mode="max",
         save_top_k=1,
+        save_last=True,  # resume point for long runs
         filename="best-{epoch:03d}-{val/reward:.4f}",
     )
     early_stop_cb = EarlyStopping(

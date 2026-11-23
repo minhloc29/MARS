@@ -103,10 +103,13 @@ class TransformerEncoder(nn.Module):
 
 
 class NestedViewEncoder(nn.Module):
-    def __init__(self, embed_dim, feedforward_dim, layers, num_heads):
+    def __init__(self, embed_dim, feedforward_dim, layers, num_heads,
+                 node_extra_dim: int = 0, current_extra_dim: int = 0):
         super().__init__()
-        self.customer_embedding = nn.Linear(3, embed_dim)
-        self.current_embedding = nn.Linear(3, embed_dim)
+        # VRPTW adds per-customer [tw_start, tw_end] and a current-time feature
+        # (both normalized by the depot horizon); CVRP/OVRP keep the upstream dims.
+        self.customer_embedding = nn.Linear(3 + node_extra_dim, embed_dim)
+        self.current_embedding = nn.Linear(3 + current_extra_dim, embed_dim)
         self.depot_embedding = nn.Linear(2, embed_dim)
         self.encoder = TransformerEncoder(layers, embed_dim, num_heads, feedforward_dim)
 
@@ -119,6 +122,8 @@ class NestedViewEncoder(nn.Module):
         demands: torch.Tensor,
         remaining_capacity: torch.Tensor,
         mask: torch.Tensor,
+        node_extra: torch.Tensor | None = None,
+        current_extra: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, k = indices.shape
         gather_idx = indices[..., None].expand(-1, -1, 2)
@@ -130,6 +135,13 @@ class NestedViewEncoder(nn.Module):
         current_features = torch.cat(
             (coordinates[:, k : k + 1], remaining_capacity[:, None, None]), dim=-1
         )
+        if node_extra is not None:
+            extra = node_extra.gather(
+                1, indices[..., None].expand(-1, -1, node_extra.size(-1))
+            )
+            customer = torch.cat((customer, extra), dim=-1)
+        if current_extra is not None:
+            current_features = torch.cat((current_features, current_extra[:, None]), dim=-1)
         hidden = torch.cat(
             (
                 self.customer_embedding(customer),
@@ -224,6 +236,7 @@ class INViTPolicy(nn.Module):
         action_encoder_layers: int = 2,
         decoder_layers: int = 3,
         problem: str = "cvrp",
+        tw_travel_scale: float = 1.0,
     ):
         super().__init__()
         if not state_sizes or any(size < action_size for size in state_sizes):
@@ -236,11 +249,20 @@ class INViTPolicy(nn.Module):
         self.action_size = action_size
         self.state_sizes = tuple(state_sizes)
         self.problem = problem
+        # VRPTW: travel time = euclidean distance * tw_travel_scale. The default 1.0
+        # matches CVRPTWEnv (the env LEGO trains on), which uses raw [0,1] distances
+        # as travel time against the cached Solomon-frame windows.
+        self.tw_travel_scale = float(tw_travel_scale)
+        self.use_tw = problem == "vrptw"
+        node_extra_dim = 2 if self.use_tw else 0
+        current_extra_dim = 1 if self.use_tw else 0
         self.action_encoder = NestedViewEncoder(
-            embed_dim, feedforward_dim, action_encoder_layers, num_heads
+            embed_dim, feedforward_dim, action_encoder_layers, num_heads,
+            node_extra_dim, current_extra_dim,
         )
         self.state_encoders = nn.ModuleList(
-            NestedViewEncoder(embed_dim, feedforward_dim, state_encoder_layers, num_heads)
+            NestedViewEncoder(embed_dim, feedforward_dim, state_encoder_layers, num_heads,
+                              node_extra_dim, current_extra_dim)
             for _ in state_sizes
         )
         combined_dim = (len(state_sizes) + 1) * embed_dim
@@ -257,6 +279,27 @@ class INViTPolicy(nn.Module):
             return locs[:, 1:], locs[:, 0], demand
         return locs, td["depot"].float(), demand
 
+    def _tw_inputs(self, td, n: int):
+        """Customer time windows (B,N,2), service durations (B,N), horizon (B,)."""
+        if not self.use_tw:
+            return None
+        if "time_windows" not in td.keys():
+            raise KeyError("INViT problem='vrptw' needs 'time_windows' in the batch; "
+                           "regenerate the cache with --problem vrptw")
+        tw = td["time_windows"].float()
+        dur = td["durations"].float() if "durations" in td.keys() else torch.zeros_like(tw[..., 0])
+        if tw.size(1) == n + 1:          # depot first, as stored by generate_slot_dataset
+            horizon = tw[:, 0, 1]
+            return tw[:, 1:], dur[:, 1:], horizon
+        return tw, dur, tw[..., 1].amax(dim=1)
+
+    def _tw_feasible(self, nodes, current, current_time, tw_ctx):
+        """Customers whose service can still *start* before their window closes,
+        exactly the CVRPTWEnv rule ``t + d(cur, j) <= tw_end[j]``."""
+        tw, _, _ = tw_ctx
+        travel = (nodes - current).norm(dim=-1) * self.tw_travel_scale     # (B, N)
+        return current_time[:, None] + travel <= tw[..., 1] + 1e-6
+
     def _step_probabilities(
         self,
         nodes,
@@ -265,11 +308,27 @@ class INViTPolicy(nn.Module):
         current,
         current_index,
         used_capacity,
+        current_time=None,
+        tw_ctx=None,
     ):
         batch = nodes.size(0)
         unfinished = demands.gt(1e-6).any(dim=1)
         remaining_capacity = 1.0 - used_capacity
         feasible = demands.gt(1e-6) & demands.le(remaining_capacity[:, None] + 1e-6)
+        node_extra = current_extra = None
+        if tw_ctx is not None:
+            tw, _, horizon = tw_ctx
+            capacity_ok = feasible
+            feasible = capacity_ok & self._tw_feasible(nodes, current, current_time, tw_ctx)
+            # Safety valve: at the depot (time reset to 0) every customer should be
+            # reachable by construction; if one is not, fall back to capacity-only
+            # feasibility for that row so decoding cannot deadlock. Counted below.
+            at_depot = current_index.eq(nodes.size(1))
+            stuck = at_depot & unfinished & ~feasible.any(dim=1)
+            feasible = torch.where(stuck[:, None], capacity_ok, feasible)
+            self._tw_fallbacks = self._tw_fallbacks + stuck.sum()
+            node_extra = tw / horizon[:, None, None]
+            current_extra = (current_time / horizon)[:, None]
         action_indices, action_mask = _nearest_candidates(
             nodes, current, ~feasible, self.action_size
         )
@@ -290,6 +349,8 @@ class INViTPolicy(nn.Module):
             demands,
             remaining_capacity,
             action_mask,
+            node_extra,
+            current_extra,
         )
         query_parts = [
             action_hidden[:, self.action_size : self.action_size + 1],
@@ -313,6 +374,8 @@ class INViTPolicy(nn.Module):
                 demands,
                 remaining_capacity,
                 state_padding[:, :size],
+                node_extra,
+                current_extra,
             )
             query_parts.extend((hidden[:, size : size + 1], hidden[:, size + 1 : size + 2]))
             other_parts.append(
@@ -351,19 +414,49 @@ class INViTPolicy(nn.Module):
         )
         return demands, current, next_index, used_capacity
 
-    def replay_log_probabilities(self, td, actions):
-        """Yield teacher-forced log-probabilities without retaining a full tour graph."""
+    def _advance_time(self, previous, nodes, next_index, current_time, tw_ctx):
+        """CVRPTWEnv time update: t <- max(t + travel, tw_start) + service at a
+        customer, reset to 0 on a depot visit."""
+        if tw_ctx is None:
+            return current_time
+        tw, dur, _ = tw_ctx
+        batch, n, _ = nodes.shape
+        batch_index = torch.arange(batch, device=nodes.device)
+        customer = next_index.lt(n)
+        safe_index = next_index.clamp_max(n - 1)
+        target = nodes[batch_index, safe_index]
+        travel = (target - previous[:, 0]).norm(dim=-1) * self.tw_travel_scale
+        arrival = current_time + travel
+        # Count deadline violations (should stay 0 except on safety-valve rows).
+        late = customer & (arrival > tw[batch_index, safe_index, 1] + 1e-6)
+        self._tw_late = self._tw_late + late.sum()
+        start = torch.maximum(arrival, tw[batch_index, safe_index, 0])
+        return torch.where(customer, start + dur[batch_index, safe_index], 0.0)
+
+    def _init_state(self, td):
         nodes, depot, demands = self._inputs(td)
         demands = demands.clone()
         batch, n, _ = nodes.shape
+        tw_ctx = self._tw_inputs(td, n)
         current = depot[:, None]
         current_index = torch.full((batch,), n, dtype=torch.long, device=nodes.device)
         used_capacity = torch.zeros(batch, dtype=demands.dtype, device=nodes.device)
+        current_time = torch.zeros(batch, dtype=nodes.dtype, device=nodes.device)
+        self._tw_fallbacks = 0
+        self._tw_late = 0
+        return nodes, depot, demands, tw_ctx, current, current_index, used_capacity, current_time
+
+    def replay_log_probabilities(self, td, actions):
+        """Yield teacher-forced log-probabilities without retaining a full tour graph."""
+        (nodes, depot, demands, tw_ctx, current, current_index,
+         used_capacity, current_time) = self._init_state(td)
+        batch, n, _ = nodes.shape
         batch_index = torch.arange(batch, device=nodes.device)
 
         for target in actions.unbind(1):
             probabilities, action_indices, unfinished = self._step_probabilities(
-                nodes, depot, demands, current, current_index, used_capacity
+                nodes, depot, demands, current, current_index, used_capacity,
+                current_time, tw_ctx,
             )
             target_customer = target.gt(0)
             matches = action_indices.eq((target - 1).clamp_min(0)[:, None])
@@ -376,18 +469,17 @@ class INViTPolicy(nn.Module):
             chosen_probability = probabilities[batch_index, choice].clamp_min(1e-12)
             yield torch.where(unfinished, chosen_probability.log(), 0.0)
             next_index = torch.where(target_customer, target - 1, torch.full_like(target, n))
+            previous = current
             demands, current, current_index, used_capacity = self._advance(
                 nodes, depot, demands, used_capacity, next_index
             )
+            current_time = self._advance_time(previous, nodes, next_index, current_time, tw_ctx)
 
     def forward(self, td, env=None, phase="train", decode_type=None, **unused):
-        nodes, depot, demands = self._inputs(td)
-        demands = demands.clone()
+        (nodes, depot, demands, tw_ctx, current, current_index,
+         used_capacity, current_time) = self._init_state(td)
         batch, n, _ = nodes.shape
         greedy = decode_type == "greedy" or (decode_type is None and phase != "train")
-        current = depot[:, None]
-        current_index = torch.full((batch,), n, dtype=torch.long, device=nodes.device)
-        used_capacity = torch.zeros(batch, dtype=demands.dtype, device=nodes.device)
         batch_index = torch.arange(batch, device=nodes.device)
         actions, log_probabilities = [], []
 
@@ -396,7 +488,8 @@ class INViTPolicy(nn.Module):
             if not unfinished.any():
                 break
             probabilities, action_indices, unfinished = self._step_probabilities(
-                nodes, depot, demands, current, current_index, used_capacity
+                nodes, depot, demands, current, current_index, used_capacity,
+                current_time, tw_ctx,
             )
             choice = probabilities.argmax(1) if greedy else Categorical(probabilities).sample()
             chosen_probability = probabilities[batch_index, choice].clamp_min(1e-12)
@@ -408,9 +501,11 @@ class INViTPolicy(nn.Module):
             actions.append(torch.where(next_index.eq(n), 0, next_index + 1))
             log_probabilities.append(torch.where(unfinished, chosen_probability.log(), 0.0))
 
+            previous = current
             demands, current, current_index, used_capacity = self._advance(
                 nodes, depot, demands, used_capacity, next_index
             )
+            current_time = self._advance_time(previous, nodes, next_index, current_time, tw_ctx)
         else:
             raise RuntimeError("INViT decoding exceeded the CVRP 2N+1 step safety bound")
 
@@ -421,12 +516,14 @@ class INViTPolicy(nn.Module):
             "reward": reward,
             "actions": action_tensor,
             "log_likelihood": log_likelihood,
+            "tw_late": int(self._tw_late),
+            "tw_fallbacks": int(self._tw_fallbacks),
         }
 
 
 def route_length(nodes: torch.Tensor, depot: torch.Tensor, actions: torch.Tensor,
                  problem: str = "cvrp") -> torch.Tensor:
-    """Compute CVRP/OVRP route length for RL4CO-style 0=depot actions."""
+    """Compute CVRP/OVRP/VRPTW route length (VRPTW = closed CVRP tour) for RL4CO-style 0=depot actions."""
     coordinates = torch.cat((depot[:, None], nodes), dim=1)
     selected = coordinates.gather(1, actions[..., None].expand(-1, -1, 2))
     path = torch.cat((depot[:, None], selected, depot[:, None]), dim=1)

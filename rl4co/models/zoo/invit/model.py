@@ -27,6 +27,7 @@ class INViT(pl.LightningModule):
         scheduler_gamma: float = 0.99,
         backprop_chunk_size: int = 16,
         problem: str = "cvrp",
+        tw_travel_scale: float = 1.0,
         optimizer_kwargs: dict | None = None,
     ):
         super().__init__()
@@ -45,6 +46,7 @@ class INViT(pl.LightningModule):
             action_encoder_layers=action_encoder_layers,
             decoder_layers=decoder_layers,
             problem=problem,
+            tw_travel_scale=tw_travel_scale,
         )
         self.baseline_policy = copy.deepcopy(self.policy).requires_grad_(False)
         self.baseline_policy.eval()
@@ -125,6 +127,13 @@ class INViT(pl.LightningModule):
         self._student_reward_sum += student["reward"].detach().sum()
         self._baseline_reward_sum += baseline["reward"].detach().sum()
         self._validation_count += batch_size
+        if self.hparams.problem == "vrptw":
+            # Time-window deadline violations / deadlock fallbacks of the greedy
+            # student; both must stay 0 for a valid VRPTW result.
+            self.log("val/tw_late", float(student["tw_late"]), on_step=False,
+                     on_epoch=True, reduce_fx="sum", batch_size=batch_size)
+            self.log("val/tw_fallbacks", float(student["tw_fallbacks"]), on_step=False,
+                     on_epoch=True, reduce_fx="sum", batch_size=batch_size)
         self.log(
             "val/reward",
             student["reward"].mean(),
