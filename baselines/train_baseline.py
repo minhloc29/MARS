@@ -533,7 +533,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None):
     args = build_parser().parse_args(argv)
     config = load_baseline_config(args.backbone, args.config)
-    run(config=config, **vars(args))
+    args_dict = vars(args)
+    args_dict.pop("config", None)  # --config is a path; run() wants the loaded dict.
+    run(config=config, **args_dict)
 
 
 if __name__ == "__main__":
