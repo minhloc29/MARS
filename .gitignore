@@ -189,7 +189,6 @@ HGS-CVRP/
 logs_test/
 results/
 output/
-configs/
 train.log
 
 PLOT.png

@@ -1,0 +1,12 @@
+# ELG baseline hyperparameters (loaded when --backbone elg).
+# Keys mirror the legacy train.py elg_* flags with the prefix stripped.
+pomo_size: 50
+num_layers: 6
+num_heads: 8
+feedforward_dim: null
+local_size: 40
+local_dim: 32
+local_heads: 4
+mode: joint
+warmup_epochs: 0
+scale_norm: true

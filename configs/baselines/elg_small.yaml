@@ -1,0 +1,16 @@
+# ELG baseline, low-memory variant (loaded when --config configs/baselines/elg_small.yaml).
+# Same knobs as elg.yaml with the memory-heavy terms reduced:
+#   * pomo_size 50 -> 20  (2.5x fewer parallel POMO trajectories per batch)
+#   * num_layers 6  -> 4  (shallower encoder, smaller autograd graph per step)
+# Effective batch = batch_size * pomo_size, and the training graph spans every
+# decode step, so both shave peak CUDA memory roughly multiplicatively.
+pomo_size: 20
+num_layers: 4
+num_heads: 8
+feedforward_dim: null
+local_size: 40
+local_dim: 32
+local_heads: 4
+mode: joint
+warmup_epochs: 0
+scale_norm: true

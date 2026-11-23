@@ -1,0 +1,8 @@
+# SIL baseline hyperparameters (loaded when --backbone sil).
+# Keys mirror the legacy train.py sil_* flags with the prefix stripped.
+repair_budget: 5
+improve_every: 20
+max_subtour_length: 64
+num_layers: 6
+parallel_reconstruction: true
+update_mode: batch

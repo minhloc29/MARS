@@ -1,0 +1,10 @@
+# DGL baseline hyperparameters (loaded when --backbone dgl).
+# Keys mirror the legacy train.py dgl_* flags with the prefix stripped.
+# Values match the argparse CLI defaults.
+knn: 50
+depot_knn: 50
+pomo_size: 4
+num_layers: 3
+num_heads: 8
+feedforward_dim: null
+improve_every: 1

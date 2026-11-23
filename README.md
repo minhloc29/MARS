@@ -17,9 +17,10 @@ the **same cached instance splits**.
 - [Model](#model) — the slot-attention method and its ablation variants.
 - [Installation](#installation) — from source, using `uv`.
 - [Data](#data) — cached splits with sparse insertion costs (`d_ins`).
-- [Training](#training) — run `train.py` on any integrated backbone.
+- [Training](#training) — run `train.py` on a LEGO slot backbone.
 - [Evaluation](#evaluation) — decode a checkpoint with `test.py`.
 - [Baseline guides](#baseline-guides) — method-specific notes and fairness caveats.
+- [Running baselines](#running-baselines) — the separate baselines CLI.
 - [Layout](#layout) — where things live.
 
 
@@ -98,9 +99,11 @@ python train.py --backbone pomo --variant D --num_loc 100 --dist uniform \
 ```
 
 Choose the Attention-model start with `--backbone am`, or a no-slot baseline with
-`--backbone pomo --disable_slots`. Run any integrated baseline with its backbone key:
-`sil`, `invit`, `dgl`, `elg`, `radar`, `icam`, `l2r`, `lehd`, `ttpl`. OVRP and VRPTW
-reuse the CVRP embedding / objective and are selected with `--problem ovrp|vrptw`.
+`--backbone pomo --disable_slots`. `--backbone` accepts the LEGO slot backbones
+`pomo`, `am`, `l2r`, `icam`; the routing baselines (`sil`, `invit`, `dgl`, `elg`,
+`radar`, `lehd`, `ttpl`) train through a separate CLI that `train.py` dispatches to
+(see [Running baselines](#running-baselines)). OVRP and VRPTW reuse the CVRP
+embedding / objective and are selected with `--problem ovrp|vrptw`.
 
 Key flags (see `python train.py --help` for the full list):
 
@@ -210,7 +213,8 @@ when comparing each method against the slot approach.
 ## Layout
 
 ```
-train.py                 # unified training entry point for every backbone
+train.py                 # LEGO training entry point (pomo/am/l2r/icam)
+baselines/train_baseline.py  # routing baselines CLI (sil/invit/dgl/elg/radar/lehd/ttpl)
 test.py                  # checkpoint evaluation / decoding
 rl4co/data/              # dataset generation, slot dataset + loaders, insertion costs
 rl4co/envs/routing/      # environments (cvrp, ovrp, cvrptw, atsp, mtsp, ...)
@@ -219,6 +223,25 @@ rl4co/models/nn/         # shared layers: slot_attention, metric_loss, attention
 rl4co/models/rl/         # RL training loops: REINFORCE, PPO, A2C
 scripts/                 # data generation, evaluation, plotting helpers
 ```
+
+## Running baselines
+
+The routing baselines — `sil`, `invit`, `dgl`, `elg`, `radar` (slot-format data)
+and `lehd`, `ttpl` (external LEHD-format data) — train through
+`baselines/train_baseline.py`, keeping `train.py` focused on the LEGO slot
+backbones. It is also reachable via `train.py`:
+
+```bash
+python -m baselines.train_baseline --backbone dgl --num_loc 100 --device 0
+python train.py --backbone dgl --num_loc 100 --device 0   # thin dispatch, same thing
+```
+
+`--backbone` groups: `sil|invit|dgl|elg|radar` reuse the shared slot-format data
+(`variant=none`, no slots/aux) and load hyperparameters from
+`configs/baselines/<backbone>.yaml` (override with `--config <path>`). `lehd|ttpl`
+share `lehd.yaml`, require `--lehd_data_path` (LEHD-format `.txt`), and ignore the
+slot/ins labels. Run `python -m baselines.train_baseline --help` for the flags.
+
 
 
 ## Citation

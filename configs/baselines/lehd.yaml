@@ -1,0 +1,4 @@
+# LEHD / TTPL baseline hyperparameters (loaded when --backbone lehd or ttpl).
+# Keys mirror the legacy train.py lehd_* flags with the prefix stripped.
+# lehd_data_path / lehd_val_data_path stay CLI flags (per-run file paths).
+decoder_layers: 6

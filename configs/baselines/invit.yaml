@@ -1,0 +1,12 @@
+# INViT baseline hyperparameters (loaded when --backbone invit).
+# Keys mirror the legacy train.py invit_* flags with the prefix stripped.
+action_size: 15
+state_sizes: [35, 50, 65]
+num_heads: 8
+state_encoder_layers: 2
+action_encoder_layers: 2
+decoder_layers: 3
+feedforward_dim: null
+baseline_tolerance: 0.001
+scheduler_gamma: 0.99
+backprop_chunk_size: 16

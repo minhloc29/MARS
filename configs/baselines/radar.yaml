@@ -1,0 +1,12 @@
+# RADAR baseline hyperparameters (loaded when --backbone radar).
+# Keys mirror the legacy train.py radar_* flags with the prefix stripped.
+embed_dim: 64
+encoder_layers: 6
+num_heads: 8
+ff_dim: 256
+ms_hidden_dim: 16
+svd_rank: 10
+logit_clipping: 10.0
+sinkhorn_iters: 10
+pomo_size: 100
+scale_norm: false

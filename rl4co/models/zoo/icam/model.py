@@ -94,8 +94,10 @@ class ICAMCVRP(pl.LightningModule):
         **kwargs,
     ):
         super().__init__()
-        if problem != "cvrp":
-            raise NotImplementedError("ICAMCVRP currently supports CVRP only.")
+        if problem not in ("cvrp", "ovrp"):
+            raise NotImplementedError(
+                "ICAM currently supports CVRP and OVRP only.")
+        self.problem = problem
         self.num_starts = num_starts
         self.optimizer_kwargs = optimizer_kwargs or {"lr": 1e-4}
         self.policy = _ICAMPolicy(
@@ -177,11 +179,23 @@ class ICAMCVRP(pl.LightningModule):
             if bool(finished.all()):
                 break
 
-        route = torch.stack(selected, dim=-1)
+        route = torch.stack(selected, dim=-1)          # (B, P, T) node indices (0=depot)
         route_xy = all_xy[:, None].expand(-1, pomo_size, -1, -1).gather(
-            2, route[..., None].expand(-1, -1, -1, 2))
-        reward = -((route_xy - route_xy.roll(-1, dims=2))
-                   ** 2).sum(-1).sqrt().sum(-1)
+            2, route[..., None].expand(-1, -1, -1, 2))   # (B, P, T, 2)
+        if self.problem == "ovrp":
+            # Open routes (mirror OVRPEnv._get_reward): the recorded visit sequence
+            # already starts at the depot (step 0 forces node 0), so consecutive
+            # forward arcs from route_xy equal the env's [depot, node(a0), ...]
+            # layout with the leading depot->depot arc collapsed. Zero out every
+            # arc whose destination is the depot (return-to-depot).
+            edges = ((route_xy[:, :, :-1] - route_xy[:, :, 1:]) ** 2).sum(-1).sqrt()
+            dest_is_customer = (route[:, :, 1:] != 0).to(edges.dtype)
+            edges = edges * dest_is_customer
+        else:
+            # Closed tours: distance between consecutive visited nodes including
+            # the wrap-around closing arc (last -> first, which is the depot).
+            edges = (((route_xy - route_xy.roll(-1, dims=2)) ** 2).sum(-1)).sqrt()
+        reward = -edges.sum(-1)
         return reward, torch.stack(log_probs, dim=-1).sum(-1), route
 
     def training_step(self, batch, batch_idx):

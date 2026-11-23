@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import time
 
@@ -23,16 +22,9 @@ from rl4co.data.slot_dataset import make_dataloader
 
 try:
     from rl4co.envs import CVRPTWEnv, CVRPEnv, OVRPEnv
-    from rl4co.models.zoo.dgl import DGL
-    from rl4co.models.zoo.elg import ELG
     from rl4co.models.zoo.icam import ICAMCVRP
-    from rl4co.models.zoo.invit import INViT
     from rl4co.models.zoo.l2r import L2RModel
-    from rl4co.models.zoo.lehd import LEHDModel, TTRLModel
-    from rl4co.models.zoo.lehd.model import make_lehd_dataloaders
     from rl4co.models.zoo.pomo_slot import AMSlot, POMOSlot
-    from rl4co.models.zoo.radar import RADAR
-    from rl4co.models.zoo.sil import SIL
     FULL_RL4CO = True
 except Exception as e:
     raise RuntimeError(
@@ -52,41 +44,13 @@ MODEL_CLASSES = {
     "am": AMSlot,
     "l2r": L2RModel,
     "icam": ICAMCVRP,
-    "invit": INViT,
-    "dgl": DGL,
-    "elg": ELG,
-    "radar": RADAR,
-    "sil": SIL,
-    "lehd": LEHDModel,
-    "ttpl": TTRLModel,
 }
 
-
-BASELINE_BACKBONES = {"sil", "invit", "dgl", "elg", "radar"}
-CONFIG_DIR = REPO_ROOT / "configs" / "baselines"
-
-
-def load_baseline_config(backbone: str, config: str | None = None) -> dict:
-    """Load a baseline's hyperparameters from YAML.
-
-    Defaults live at ``configs/baselines/<backbone>.yaml``; ``--config <path>``
-    overrides for a per-run sweep. ``lehd``/``ttpl`` share `lehd.yaml`.
-    Returns an empty dict for LEGO slot backbones (no config needed).
-    """
-    if backbone not in BASELINE_BACKBONES and backbone not in ("lehd", "ttpl"):
-        return {}
-    name = "lehd" if backbone in ("lehd", "ttpl") else backbone
-    path = Path(config) if config else CONFIG_DIR / f"{name}.yaml"
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Baseline config for '{backbone}' not found: {path}\n"
-            f"Place a YAML at {CONFIG_DIR / (name + '.yaml')} or pass --config <path>."
-        )
-    import yaml
-    with open(path) as f:
-        cfg = yaml.safe_load(f) or {}
-    print(f"Loaded {backbone} baseline config from {path}")
-    return cfg
+# LEGO slot backbones trained directly in this module.
+LEGO_BACKBONES = set(MODEL_CLASSES)
+# Routing baselines living in baselines/train_baseline.py. main() dispatches them
+# there, so a baseline stays CLI-runnable via train.py too.
+BASELINE_BACKBONES = {"sil", "invit", "dgl", "elg", "radar", "lehd", "ttpl"}
 
 
 def _make_trainer(run_name: str, log_path: Path, epochs: int,
@@ -177,39 +141,17 @@ def train(
     num_workers: int = 4,
     generate_missing_data: bool = False,
     generation_chunk_size: int | None = None,
-    # ---- Baseline config (loaded from YAML, see load_baseline_config) ----
-    config: dict | None = None,
-    # Per-run LEHD data paths stay CLI flags (they're paths, not hyperparameters).
-    lehd_data_path: str | None = None,
-    lehd_val_data_path: str | None = None,
 ):
     assert FULL_RL4CO, (
         "Full rl4co import failed. Ensure torchrl DLL is installed correctly "
         "or run on a compatible machine."
     )
-
-    # ----------------------------------------------------------------
-    # LEHD / TTPL branch — separate training loop using LEHD's own data
-    # ----------------------------------------------------------------
-    if backbone in ("lehd", "ttpl"):
-        return _train_lehd(
-            backbone=backbone,
-            num_loc=num_loc,
-            output=output,
-            seed=seed,
-            device=device,
-            embed_dim=embed_dim,
-            epochs=epochs,
-            batch_size=batch_size,
-            lr=lr,
-            n_train=n_train,
-            n_val=n_val,
-            max_instances=max_instances,
-            logger=logger,
-            resume=resume,
-            lehd_data_path=lehd_data_path,
-            lehd_val_data_path=lehd_val_data_path,
-            config=config,
+    if backbone not in LEGO_BACKBONES:
+        raise ValueError(
+            f"--backbone {backbone!r} is a routing baseline, not a LEGO slot "
+            f"backbone. Run it with `python -m baselines.train_baseline "
+            f"--backbone {backbone}` (or `python train.py --backbone {backbone}`, "
+            f"which dispatches to it)."
         )
 
     pl.seed_everything(seed)
@@ -278,11 +220,10 @@ def train(
         )
 
     # Data
-    data_variant = "none" if backbone in BASELINE_BACKBONES else metric_variant
+    data_variant = metric_variant
     loader_kwargs = dict(seed=seed, num_workers=num_workers)
     train_loader = make_dataloader(train_path, batch_size, shuffle=True,
-                                   variant=data_variant, max_instances=n_train_eff,
-                                   include_instance_id=backbone in {"sil", "dgl"}, **loader_kwargs)
+                                   variant=data_variant, max_instances=n_train_eff, **loader_kwargs)
     val_loader = make_dataloader(val_path, batch_size, shuffle=False,
                                  variant=data_variant, max_instances=n_val_eff, **loader_kwargs)
     for loader in (train_loader, val_loader):
@@ -292,7 +233,7 @@ def train(
 
     # Validate d_ins cost method (Variant D consumes d_ins). The data was baked
     # with a specific method; refuse a mismatch so we never train on the wrong cost.
-    if metric_variant == "D" and backbone not in BASELINE_BACKBONES:
+    if metric_variant == "D":
         data_method = train_loader.dataset.method
         if data_method is not None and data_method != ins_method:
             raise RuntimeError(
@@ -311,7 +252,7 @@ def train(
     # Validate reference-tour teacher tag (Variant D consumes d_cons from a specific
     # teacher's order). A teacher mismatch silently trains on the wrong geometry, so
     # refuse it explicitly except for legacy data stamped before the teacher field.
-    if metric_variant == "D" and backbone not in BASELINE_BACKBONES:
+    if metric_variant == "D":
         data_teacher = getattr(train_loader.dataset, "teacher", None)
         if data_teacher is not None and data_teacher != teacher:
             raise RuntimeError(
@@ -363,51 +304,15 @@ def train(
             env=env,
             embed_dim=embed_dim,
             num_starts=num_loc,
-            problem="cvrp",
-            optimizer_kwargs={"lr": lr},
-        )
-    elif backbone == "sil":
-        model_kwargs = dict(
-            env=env, embed_dim=embed_dim,
-            optimizer_kwargs={"lr": lr}, **config,
-        )
-    elif backbone == "invit":
-        cfg = dict(config)  # state_sizes is a list in YAML; model expects tuple
-        cfg["state_sizes"] = tuple(cfg["state_sizes"])
-        model_kwargs = dict(
-            env=env,
-            embed_dim=embed_dim,
             problem=problem,
             optimizer_kwargs={"lr": lr},
-            **cfg,
-        )
-    elif backbone == "dgl":
-        model_kwargs = dict(
-            env=env, embed_dim=embed_dim, problem=problem,
-            optimizer_kwargs={"lr": lr}, **config,
-        )
-    elif backbone == "elg":
-        model_kwargs = dict(
-            env=env, embed_dim=embed_dim, problem=problem,
-            optimizer_kwargs={"lr": lr}, **config,
-        )
-    elif backbone == "radar":
-        model_kwargs = dict(
-            env=env,
-            problem=problem,
-            optimizer_kwargs={"lr": lr},
-            **config,
         )
     elif backbone == "am":
         model_kwargs["baseline"] = baseline if baseline is not None else "shared"
     # disable_slots: run backbone as a true no-slot baseline (no slot/aux).
-    if disable_slots and backbone not in BASELINE_BACKBONES:
+    if disable_slots:
         model_kwargs["disable_slots"] = True
     model = model_cls(**model_kwargs)
-    if backbone == "sil":
-        model.dataset_signature = train_loader.dataset.signature()
-    elif backbone == "dgl":
-        model.dataset_signature = train_loader.dataset.signature()
 
     # run_name uniquely IDs the run (backbone, variant, K, N, dist, seed, ins_method,
     # and — for Variant D — the normalize/symmetrize target-aggregation flags).
@@ -416,14 +321,7 @@ def train(
         norm_tag = f"_n{int(normalize_target)}s{int(symmetrize_target)}"
 
     base_suffix = f"_bl{baseline}" if backbone == "am" and baseline else ""
-    if backbone in BASELINE_BACKBONES:
-        # Baseline run names carry a compact config digest so distinct
-        # hyperparameters (from YAML or --config) don't collide in output dirs.
-        cfg_digest = hashlib.sha256(
-            json.dumps(config, sort_keys=True).encode()).hexdigest()[:6]
-        run_name = (f"{backbone}_N{num_loc}_{dist}_{ins_method}_seed{seed}"
-                    f"_d{embed_dim}_c{cfg_digest}")
-    elif disable_slots:
+    if disable_slots:
         run_name = f"{backbone}_noslot_N{num_loc}_{dist}_seed{seed}{base_suffix}"
     else:
         run_name = (f"{backbone}_slot_{metric_variant}_K{num_slots}_N{num_loc}_{dist}_"
@@ -433,20 +331,15 @@ def train(
     log_path = Path(output) / run_name
 
     trainer, checkpoint_cb, _ = _make_trainer(
-        run_name, log_path, epochs, device, logger,
-        gradient_clip_val=None if backbone in BASELINE_BACKBONES else 1.0,
+        run_name, log_path, epochs, device, logger, gradient_clip_val=1.0,
     )
 
     print(f"\n{'='*60}")
     print(f"Training {model_cls.__name__} | N={num_loc} | {dist}")
     print(
         f"  Epochs: {epochs}  Batch: {batch_size}  LR: {lr}")
-    if backbone in BASELINE_BACKBONES:
-        print(f"  {backbone.upper()} config: {json.dumps(config, sort_keys=True)}")
-        print("  Slot/metric/entropy flags do not apply to baselines; ins_method selects the shared data folder.")
-    else:
-        print(
-            f"  Slots: K={num_slots}  proj_dim={proj_dim}  iters={slot_iters}")
+    print(
+        f"  Slots: K={num_slots}  proj_dim={proj_dim}  iters={slot_iters}")
     print(f"  ins_method: {ins_method}")
     print(f"  Output: {log_path}")
     print(f"{'='*60}\n")
@@ -459,8 +352,8 @@ def train(
     ) if checkpoint_cb.best_model_score else None
     result = {
         "backbone": backbone,
-        "metric_variant": None if backbone in BASELINE_BACKBONES else metric_variant,
-        "num_slots": None if backbone in BASELINE_BACKBONES else num_slots,
+        "metric_variant": metric_variant,
+        "num_slots": num_slots,
         "num_loc": num_loc,
         "dist": dist,
         "problem": problem,
@@ -482,19 +375,6 @@ def train(
         "n_train": len(train_loader.dataset),
         "n_val": len(val_loader.dataset),
     }
-    if backbone in BASELINE_BACKBONES:
-        # Record the config (prefixed by backbone) so ablation rows stay readable.
-        prefix = {"sil": "sil_", "invit": "invit_", "dgl": "dgl_",
-                  "elg": "elg_", "radar": "radar_"}[backbone]
-        cfg_view = dict(config)
-        if backbone == "invit" and "state_sizes" in cfg_view:
-            cfg_view["state_sizes"] = list(cfg_view["state_sizes"])
-        if backbone in ("dgl", "sil"):
-            cfg_view["dataset_signature"] = model.dataset_signature
-        result.update(
-            normalize_target=None, symmetrize_target=None,
-            **{f"{prefix}{k}": v for k, v in cfg_view.items()},
-        )
 
     # Dedup identical configs: rerun replaces, never appends a duplicate row.
     result_dir = Path(output)
@@ -509,14 +389,6 @@ def train(
     )}
     if problem != "cvrp":
         dedup_key["problem"] = problem
-    if backbone in BASELINE_BACKBONES:
-        prefix = {"sil": "sil_", "invit": "invit_", "dgl": "dgl_",
-                  "elg": "elg_", "radar": "radar_"}[backbone]
-        dedup_key.update(
-            {k: v for k, v in result.items() if k.startswith(prefix)})
-        if backbone in ("dgl", "sil"):
-            dedup_key["dataset_signature"] = result["dataset_signature"]
-        dedup_key.update({"embed_dim": embed_dim, "batch_size": batch_size, "lr": lr})
     results = [r for r in results if not all(
         r.get(k) == v for k, v in dedup_key.items())]
     results.append(result)
@@ -537,118 +409,6 @@ def train(
             w.writerow(result)
     except Exception as _e:  # never crash training on logging failure
         print(f"[WARN] could not write teacher_ablation.csv: {_e}")
-
-    print(f"\nDone. Best val reward: {best_reward} | {elapsed/60:.1f} min")
-    return result
-
-
-def _train_lehd(
-    backbone: str,
-    num_loc: int,
-    output: str,
-    seed: int,
-    device: int | list[int],
-    embed_dim: int,
-    epochs: int,
-    batch_size: int,
-    lr: float,
-    n_train: int,
-    n_val: int,
-    max_instances: int | None,
-    logger: str,
-    resume: str | None,
-    lehd_data_path: str | None,
-    lehd_val_data_path: str | None,
-    config: dict,
-) -> dict:
-    """Train LEHD or TTPL backbone under the same Lightning Trainer as MARS."""
-    import json
-
-    if lehd_data_path is None:
-        raise ValueError(
-            "--backbone lehd/ttpl requires --lehd_data_path pointing to a "
-            "LEHD-format .txt training file "
-            "(e.g. vrp1000_hgs_train_100w.txt from the LEHD Google Drive)."
-        )
-
-    pl.seed_everything(seed)
-
-    if max_instances is not None:
-        n_train = min(n_train, max_instances)
-        n_val = min(n_val, max(1, max_instances // 10))
-
-    model_cls = MODEL_CLASSES[backbone]  # LEHDModel or TTRLModel
-    model = model_cls(
-        data_path=lehd_data_path,
-        val_data_path=lehd_val_data_path,
-        num_loc=num_loc,
-        embed_dim=embed_dim,
-        decoder_layer_num=config["decoder_layers"],
-        n_train_episodes=n_train,
-        n_val_episodes=n_val,
-        optimizer_kwargs={"lr": lr},
-    )
-
-    train_loader, val_loader = make_lehd_dataloaders(
-        n_train=n_train,
-        n_val=n_val,
-        batch_size=batch_size,
-        seed=seed,
-        num_workers=0,  # data lives inside the model; no worker overhead needed
-    )
-
-    run_name = (
-        f"{backbone}_N{num_loc}_seed{seed}_d{embed_dim}"
-        f"_dec{config['decoder_layers']}"
-    )
-    log_path = Path(output) / run_name
-
-    trainer, checkpoint_cb, _ = _make_trainer(
-        run_name, log_path, epochs, device, logger, gradient_clip_val=None)
-
-    print(f"\n{'='*60}")
-    print(f"Training {model_cls.__name__} | N={num_loc}")
-    print(f"  Epochs: {epochs}  Batch: {batch_size}  LR: {lr}")
-    print(f"  embed_dim: {embed_dim}  decoder_layers: {config['decoder_layers']}")
-    print(f"  n_train: {n_train}  n_val: {n_val}")
-    print(f"  data: {lehd_data_path}")
-    print(f"  Output: {log_path}")
-    print(f"{'='*60}\n")
-
-    t0 = time.time()
-    trainer.fit(model, train_loader, val_loader, ckpt_path=resume)
-    elapsed = time.time() - t0
-
-    best_reward = checkpoint_cb.best_model_score.item(
-    ) if checkpoint_cb.best_model_score else None
-    result = {
-        "backbone": backbone,
-        "num_loc": num_loc,
-        "seed": seed,
-        "embed_dim": embed_dim,
-        "decoder_layers": config["decoder_layers"],
-        "best_val_reward": best_reward,
-        "elapsed_min": round(elapsed / 60, 1),
-        "checkpoint": str(checkpoint_cb.best_model_path),
-        "batch_size": batch_size,
-        "lr": lr,
-        "n_train": n_train,
-        "n_val": n_val,
-        "lehd_data_path": lehd_data_path,
-        "lehd_val_data_path": lehd_val_data_path,
-    }
-
-    result_dir = Path(output)
-    result_dir.mkdir(parents=True, exist_ok=True)
-    result_file = result_dir / f"ablation_N{num_loc}.json"
-    results = json.loads(result_file.read_text()
-                         ) if result_file.exists() else []
-    dedup_key = {k: result[k]
-                 for k in ("backbone", "num_loc", "seed", "embed_dim")}
-    results = [r for r in results if not all(
-        r.get(k) == v for k, v in dedup_key.items())]
-    results.append(result)
-    result_file.write_text(json.dumps(results, indent=2))
 
     print(f"\nDone. Best val reward: {best_reward} | {elapsed/60:.1f} min")
     return result
@@ -680,7 +440,11 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max_instances", type=int, default=None)
     parser.add_argument("--backbone", default="pomo",
-                        choices=["pomo", "am", "l2r", "icam", "sil", "invit", "dgl", "elg", "radar", "lehd", "ttpl"])
+                        choices=sorted(LEGO_BACKBONES | BASELINE_BACKBONES),
+                        help="LEGO slot backbones: " + ", ".join(sorted(LEGO_BACKBONES)) +
+                             ". Routing baselines (" +
+                             ", ".join(sorted(BASELINE_BACKBONES)) +
+                             ") train via the baselines CLI (dispatched here).")
     parser.add_argument("--embed_dim", type=int, default=128)
     parser.add_argument("--num_slots", type=int, default=8)
     parser.add_argument("--proj_dim", type=int, default=64)
@@ -725,17 +489,19 @@ def main():
                         dest="symmetrize_target", action="store_false")
     parser.add_argument("--logger", default="csv", choices=["csv", "wandb"])
     parser.add_argument("--resume", default=None)
+    # LEHD/TTPL baselines need their external data path (ignored for other backbones).
     parser.add_argument("--lehd_data_path", default=None)
     parser.add_argument("--lehd_val_data_path", default=None)
-    parser.add_argument(
-        "--config", default=None,
-        help="Path to a baseline hyperparameter YAML (defaults to "
-             "configs/baselines/<backbone>.yaml). For LEGO slot backbones "
-             "(pomo/am/l2r/icam) this is ignored.")
     args = parser.parse_args()
 
-    # Baseline hyperparameters come from YAML; LEGO backbones need no config.
-    config = load_baseline_config(args.backbone, args.config)
+    if args.backbone in BASELINE_BACKBONES:
+        # Routing baselines train in baselines/train_baseline.py; dispatch there so
+        # they remain CLI-runnable through train.py without living in this file.
+        from baselines.train_baseline import run as run_baseline
+        from baselines.train_baseline import load_baseline_config
+        config = load_baseline_config(args.backbone, None)
+        run_baseline(backbone=args.backbone, config=config, **vars(args))
+        return
 
     train(
         num_loc=args.num_loc, dist=args.dist, problem=args.problem,
@@ -744,7 +510,6 @@ def main():
         n_train=args.n_train, n_val=args.n_val, epochs=args.epochs,
         batch_size=args.batch_size, lr=args.lr, max_instances=args.max_instances,
         backbone=args.backbone, embed_dim=args.embed_dim, num_slots=args.num_slots,
-        config=config,
         proj_dim=args.proj_dim, slot_iters=args.slot_iters,
         lambda_init=args.lambda_init, lr_dual=args.lr_dual,
         metric_variant=args.metric_variant, alpha_metric=args.alpha_metric,
@@ -758,8 +523,6 @@ def main():
         resume=args.resume, num_workers=args.num_workers,
         generate_missing_data=args.generate_missing_data,
         generation_chunk_size=args.generation_chunk_size,
-        lehd_data_path=args.lehd_data_path,
-        lehd_val_data_path=args.lehd_val_data_path,
     )
 
 
