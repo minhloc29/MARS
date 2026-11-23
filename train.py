@@ -420,8 +420,11 @@ def train(
     if backbone in BASELINE_BACKBONES:
         # Baseline run names carry a compact config digest so distinct
         # hyperparameters (from YAML or --config) don't collide in output dirs.
+        # Memory-only knobs (exact gradient accumulation) don't change the
+        # experiment, so they are left out and a run can resume after changing them.
+        digest_cfg = {k: v for k, v in config.items() if k not in ("micro_batch_size",)}
         cfg_digest = hashlib.sha256(
-            json.dumps(config, sort_keys=True).encode()).hexdigest()[:6]
+            json.dumps(digest_cfg, sort_keys=True).encode()).hexdigest()[:6]
         run_name = (f"{backbone}_N{num_loc}_{dist}_{ins_method}_seed{seed}"
                     f"_d{embed_dim}_c{cfg_digest}")
     elif disable_slots:
