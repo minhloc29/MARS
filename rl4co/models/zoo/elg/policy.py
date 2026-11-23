@@ -32,13 +32,16 @@ class _EncoderLayer(nn.Module):
 
 
 class _LocalPolicy(nn.Module):
-    def __init__(self, hidden_dim: int, heads: int, local_size: int):
+    def __init__(self, hidden_dim: int, heads: int, local_size: int, use_tw: bool = False):
         super().__init__()
         if hidden_dim % heads:
             raise ValueError("elg_local_dim must be divisible by elg_local_heads")
         self.hidden_dim = hidden_dim
         self.local_size = local_size
-        self.input = nn.Linear(3, hidden_dim)
+        self.use_tw = use_tw
+        # VRPTW adds (tw_start - t)/H and (tw_end - t)/H for each local neighbour.
+        self.in_dim = 5 if use_tw else 3
+        self.input = nn.Linear(self.in_dim, hidden_dim)
         self.query = nn.Parameter(torch.empty(hidden_dim))
         nn.init.uniform_(self.query, -1, 1)
         self.attn = nn.MultiheadAttention(hidden_dim, heads, batch_first=True, bias=False)
@@ -61,8 +64,15 @@ class _LocalPolicy(nn.Module):
         demand = norm_demand.gather(-1, idx)
         finite_distance = distance.masked_fill(~valid, 0)
         scale = finite_distance.amax(-1, keepdim=True).clamp_min(1e-6)
-        local_input = torch.stack((finite_distance / scale, angle / math.pi, demand), -1)
-        local_input = local_input.reshape(b * w, k + 1, 3)
+        feats = [finite_distance / scale, angle / math.pi, demand]
+        if self.use_tw:
+            tw, t = state.tw_features()                       # (B,N+1,2), (B,W)
+            start = tw[..., 0][:, None].expand(b, w, n1).gather(-1, idx)
+            end = tw[..., 1][:, None].expand(b, w, n1).gather(-1, idx)
+            feats += [(start - t[..., None]).masked_fill(~valid, 0),
+                      (end - t[..., None]).masked_fill(~valid, 0)]
+        local_input = torch.stack(feats, -1)
+        local_input = local_input.reshape(b * w, k + 1, self.in_dim)
         valid_flat = valid.reshape(b * w, k + 1)
         encoded = self.input(local_input)
         query = self.query[None, None].expand(b * w, 1, -1)
@@ -89,6 +99,7 @@ class ELGPolicy(nn.Module):
         distance_penalty: bool = True,
         logit_clipping: float = 50.0,
         xi: float = -1.0,
+        use_tw: bool = False,
     ):
         super().__init__()
         if mode not in {"joint", "only_global", "only_local"}:
@@ -101,19 +112,21 @@ class ELGPolicy(nn.Module):
         self.logit_clipping = logit_clipping
         self.xi = xi
         self.local_enabled = mode != "only_global"
+        self.use_tw = use_tw
         self.depot_embed = nn.Linear(2, embed_dim)
-        self.customer_embed = nn.Linear(3, embed_dim)
+        # VRPTW: customers also embed [tw_start, tw_end]/H; the query also sees t/H.
+        self.customer_embed = nn.Linear(5 if use_tw else 3, embed_dim)
         self.encoder = nn.ModuleList(
             _EncoderLayer(embed_dim, num_heads, feedforward_dim or 4 * embed_dim)
             for _ in range(num_layers)
         )
-        self.query = nn.Linear(embed_dim + 1, embed_dim, bias=False)
+        self.query = nn.Linear(embed_dim + (2 if use_tw else 1), embed_dim, bias=False)
         self.num_heads = num_heads
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.attn_out = nn.Linear(embed_dim, embed_dim)
-        self.local = _LocalPolicy(local_dim, local_heads, local_size)
+        self.local = _LocalPolicy(local_dim, local_heads, local_size, use_tw)
         self.encoded = None
 
     def prepare(self, state):
@@ -121,7 +134,10 @@ class ELGPolicy(nn.Module):
             self.encoded = None
             return
         depot = self.depot_embed(state.xy[:, :1])
-        customers = self.customer_embed(torch.cat((state.xy[:, 1:], state.demand[:, 1:, None]), -1))
+        parts = [state.xy[:, 1:], state.demand[:, 1:, None]]
+        if self.use_tw:
+            parts.append(state.tw_features()[0][:, 1:])
+        customers = self.customer_embed(torch.cat(parts, -1))
         encoded = torch.cat((depot, customers), 1)
         for layer in self.encoder:
             encoded = layer(encoded)
@@ -137,7 +153,10 @@ class ELGPolicy(nn.Module):
             current = self.encoded.gather(
                 1, state.current[..., None].expand(b, w, self.encoded.size(-1))
             )
-            query = self.query(torch.cat((current, state.load[..., None]), -1))
+            ctx = [current, state.load[..., None]]
+            if self.use_tw:
+                ctx.append(state.tw_features()[1][..., None])
+            query = self.query(torch.cat(ctx, -1))
             dim = query.size(-1)
             head_dim = dim // self.num_heads
             q = self.q_proj(query).view(b, w, self.num_heads, head_dim).transpose(1, 2)

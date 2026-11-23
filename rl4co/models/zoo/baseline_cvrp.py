@@ -69,12 +69,38 @@ class CVRPState:
     current: torch.Tensor
     finished: torch.Tensor
     actions: list[torch.Tensor]
+    # ---- VRPTW only (None for CVRP/OVRP; behaviour then unchanged) ----
+    # Follows CVRPTWEnv: service must *start* by tw_end; wait until tw_start;
+    # time resets to 0 at the depot. travel time = distance * tw_travel_scale
+    # (1.0 matches CVRPTWEnv, the env LEGO trains on).
+    time_windows: torch.Tensor | None = None   # (B, N+1, 2), depot first
+    durations: torch.Tensor | None = None      # (B, N+1)
+    horizon: torch.Tensor | None = None        # (B,) depot window end
+    time: torch.Tensor | None = None           # (B, W) current time
+    tw_travel_scale: float = 1.0
+    tw_late: torch.Tensor | int = 0            # deadline violations (must stay 0)
+    tw_fallbacks: torch.Tensor | int = 0       # safety-valve hits (summed over mask() calls; must stay 0)
 
     @classmethod
-    def from_batch(cls, batch: dict[str, torch.Tensor], width: int = 1):
+    def from_batch(cls, batch: dict[str, torch.Tensor], width: int = 1,
+                   problem: str = "cvrp", tw_travel_scale: float = 1.0):
         data = normalize_batch(batch)
         xy, demand = data["xy"], data["demand"]
         b, n1, _ = xy.shape
+        tw_kwargs = {}
+        if problem == "vrptw":
+            if "time_windows" not in batch:
+                raise KeyError("problem='vrptw' needs 'time_windows' in the batch; "
+                               "regenerate the cache with --problem vrptw")
+            tw = batch["time_windows"].float()
+            dur = batch["durations"].float() if "durations" in batch else torch.zeros_like(tw[..., 0])
+            if tw.size(1) != n1:
+                raise ValueError("time_windows must include the depot as node 0")
+            tw_kwargs = dict(
+                time_windows=tw, durations=dur, horizon=tw[:, 0, 1],
+                time=torch.zeros(b, width, device=xy.device),
+                tw_travel_scale=float(tw_travel_scale),
+            )
         return cls(
             xy=xy,
             demand=demand,
@@ -84,7 +110,23 @@ class CVRPState:
             current=torch.zeros(b, width, dtype=torch.long, device=xy.device),
             finished=torch.zeros(b, width, dtype=torch.bool, device=xy.device),
             actions=[],
+            **tw_kwargs,
         )
+
+    @property
+    def has_tw(self) -> bool:
+        return self.time_windows is not None
+
+    def _cur_dist(self) -> torch.Tensor:
+        """(B, W, N+1) distance from each thread's current node."""
+        b, w = self.current.shape
+        n1 = self.xy.size(1)
+        return self.distance.gather(1, self.current[..., None].expand(b, w, n1))
+
+    def tw_features(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Horizon-normalized (static node windows (B,N+1,2), current time (B,W))."""
+        h = self.horizon.clamp_min(1e-6)
+        return self.time_windows / h[:, None, None], self.time / h[:, None]
 
     @property
     def batch_size(self):
@@ -104,6 +146,19 @@ class CVRPState:
         demand = self.demand[:, None].expand_as(mask)
         mask |= demand > self.load[:, :, None] + 1e-6
         all_visited = self.visited[:, :, 1:].all(-1)
+        if self.has_tw:
+            capacity_mask = mask.clone()
+            arrival = self.time[..., None] + self._cur_dist() * self.tw_travel_scale
+            late = arrival > self.time_windows[:, None, :, 1] + 1e-6
+            late[:, :, 0] = False
+            mask |= late
+            # Safety valve: at the depot (time 0) every customer is reachable by
+            # construction; if none is, relax time for that thread so it cannot
+            # deadlock, and count it (must stay 0 for a valid VRPTW result).
+            stuck = (self.current == 0) & ~all_visited & ~self.finished \
+                & mask[:, :, 1:].all(-1)
+            mask = torch.where(stuck[..., None], capacity_mask, mask)
+            self.tw_fallbacks = self.tw_fallbacks + stuck.sum()
         mask[:, :, 0] = (self.current == 0) & ~all_visited
         mask[:, :, 0] &= ~self.finished
         # Finished rows are pinned at depot.
@@ -113,6 +168,18 @@ class CVRPState:
 
     def step(self, selected: torch.Tensor):
         at_depot = selected == 0
+        if self.has_tw:
+            travel = self._cur_dist().gather(2, selected[..., None]).squeeze(-1) \
+                * self.tw_travel_scale
+            arrival = self.time + travel
+            tw_start = self.time_windows[..., 0].gather(1, selected)   # (B, W)
+            tw_end = self.time_windows[..., 1].gather(1, selected)
+            service = self.durations.gather(1, selected)
+            self.tw_late = self.tw_late + (~at_depot & (arrival > tw_end + 1e-6)).sum()
+            self.time = torch.where(
+                at_depot, torch.zeros_like(arrival),
+                torch.maximum(arrival, tw_start) + service,
+            )
         picked_demand = self.demand[:, None].expand(
             -1, self.width, -1
         ).gather(2, selected[..., None]).squeeze(-1)
@@ -153,13 +220,14 @@ class CVRPState:
 
 
 def rollout(policy, batch, width: int, decode_type: str, return_log_probs: bool = True,
-            problem: str = "cvrp"):
+            problem: str = "cvrp", tw_travel_scale: float = 1.0):
     """POMO-compatible rollout shared by ELG and DGL adapters.
 
     ``problem`` selects the reward convention: "ovrp" uses open-route reward
     (drop return-to-depot arcs), otherwise closed-tour CVRP reward.
     """
-    state = CVRPState.from_batch(batch, width=min(width, batch["locs"].size(1)))
+    state = CVRPState.from_batch(batch, width=min(width, batch["locs"].size(1)),
+                                 problem=problem, tw_travel_scale=tw_travel_scale)
     b, w = state.current.shape
     depot = torch.zeros(b, w, dtype=torch.long, device=state.xy.device)
     state.actions.append(depot)
@@ -189,4 +257,8 @@ def rollout(policy, batch, width: int, decode_type: str, return_log_probs: bool 
 
     reward = state.reward(problem=problem)
     log_prob = torch.stack(log_probs, -1).sum(-1) if log_probs else torch.zeros_like(reward)
-    return {"reward": reward, "log_prob": log_prob, "actions": torch.stack(state.actions, -1)}
+    out = {"reward": reward, "log_prob": log_prob, "actions": torch.stack(state.actions, -1)}
+    if state.has_tw:
+        out["tw_late"] = int(state.tw_late)
+        out["tw_fallbacks"] = int(state.tw_fallbacks)
+    return out
