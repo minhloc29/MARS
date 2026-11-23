@@ -276,6 +276,12 @@ class RADARPolicy(nn.Module):
         )
         qkv_dim = embed_dim // num_heads
         self.svd_rank = svd_rank
+        # Optional profiling counters (only updated while prof_enabled is True,
+        # so off by default and non-invasive to normal training/eval).
+        self.prof_enabled = False
+        self.prof_steps = 0
+        self.prof_svd_sec = 0.0
+        self.prof_decode_sec = 0.0
         # SVD features (2k) + normalised demand (1) → embed_dim
         self.projection = nn.Linear(2 * svd_rank + 1, embed_dim)
         self.encoder = _RADAREncoder(
@@ -308,6 +314,9 @@ class RADARPolicy(nn.Module):
 
         # ── SVD-lowrank embedding ─────────────────────────────────
         # Q ≈ U * sqrt(S),  K ≈ V * sqrt(S)  →  X = [Q | K]
+        if self.prof_enabled:
+            import time as _time
+            _t = _time.perf_counter()
         U, S, V = torch.svd_lowrank(dist_norm, q=self.svd_rank)
         sqrt_S   = S.sqrt().unsqueeze(1)           # (B, 1, k)
         Q        = U * sqrt_S                      # (B, n+1, k)
@@ -323,6 +332,8 @@ class RADARPolicy(nn.Module):
         x = self.projection(x)                          # (B, n+1, d)
         self._encoded = self.encoder(x, dist_norm)      # (B, n+1, d)
         self.decoder.set_kv(self._encoded)
+        if self.prof_enabled:
+            self.prof_svd_sec += _time.perf_counter() - _t
 
     # ── Decoding ─────────────────────────────────────────────────
 
@@ -334,6 +345,8 @@ class RADARPolicy(nn.Module):
         returned action logits before sampling.
         """
         B, pomo = state.current.shape
+        if self.prof_enabled:
+            self.prof_steps += 1
         enc = self._encoded                           # (B, n+1, d)
         cur_emb = enc.gather(
             1, state.current[:, :, None].expand(B, pomo, enc.size(-1))
