@@ -13,6 +13,7 @@ from rl4co.models.zoo.elg import ELG
 from rl4co.models.zoo.icam import ICAMCVRP
 from rl4co.models.zoo.invit import INViT
 from rl4co.models.zoo.l2r import L2RModel
+from rl4co.models.zoo.lehd.model import LEHDModel, TTRLModel
 from rl4co.models.zoo.pomo import POMO
 from rl4co.models.zoo.pomo_slot import AMSlot, POMOSlot
 from rl4co.models.zoo.radar import RADAR
@@ -30,6 +31,8 @@ MODEL_CLASSES = {
     "elg": ELG,
     "invit": INViT,
     "radar": RADAR,
+    "lehd": LEHDModel,
+    "ttpl": TTRLModel,
 }
 
 

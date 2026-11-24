@@ -6,10 +6,11 @@ import torch
 from tensordict import TensorDict
 
 from rl4co.envs import CVRPEnv
+from rl4co.models.zoo.lehd._env import LEHDVRPEnv
 from rl4co.utils.eval_utils import _allow_safe_globals
 from rl4co.utils.ops import get_tour_length
 
-ACTION_BACKBONES = {"pomo", "am", "pomo_base", "elg", "dgl", "radar"}
+ACTION_BACKBONES = {"pomo", "am", "pomo_base", "elg", "dgl", "radar", "lehd", "ttpl"}
 GROUPS = [(100, 200), (200, 300), (300, 500),
           (500, None)]  # [lo, hi), hi=None -> inf
 
@@ -59,6 +60,7 @@ def _load_checkpoint_model(ckpt: str, model: str):
     from rl4co.models.zoo.invit import INViT
     from rl4co.models.zoo.radar import RADAR
     from rl4co.models.zoo.dgl import DGL
+    from rl4co.models.zoo.lehd.model import LEHDModel, TTRLModel
 
     MODEL_CLASSES = {
         "am": AMSlot,
@@ -71,10 +73,16 @@ def _load_checkpoint_model(ckpt: str, model: str):
         "invit": INViT,
         "radar": RADAR,
         "dgl": DGL,
+        "lehd": LEHDModel,
+        "ttpl": TTRLModel,
     }
-    env = CVRPEnv(generator_params=dict(num_loc=100))
-    net = MODEL_CLASSES[model].load_from_checkpoint(ckpt, env=env,
-                                                    map_location="cpu")
+    # LEHD/TTPL are standalone LightningModules with their own data-driven env;
+    # they do not accept an RL4CO ``env`` kwarg, so load without it.
+    load_kwargs = {"map_location": "cpu"}
+    if model not in ("lehd", "ttpl"):
+        env = CVRPEnv(generator_params=dict(num_loc=100))
+        load_kwargs["env"] = env
+    net = MODEL_CLASSES[model].load_from_checkpoint(ckpt, **load_kwargs)
     net.eval()
     if model == "sil":
         net.labels.clear()
@@ -123,6 +131,8 @@ def decode_cvrplib(net, env, td, td_reset, model, starts, device):
         elif model in ("icam", "l2r"):
             r, _ = net._rollout(td, sampling=False)
             return float(-r.reshape(-1).max().item()), None
+        elif model in ("lehd", "ttpl"):
+            return _decode_lehd(net, td, device)
         elif model == "invit":
             out = net.policy(td, phase="test", decode_type="greedy")
             return float(-out["reward"].reshape(-1).max().item()), None
@@ -136,6 +146,82 @@ def decode_cvrplib(net, env, td, td_reset, model, starts, device):
             cost = costs_from_actions(env, td_reset, actions).reshape(-1)
             best = cost.min() if cost.numel() > 1 else cost[0]
             return float(best.item()), actions
+
+
+def _decode_lehd(net, td, device):
+    """Greedy-decode one CVRPLIB instance with the LEHD/TTPL decoder bridge.
+
+    LEHD consumes a bespoke ``problems`` tensor (B, V+1, 4) = [x, y, integer
+    demand, remaining_capacity] with the depot at index 0, decoded via its own
+    ``LEHDVRPEnv``. We reconstruct ``problems`` from the shared Set X td
+    (normalized [0,1]^2 coords; integer demand/capacity kept in
+    ``raw_demand``/``raw_capacity``), run the model's greedy loop, and return
+    the student tour length in [0,1]^2 units (the harness rescales by ``scale``).
+
+    No ground-truth solution is used: the first node is also chosen greedily.
+    """
+    with torch.no_grad():
+        coords_full = torch.cat([td["depot"], td["locs"][0]], dim=0)     # (N, 2)
+        raw_demand = td["raw_demand"][0].to(device).float().clone()        # (N,)
+        capacity = float(td["raw_capacity"][0].item())
+
+        N = coords_full.shape[0]
+        V = N - 1  # customers
+        demands = raw_demand.clone()
+        demands[0] = 0.0
+        cap_exp = torch.full((N,), capacity, device=device)
+        problems = torch.cat(
+            [coords_full.to(device), demands[:, None], cap_exp[:, None]], dim=1
+        ).unsqueeze(0).float()                                            # (1, N, 4)
+
+        net.model.eval()
+        env = LEHDVRPEnv(data_path="", mode="test", sub_path=False)
+        env.raw_data_capacity = torch.tensor([[capacity]], dtype=torch.float32)
+        env.problems = problems
+        # env.step always computes the *teacher* length from env.solution; with no
+        # ground truth we stub it (we only read the student route).
+        env.solution = torch.zeros(1, 1, 2, dtype=torch.long, device=device)
+        env.reset("test")
+
+        step = 0
+        while True:
+            if env.selected_count == V:
+                break
+            remaining_cap = env.problems[:, 0, 3]
+            probs = net.model.decode_step(
+                env.problems, env.selected_node_list,
+                capacity, remaining_cap, step)
+            flat = probs.argmax(dim=1)
+            is_via = flat >= V
+            sel_node = torch.where(
+                is_via, flat - V + 1, flat + 1).long()
+            sel_flag = is_via.long()
+            step += 1
+            env.step(sel_node, sel_node, sel_flag, sel_flag)
+
+        # Reconstruct the physical route from the decoded (order, via-flag) pairs:
+        # a via-depot flag means the vehicle returns to the depot before serving
+        # that customer. The env's own ``_cal_length`` reward is a *reduced*
+        # two-level distance that is NOT the true tour length, so we compute the
+        # real closed-route length in [0,1]^2 units here (× scale to compare to bks).
+        order = env.selected_node_list[0].tolist()          # 1-indexed customers
+        # Capacity-forced returns are recorded on the *teacher* flag copy
+        # (env.step overrides only that one); the student flag omits them, so
+        # using it would undercount capacity resets and report infeasible/too-cheap
+        # routes. Reconstruct the physically-served route from the teacher flag.
+        flag = env.selected_teacher_flag[0].tolist()        # 1 => return to depot
+        nodes = [0]                                          # start at depot
+        for i, nd in enumerate(order):
+            if flag[i]:
+                nodes.append(0)                              # return to depot first
+            nodes.append(nd)
+        nodes.append(0)                                      # close back to depot
+        xy = coords_full.to(device)
+        pts = xy[torch.tensor(nodes, device=device)]
+        cost_norm = float((pts[1:] - pts[:-1]).norm(dim=1).sum().item())
+        # Return the physical action sequence (depot=0 at every return, customers
+        # 1..V) so the harness independently re-verifies capacity feasibility.
+        return cost_norm, torch.tensor(nodes, device=device).unsqueeze(0)
 
 
 def build_td(coords, demand, capacity, device):
@@ -163,6 +249,11 @@ def build_td(coords, demand, capacity, device):
             "depot": depot,                         # (1, 2)
             "demand": dem_cust.unsqueeze(0),        # (1, N)
             "capacity": torch.ones(1, device=device),  # normalized capacity
+            # Raw integer demand (depot-first, N,) and capacity, carried so
+            # backbones that consume integer inputs (LEHD/TTPL) can rebuild
+            # their own problem tensors from the same instance.
+            "raw_demand": torch.tensor(demand, device=device).unsqueeze(0),   # (1,N) int
+            "raw_capacity": torch.tensor(float(capacity), device=device).unsqueeze(0),  # (1,)
         },
         batch_size=[1],
     )
@@ -287,7 +378,7 @@ def evaluate_cvrplib(model, ckpt, data_dir="./data/cvrplib_setX", sizes=None,
         td = build_td(coords, demand, capacity, device)
         # L2R consumes the pre-reset benchmark TensorDict directly; the other
         # policies use the regular CVRPEnv reset representation.
-        td_reset = td if model == "l2r" else env.reset(td.clone())
+        td_reset = td if model in ("l2r", "lehd", "ttpl") else env.reset(td.clone())
         try:
             cost, actions = decode_cvrplib(
                 net, env, td, td_reset, model, starts, device)
