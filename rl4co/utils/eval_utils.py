@@ -132,7 +132,11 @@ def decode_elg(model, batch, args, env):
     from rl4co.models.zoo.baseline_cvrp import rollout as elg_rollout
 
     width = model.hparams.pomo_size
-    out = elg_rollout(model.policy, batch, width, greedy_name(args.decode), False)
+    # Decode under the problem the checkpoint was trained on (VRPTW masks time
+    # windows); previously this always decoded plain CVRP.
+    out = elg_rollout(model.policy, batch, width, greedy_name(args.decode), False,
+                      problem=model.hparams.get("problem", "cvrp"),
+                      tw_travel_scale=model.hparams.get("tw_travel_scale", 1.0))
     return out["reward"].max(dim=1).values, out["reward"].shape[1], out.get("actions", None)
 
 
@@ -146,8 +150,10 @@ def decode_radar(model, batch, args, env):
 
     width = model.hparams.pomo_size
     out = radar_rollout(
-        model.policy, batch, width, greedy_name(args.decode), False)
-    
+        model.policy, batch, width, greedy_name(args.decode), False,
+        problem=model.hparams.get("problem", "cvrp"),
+        tw_travel_scale=model.hparams.get("tw_travel_scale", 1.0))
+
     return out["reward"].max(dim=1).values, out["reward"].shape[1], out.get("actions", None)
 
 
@@ -314,7 +320,11 @@ def evaluate(model, args, env, ds, return_instances: int | None = None):
         tw_all = torch.cat(tw_buf)
         dur_all = torch.cat(dur_buf)
         loc_all = torch.cat(loc_buf)
-        acts_all = torch.cat(actions_buf)
+        # Batches decode to different lengths; right-pad with 0 (depot stays,
+        # zero length, and the feasibility check treats it as a route reset).
+        T_max = max(a.shape[-1] for a in actions_buf)
+        acts_all = torch.cat([
+            torch.nn.functional.pad(a, (0, T_max - a.shape[-1])) for a in actions_buf])
         ns = num_starts if num_starts else 1
         T = acts_all.shape[-1]
         acts_all = acts_all.view(B, ns, T)

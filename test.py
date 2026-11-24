@@ -8,7 +8,7 @@ import lightning.pytorch as pl
 import torch
 
 from rl4co.data.transforms import StateAugmentation
-from rl4co.envs import CVRPEnv, OVRPEnv
+from rl4co.envs import CVRPEnv, CVRPTWEnv, OVRPEnv
 from rl4co.models.zoo.elg import ELG
 from rl4co.models.zoo.icam import ICAMCVRP
 from rl4co.models.zoo.invit import INViT
@@ -53,9 +53,9 @@ def main() -> None:
                         choices=["cvrp", "ovrp", "vrptw"],
                         help="Problem to evaluate. OVRP uses the same CVRP "
                              "checkpoint with an open-route (no return) reward; "
-                             "VRPTW attaches Solomon time windows for feasibility "
-                             "reporting (constraint-agnostic: the model still "
-                             "ignores them, like capacity).")
+                             "VRPTW decodes in CVRPTWEnv / the time-window-aware "
+                             "baseline rollouts and additionally re-checks "
+                             "time-window feasibility of the decoded tours.")
     parser.add_argument("--num_loc", type=int, default=None,
                         help="Target number of customers N (required for "
                              "--dataset synthetic).")
@@ -137,7 +137,9 @@ def main() -> None:
         print(f"Saved to {out_path}")
         return
 
-    env = (OVRPEnv if args.problem == "ovrp" else CVRPEnv)(
+    # VRPTW must decode in CVRPTWEnv so env-based models (LEGO/POMO/AM) see the
+    # time-window mask, exactly as in training (train.py uses CVRPTWEnv).
+    env = {"cvrp": CVRPEnv, "ovrp": OVRPEnv, "vrptw": CVRPTWEnv}[args.problem](
         generator_params=dict(num_loc=args.num_loc))
     model_cls = MODEL_CLASSES[args.model]
     model = model_cls.load_from_checkpoint(
