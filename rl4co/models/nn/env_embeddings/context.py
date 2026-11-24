@@ -163,7 +163,9 @@ class VRPTWContext(VRPContext):
 
     def _state_embedding(self, embeddings, td):
         capacity = super()._state_embedding(embeddings, td)
-        current_time = td["current_time"]
+        # Same horizon normalization as VRPTWInitEmbedding (raw time reaches ~480).
+        horizon = td["time_windows"][..., 0, 1:2].clamp_min(1e-6)        # (B, 1)
+        current_time = td["current_time"] / horizon
         return torch.cat([capacity, current_time], -1)
 
 

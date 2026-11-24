@@ -144,8 +144,12 @@ class VRPTWInitEmbedding(VRPInitEmbedding):
 
     def forward(self, td):
         depot, cities = td["locs"][:, :1, :], td["locs"][:, 1:, :]
-        durations = td["durations"][..., 1:]
-        time_windows = td["time_windows"][..., 1:, :]
+        # Normalize times by the depot horizon (tw_end of node 0). Raw Solomon-frame
+        # windows (0..480) next to [0,1] coordinates swamp the geometry in the shared
+        # linear layer; the model then degenerates to deadline ordering.
+        horizon = td["time_windows"][..., :1, 1:2].clamp_min(1e-6)       # (B, 1, 1)
+        durations = td["durations"][..., 1:] / horizon[..., 0]
+        time_windows = td["time_windows"][..., 1:, :] / horizon
         # embeddings
         depot_embedding = self.init_embed_depot(depot)
         node_embeddings = self.init_embed(
