@@ -59,11 +59,18 @@ class RADAR(pl.LightningModule):
         pomo_size:      int   = 100,
         scale_norm:     bool  = False,
         problem:        str   = "cvrp",
+        tw_travel_scale: float = 1.0,
+        micro_batch_size: int | None = None,
         optimizer_kwargs: dict | None = None,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["env"])
         self.env = env
+        # Exact gradient accumulation inside one optimizer step (POMO advantage is
+        # per instance, loss is a batch mean); see ELG for the same construction.
+        if micro_batch_size is not None and micro_batch_size < 1:
+            raise ValueError("micro_batch_size must be positive")
+        self.automatic_optimization = micro_batch_size is None
         self.policy = RADARPolicy(
             embed_dim=embed_dim,
             encoder_layers=encoder_layers,
@@ -73,6 +80,7 @@ class RADAR(pl.LightningModule):
             svd_rank=svd_rank,
             logit_clipping=logit_clipping,
             sinkhorn_iters=sinkhorn_iters,
+            use_tw=problem == "vrptw",
         )
 
     # ── Optimiser ────────────────────────────────────────────────
@@ -86,14 +94,18 @@ class RADAR(pl.LightningModule):
 
     # ── Training ─────────────────────────────────────────────────
 
-    def training_step(self, batch, batch_idx):
-        out = rollout(
+    def _rollout(self, batch, decode_type, return_log_probs):
+        return rollout(
             self.policy, batch,
             width=self.hparams.pomo_size,
-            decode_type="sampling",
-            return_log_probs=True,
+            decode_type=decode_type,
+            return_log_probs=return_log_probs,
             problem=self.hparams.get("problem", "cvrp"),
+            tw_travel_scale=self.hparams.get("tw_travel_scale", 1.0),
         )
+
+    def _chunk_objective(self, batch):
+        out = self._rollout(batch, "sampling", True)
         reward, log_prob = out["reward"], out["log_prob"]
         # POMO REINFORCE: advantage over in-batch mean
         advantage = reward - reward.mean(1, keepdim=True)
@@ -103,7 +115,27 @@ class RADAR(pl.LightningModule):
             objective = objective / (
                 advantage.detach().abs().amax(1, keepdim=True).clamp_min(1e-6)
             )
-        loss = objective.mean()
+        return objective.mean(), reward
+
+    def training_step(self, batch, batch_idx):
+        micro = self.hparams.get("micro_batch_size")
+        if micro is None:
+            loss, reward = self._chunk_objective(batch)
+        else:
+            optimizer = self.optimizers()
+            optimizer.zero_grad()
+            total = batch["locs"].size(0)
+            loss_sum, rewards = 0.0, []
+            for start in range(0, total, micro):
+                chunk = {k: v[start:start + micro] for k, v in batch.items()
+                         if torch.is_tensor(v) and v.size(0) == total}
+                chunk_loss, chunk_reward = self._chunk_objective(chunk)
+                weight = chunk_reward.size(0) / total
+                self.manual_backward(chunk_loss * weight)
+                loss_sum += chunk_loss.detach() * weight
+                rewards.append(chunk_reward.detach())
+            optimizer.step()
+            loss, reward = loss_sum, torch.cat(rewards)
         self.log("train/loss", loss, on_step=True, on_epoch=True,
                  batch_size=reward.size(0))
         self.log("train/reward", reward.max(1).values.mean(),
@@ -114,28 +146,22 @@ class RADAR(pl.LightningModule):
     # ── Validation ───────────────────────────────────────────────
 
     def validation_step(self, batch, batch_idx):
-        out = rollout(
-            self.policy, batch,
-            width=self.hparams.pomo_size,
-            decode_type="greedy",
-            return_log_probs=False,
-            problem=self.hparams.get("problem", "cvrp"),
-        )
+        out = self._rollout(batch, "greedy", False)
         reward = out["reward"].max(1).values
         self.log("val/reward", reward.mean(), on_epoch=True, prog_bar=True,
                  batch_size=reward.size(0))
+        if "tw_late" in out:
+            # Must stay 0 for a valid VRPTW result.
+            self.log("val/tw_late", float(out["tw_late"]), on_epoch=True,
+                     reduce_fx="sum", batch_size=reward.size(0))
+            self.log("val/tw_fallbacks", float(out["tw_fallbacks"]), on_epoch=True,
+                     reduce_fx="sum", batch_size=reward.size(0))
         return reward
 
     # ── Test ─────────────────────────────────────────────────────
 
     def test_step(self, batch, batch_idx):
-        out = rollout(
-            self.policy, batch,
-            width=self.hparams.pomo_size,
-            decode_type="greedy",
-            return_log_probs=False,
-            problem=self.hparams.get("problem", "cvrp"),
-        )
+        out = self._rollout(batch, "greedy", False)
         reward = out["reward"].max(1).values
         self.log("test/reward", reward.mean(), batch_size=reward.size(0))
         return out

@@ -393,11 +393,15 @@ def train(
             optimizer_kwargs={"lr": lr}, **config,
         )
     elif backbone == "radar":
+        # --embed_dim must reach RADAR like the other baselines (it was silently
+        # ignored before, leaving the RADARPolicy default of 64).
+        cfg = {k: v for k, v in config.items() if k != "embed_dim"}
         model_kwargs = dict(
             env=env,
+            embed_dim=embed_dim,
             problem=problem,
             optimizer_kwargs={"lr": lr},
-            **config,
+            **cfg,
         )
     elif backbone == "am":
         model_kwargs["baseline"] = baseline if baseline is not None else "shared"

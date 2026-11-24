@@ -187,14 +187,15 @@ class _RADARDecoder(nn.Module):
     mask externally and then calls Categorical / argmax on the logits.
     """
 
-    def __init__(self, dim: int, head_num: int, qkv_dim: int, logit_clipping: float):
+    def __init__(self, dim: int, head_num: int, qkv_dim: int, logit_clipping: float,
+                 context_extra_dim: int = 0):
         super().__init__()
         self.head_num = head_num
         self.sqrt_qkv = math.sqrt(qkv_dim)
         self.sqrt_dim  = math.sqrt(dim)
         self.logit_clipping = logit_clipping
-        # +1 dim for vehicle load
-        self.Wq0 = nn.Linear(dim + 1, head_num * qkv_dim, bias=False)
+        # +1 dim for vehicle load (+1 for current time under VRPTW)
+        self.Wq0 = nn.Linear(dim + 1 + context_extra_dim, head_num * qkv_dim, bias=False)
         self.Wk  = nn.Linear(dim, head_num * qkv_dim, bias=False)
         self.Wv  = nn.Linear(dim, head_num * qkv_dim, bias=False)
         self.combine = nn.Linear(head_num * qkv_dim, dim)
@@ -214,12 +215,14 @@ class _RADARDecoder(nn.Module):
         cur_emb: torch.Tensor,  # (B, pomo, dim) — current node embedding
         load:    torch.Tensor,  # (B, pomo)      — remaining vehicle capacity
         mask:    torch.Tensor,  # (B, pomo, n+1) — True means unavailable
+        extra:   torch.Tensor | None = None,  # (B, pomo, e) — VRPTW: current time/H
     ) -> torch.Tensor:
         """Return raw logit scores (B, pomo, n+1) before masking."""
         B, pomo, dim = cur_emb.shape
         H = self.head_num
-        # Query: concat current embedding + load scalar
-        q_in = torch.cat([cur_emb, load[:, :, None]], dim=2)  # (B, pomo, dim+1)
+        # Query: concat current embedding + load scalar (+ time under VRPTW)
+        parts = [cur_emb, load[:, :, None]] + ([extra] if extra is not None else [])
+        q_in = torch.cat(parts, dim=2)                         # (B, pomo, dim+1[+e])
         q = _reshape_by_heads(self.Wq0(q_in), H)              # (B, H, pomo, qkv)
         # Match the original RADAR decoder: unavailable nodes are excluded
         # from both the multi-head context and the final action distribution.
@@ -269,6 +272,7 @@ class RADARPolicy(nn.Module):
         svd_rank:       int   = 10,
         logit_clipping: float = 10.0,
         sinkhorn_iters: int   = 10,
+        use_tw:         bool  = False,
     ):
         super().__init__()
         assert embed_dim % num_heads == 0, (
@@ -276,13 +280,15 @@ class RADARPolicy(nn.Module):
         )
         qkv_dim = embed_dim // num_heads
         self.svd_rank = svd_rank
-        # SVD features (2k) + normalised demand (1) → embed_dim
-        self.projection = nn.Linear(2 * svd_rank + 1, embed_dim)
+        self.use_tw = use_tw
+        # SVD features (2k) + normalised demand (1) [+ tw_start, tw_end / H] → embed_dim
+        self.projection = nn.Linear(2 * svd_rank + 1 + (2 if use_tw else 0), embed_dim)
         self.encoder = _RADAREncoder(
             embed_dim, num_heads, qkv_dim, ff_dim, ms_hidden_dim,
             encoder_layers, sinkhorn_iters,
         )
-        self.decoder = _RADARDecoder(embed_dim, num_heads, qkv_dim, logit_clipping)
+        self.decoder = _RADARDecoder(embed_dim, num_heads, qkv_dim, logit_clipping,
+                                     context_extra_dim=1 if use_tw else 0)
         self._encoded: torch.Tensor | None = None
 
     # ── Encoding ─────────────────────────────────────────────────
@@ -319,7 +325,10 @@ class RADARPolicy(nn.Module):
         demand_feat = (demand / total_dem).unsqueeze(-1)  # (B, n+1, 1)
 
         # ── Project and encode ────────────────────────────────────
-        x = torch.cat([svd_feat, demand_feat], dim=-1)  # (B, n+1, 2k+1)
+        feats = [svd_feat, demand_feat]
+        if self.use_tw:
+            feats.append(state.tw_features()[0].float())  # (B, n+1, 2) depot = [0, 1]
+        x = torch.cat(feats, dim=-1)                    # (B, n+1, 2k+1[+2])
         x = self.projection(x)                          # (B, n+1, d)
         self._encoded = self.encoder(x, dist_norm)      # (B, n+1, d)
         self.decoder.set_kv(self._encoded)
@@ -338,4 +347,5 @@ class RADARPolicy(nn.Module):
         cur_emb = enc.gather(
             1, state.current[:, :, None].expand(B, pomo, enc.size(-1))
         )                                             # (B, pomo, d)
-        return self.decoder(cur_emb, state.load, state.mask())  # (B, pomo, n+1)
+        extra = state.tw_features()[1][..., None] if self.use_tw else None
+        return self.decoder(cur_emb, state.load, state.mask(), extra)  # (B, pomo, n+1)
